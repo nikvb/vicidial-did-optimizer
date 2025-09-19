@@ -16,6 +16,7 @@ This system provides intelligent Direct Inward Dialing (DID) optimization for VI
 - **🔐 Multi-Tenant Architecture**: Secure isolation for multiple organizations
 - **📈 Real-Time Analytics**: Comprehensive metrics and reporting
 - **⚡ High Performance**: Optimized for high-volume call centers
+- **🎯 VICIdial AGI Integration**: Proper AGI-based integration following VICIdial best practices
 
 ## 🎯 Key Features
 
@@ -26,6 +27,7 @@ This system provides intelligent Direct Inward Dialing (DID) optimization for VI
 - **Fallback Strategies**: Multiple algorithms ensure calls always get a DID
 
 ### VICIdial Integration
+- **🔥 AGI-Based Integration**: Uses proper AGI scripts instead of System() calls
 - **Seamless Setup**: Simple configuration via Asterisk dialplan
 - **Real-Time API**: Fast DID selection during active calls
 - **Comprehensive Reporting**: Collects call outcomes for AI training
@@ -39,10 +41,23 @@ This system provides intelligent Direct Inward Dialing (DID) optimization for VI
 
 ## 🚀 Quick Installation
 
-### Option 1: Automated Installation (Recommended)
+### Option 1: AGI-Based Installation (Recommended)
 
 ```bash
-# 1. Download the installer
+# 1. Download the AGI installer
+wget https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/install-vicidial-integration-agi.sh
+
+# 2. Make it executable
+chmod +x install-vicidial-integration-agi.sh
+
+# 3. Run the installer (as root)
+sudo ./install-vicidial-integration-agi.sh
+```
+
+### Option 2: System() Call Installation (Alternative)
+
+```bash
+# 1. Download the standard installer
 wget https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/install-vicidial-integration.sh
 
 # 2. Make it executable
@@ -51,11 +66,6 @@ chmod +x install-vicidial-integration.sh
 # 3. Run the installer (as root)
 sudo ./install-vicidial-integration.sh
 ```
-
-### Option 2: Manual Installation
-
-1. **Install the DID Optimizer Service** (see [Server Setup](#server-setup))
-2. **Configure VICIdial Integration** (see [VICIdial Setup](#vicidial-setup))
 
 ## 🖥️ Server Setup
 
@@ -104,25 +114,60 @@ VICIDIAL_DB_NAME=asterisk
 
 ## 📞 VICIdial Setup
 
-### 1. Install Integration Files
+### AGI-Based Integration (Recommended)
 
-The installer automatically handles this, or manually:
+The AGI installer automatically handles this, or manually:
 
 ```bash
+# Copy AGI scripts
+sudo cp agi-did-optimizer.agi /usr/share/astguiclient/agi-bin/
+sudo cp agi-did-optimizer-report.agi /usr/share/astguiclient/agi-bin/
+sudo chmod +x /usr/share/astguiclient/agi-bin/agi-did-optimizer*.agi
+
 # Copy configuration
 sudo cp dids.conf /etc/asterisk/
 sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
-
-# Copy integration script
-sudo cp vicidial-did-optimizer-config.pl /usr/share/astguiclient/
-sudo chmod +x /usr/share/astguiclient/vicidial-did-optimizer-config.pl
-
-# Install Perl dependencies
-sudo apt-get install libwww-perl libjson-perl libdbi-perl libdbd-mysql-perl
 ```
 
-### 2. Configure API Settings
+### Update Asterisk Dialplan (AGI Version)
+
+Add to `/etc/asterisk/extensions.conf`:
+
+```asterisk
+; DID Optimizer Integration - AGI Version
+[did-optimizer]
+exten => _X.,1,NoOp(=== DID Optimizer: Processing ${EXTEN} ===)
+exten => _X.,n,Set(CUSTOMER_PHONE=${EXTEN})
+exten => _X.,n,Set(CAMPAIGN_ID=${campaign})
+exten => _X.,n,Set(AGENT_ID=${agent})
+
+; Call DID optimizer AGI script
+exten => _X.,n,AGI(agi-did-optimizer.agi,${CAMPAIGN_ID},${AGENT_ID},${CUSTOMER_PHONE})
+
+; Set the optimized caller ID (set by AGI)
+exten => _X.,n,Set(CALLERID(num)=${OPTIMIZED_DID})
+exten => _X.,n,NoOp(DID Optimizer: Selected ${OPTIMIZED_DID})
+exten => _X.,n,Goto(vicidial-auto,${EXTEN},1)
+
+; Call completion handler
+exten => h,1,AGI(agi-did-optimizer-report.agi,${CAMPAIGN_ID},${CUSTOMER_PHONE},${DIALSTATUS},${ANSWEREDTIME},${disposition})
+
+; Modify your [vicidial-auto] context - add as first line:
+[vicidial-auto]
+exten => _X.,1,GotoIf($["${CALLERID(num)}" = "COMPAT_DID_OPTIMIZER"]?did-optimizer,${EXTEN},1)
+; ... rest of your existing dialplan ...
+```
+
+### Configure VICIdial Campaign
+
+1. **Login to VICIdial Admin Interface**
+2. **Go to:** Admin → Campaigns → [Your Campaign]
+3. **Set Outbound Caller ID:** `COMPAT_DID_OPTIMIZER`
+4. **Set Campaign CID Override:** `Y`
+5. **Click SUBMIT**
+
+### Configure API Settings
 
 Edit `/etc/asterisk/dids.conf`:
 
@@ -138,34 +183,7 @@ max_distance_miles=500
 enable_geographic_routing=1
 ```
 
-### 3. Update Asterisk Dialplan
-
-Add to `/etc/asterisk/extensions.conf` (or let the installer handle this):
-
-```asterisk
-; DID Optimizer Integration
-[did-optimizer]
-exten => _X.,1,NoOp(=== DID Optimizer: Processing ${EXTEN} ===)
-exten => _X.,n,System(/usr/share/astguiclient/vicidial-did-optimizer-config.pl "${campaign}" "${agent}" "${EXTEN}" > /tmp/did_${campaign}_${UNIQUEID})
-exten => _X.,n,Set(SELECTED_DID=${FILE(/tmp/did_${campaign}_${UNIQUEID})})
-exten => _X.,n,Set(CALLERID(num)=${SELECTED_DID})
-exten => _X.,n,Goto(vicidial-auto,${EXTEN},1)
-
-; Modify your [vicidial-auto] context - add as first line:
-[vicidial-auto]
-exten => _X.,1,GotoIf($["${CALLERID(num)}" = "COMPAT_DID_OPTIMIZER"]?did-optimizer,${EXTEN},1)
-; ... rest of your existing dialplan ...
-```
-
-### 4. Configure VICIdial Campaign
-
-1. **Login to VICIdial Admin Interface**
-2. **Go to:** Admin → Campaigns → [Your Campaign]
-3. **Set Outbound Caller ID:** `COMPAT_DID_OPTIMIZER`
-4. **Set Campaign CID Override:** `Y`
-5. **Click SUBMIT**
-
-### 5. Reload Asterisk
+### Reload Asterisk
 
 ```bash
 sudo asterisk -rx "dialplan reload"
@@ -173,14 +191,16 @@ sudo asterisk -rx "dialplan reload"
 
 ## 🧪 Testing
 
-### Test API Connection
+### Test AGI Scripts
 ```bash
-sudo -u asterisk /usr/share/astguiclient/vicidial-did-optimizer-config.pl --test
-```
+# Test main AGI script
+sudo -u asterisk /usr/share/astguiclient/agi-bin/agi-did-optimizer.agi TEST001 1001 4155551234
 
-### Test DID Selection
-```bash
-sudo -u asterisk /usr/share/astguiclient/vicidial-did-optimizer-config.pl "CAMPAIGN001" "1001" "4155551234" "CA" "94102"
+# Test quick script
+sudo -u asterisk /usr/share/astguiclient/agi-bin/did-optimizer-quick.pl TEST001 1001 4155551234
+
+# Test API connection
+sudo -u asterisk /usr/share/astguiclient/vicidial-did-optimizer-config.pl --test
 ```
 
 ### Monitor Logs
@@ -245,6 +265,7 @@ sudo nano /etc/asterisk/dids.conf
 # Solution: Fix file permissions
 sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
+sudo chmod +x /usr/share/astguiclient/agi-bin/agi-did-optimizer*.agi
 ```
 
 **❌ "Can't locate JSON.pm"**
@@ -255,8 +276,8 @@ sudo apt-get install libwww-perl libjson-perl libdbi-perl libdbd-mysql-perl
 
 ### Debug Commands
 ```bash
-# Check script permissions
-ls -la /usr/share/astguiclient/vicidial-did-optimizer-config.pl
+# Check AGI script permissions
+ls -la /usr/share/astguiclient/agi-bin/agi-did-optimizer*
 
 # Test API connectivity
 curl -H "x-api-key: YOUR_KEY" http://your-server:3001/api/v1/health
@@ -268,10 +289,9 @@ sudo -u asterisk /usr/share/astguiclient/vicidial-did-optimizer-config.pl --conf
 ## 📚 Documentation
 
 - **[Quick Setup Guide](QUICK_SETUP_GUIDE.md)** - Get up and running in 3 steps
-- **[Dialplan Integration](VICIDIAL_DIALPLAN_INTEGRATION.md)** - Detailed VICIdial setup
+- **[AGI Dialplan Integration](vicidial-dialplan-agi.conf)** - AGI-based VICIdial setup
+- **[System() Dialplan Integration](vicidial-dialplan-simple.conf)** - Alternative System() setup
 - **[Step-by-Step Dialplan Modification](DIALPLAN_MODIFICATION_STEPS.md)** - Manual configuration guide
-- **[API Documentation](docs/API.md)** - Complete API reference
-- **[Configuration Reference](docs/CONFIGURATION.md)** - All configuration options
 
 ## 🤝 Contributing
 
@@ -291,7 +311,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🆘 Support
 
-- **📧 Email**: support@example.com
 - **🐛 Issues**: [GitHub Issues](https://github.com/nikvb/vicidial-did-optimizer/issues)
 - **💬 Discussions**: [GitHub Discussions](https://github.com/nikvb/vicidial-did-optimizer/discussions)
 
@@ -303,6 +322,7 @@ When working correctly, you'll see:
 ✅ **Balanced DID Usage**: Prevents individual DIDs from being flagged as spam
 ✅ **Real-Time Optimization**: AI learns and improves selection over time
 ✅ **Comprehensive Analytics**: Deep insights into call performance
+✅ **Proper VICIdial Integration**: AGI-based approach follows VICIdial best practices
 
 ---
 
