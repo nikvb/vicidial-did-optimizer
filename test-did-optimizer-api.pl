@@ -1,23 +1,26 @@
 #!/usr/bin/perl
 
 ##############################################################################
-# VICIdial DID Optimizer - Comprehensive API Test Script
+# VICIdial DID Optimizer - FULL DEBUG API Test Script v2.0
 #
 # This script automatically reads configuration from:
 # - /etc/asterisk/dids.conf (DID Optimizer settings)
 # - /etc/astguiclient.conf (VICIdial database settings)
 #
-# Tests:
-# - Configuration loading
-# - Database connectivity
-# - API connectivity and authentication
-# - DID selection functionality
-# - Error handling and fallbacks
+# Tests with FULL DEBUG TRACING:
+# - Configuration loading with detailed file parsing
+# - Database connectivity with VICIdial table verification
+# - API connectivity with full HTTP headers and response analysis
+# - DID selection functionality with rotation testing
+# - Error handling and fallbacks with network diagnostics
+# - Connection diagnostics and troubleshooting
 #
 # Usage:
 #   sudo -u asterisk ./test-did-optimizer-api.pl
-#   ./test-did-optimizer-api.pl --verbose
-#   ./test-did-optimizer-api.pl --config-only
+#   ./test-did-optimizer-api.pl --verbose    # Extra verbose output
+#   ./test-did-optimizer-api.pl --config-only  # Only test config loading
+#   ./test-did-optimizer-api.pl --debug      # MAXIMUM debug output
+#   ./test-did-optimizer-api.pl --trace      # HTTP request/response tracing
 ##############################################################################
 
 use strict;
@@ -26,17 +29,28 @@ use LWP::UserAgent;
 use JSON;
 use DBI;
 use Getopt::Long;
+use Data::Dumper;
+use Time::HiRes qw(time);
+use Socket;
+use IO::Socket::INET;
 
 # Command line options
 my $verbose = 0;
 my $config_only = 0;
 my $help = 0;
+my $debug = 0;
+my $trace = 0;
 
 GetOptions(
     'verbose' => \$verbose,
     'config-only' => \$config_only,
-    'help' => \$help
+    'help' => \$help,
+    'debug' => \$debug,
+    'trace' => \$trace
 );
+
+# Enable verbose mode for debug and trace
+$verbose = 1 if $debug || $trace;
 
 if ($help) {
     print_help();
@@ -47,8 +61,72 @@ if ($help) {
 my %config;
 my %vicidial_config;
 
-print "🚀 VICIdial DID Optimizer - API Test Script\n";
-print "=" x 50 . "\n\n";
+# Global debug function
+sub debug_print {
+    my ($level, $message) = @_;
+    my $timestamp = sprintf "%.3f", time();
+
+    if ($level eq 'INFO' || $verbose) {
+        print "[$timestamp] $message\n";
+    } elsif ($level eq 'DEBUG' && $debug) {
+        print "[$timestamp] [DEBUG] $message\n";
+    } elsif ($level eq 'TRACE' && $trace) {
+        print "[$timestamp] [TRACE] $message\n";
+    }
+}
+
+# Enhanced network diagnostics
+sub test_network_connectivity {
+    my ($host, $port) = @_;
+
+    debug_print('DEBUG', "Testing network connectivity to $host:$port");
+
+    my $socket = IO::Socket::INET->new(
+        PeerAddr => $host,
+        PeerPort => $port,
+        Proto    => 'tcp',
+        Timeout  => 5
+    );
+
+    if ($socket) {
+        debug_print('DEBUG', "✅ TCP connection to $host:$port successful");
+        close($socket);
+        return 1;
+    } else {
+        debug_print('DEBUG', "❌ TCP connection to $host:$port failed: $!");
+        return 0;
+    }
+}
+
+# Enhanced HTTP request tracing
+sub trace_http_request {
+    my ($request, $response) = @_;
+
+    if ($trace) {
+        debug_print('TRACE', "=== HTTP REQUEST ===");
+        debug_print('TRACE', $request->method . " " . $request->uri);
+        debug_print('TRACE', "Headers:");
+        for my $header ($request->header_field_names) {
+            my $value = $header eq 'x-api-key' ? substr($request->header($header), 0, 8) . "..." : $request->header($header);
+            debug_print('TRACE', "  $header: $value");
+        }
+        debug_print('TRACE', "");
+
+        debug_print('TRACE', "=== HTTP RESPONSE ===");
+        debug_print('TRACE', "Status: " . $response->code . " " . $response->message);
+        debug_print('TRACE', "Headers:");
+        for my $header ($response->header_field_names) {
+            debug_print('TRACE', "  $header: " . $response->header($header));
+        }
+        debug_print('TRACE', "Body: " . $response->content);
+        debug_print('TRACE', "");
+    }
+}
+
+print "🚀 VICIdial DID Optimizer - FULL DEBUG API Test Script v2.0\n";
+print "=" x 60 . "\n";
+print "Debug Level: " . ($debug ? "MAXIMUM" : $trace ? "TRACE" : $verbose ? "VERBOSE" : "NORMAL") . "\n";
+print "=" x 60 . "\n\n";
 
 # Step 1: Load configurations
 print "📋 Step 1: Loading configuration files...\n";
@@ -298,19 +376,50 @@ sub test_api_health {
         return;
     }
 
+    debug_print('DEBUG', "API Key: " . substr($config{api_key}, 0, 8) . "...");
+
+    # First test network connectivity
+    my ($protocol, $host, $port, $path) = $config{api_base_url} =~ m{^(https?)://([^:/]+)(?::(\d+))?(.*)$};
+    $port ||= ($protocol eq 'https' ? 443 : 80);
+    $path ||= '';
+
+    debug_print('DEBUG', "Parsed URL: protocol=$protocol, host=$host, port=$port, path=$path");
+
+    if ($debug) {
+        test_network_connectivity($host, $port);
+    }
+
     my $ua = LWP::UserAgent->new(
         timeout => $config{api_timeout},
-        agent => 'VICIdial-DID-Optimizer-Test/1.0'
+        agent => 'VICIdial-DID-Optimizer-Test/2.0'
     );
 
+    # Enable debugging for LWP if trace mode
+    if ($trace) {
+        $ua->add_handler("request_send",  sub { debug_print('TRACE', "Sending request..."); return });
+        $ua->add_handler("response_done", sub { debug_print('TRACE', "Response received."); return });
+    }
+
     my $health_url = "$config{api_base_url}/api/health";
-    print "    Testing: $health_url\n" if $verbose;
+    print "    Testing: $health_url\n";
+    debug_print('DEBUG', "Full URL: $health_url");
 
     my $request = HTTP::Request->new(GET => $health_url);
     $request->header('x-api-key' => $config{api_key});
     $request->header('Content-Type' => 'application/json');
+    $request->header('User-Agent' => 'VICIdial-DID-Optimizer-Test/2.0');
 
+    debug_print('DEBUG', "Request headers prepared");
+
+    my $start_time = time();
     my $response = $ua->request($request);
+    my $duration = time() - $start_time;
+
+    debug_print('DEBUG', sprintf("Request completed in %.3f seconds", $duration));
+
+    if ($trace) {
+        trace_http_request($request, $response);
+    }
 
     if ($response->is_success) {
         print "  ✅ API health check successful\n";
@@ -347,10 +456,10 @@ sub test_did_selection {
         return;
     }
 
-    # Test cases
+    # Enhanced test cases with more debugging scenarios
     my @test_cases = (
         {
-            name => "California customer",
+            name => "Basic DID request",
             campaign_id => "TEST001",
             agent_id => "1001",
             customer_phone => "4155551234",
@@ -358,7 +467,7 @@ sub test_did_selection {
             customer_zip => "94102"
         },
         {
-            name => "New York customer",
+            name => "Rotation test #1",
             campaign_id => "TEST002",
             agent_id => "1002",
             customer_phone => "2125551234",
@@ -366,9 +475,25 @@ sub test_did_selection {
             customer_zip => "10001"
         },
         {
-            name => "No location data",
+            name => "Rotation test #2",
             campaign_id => "TEST003",
             agent_id => "1003",
+            customer_phone => "3125551234",
+            customer_state => "IL",
+            customer_zip => "60601"
+        },
+        {
+            name => "Rotation test #3",
+            campaign_id => "TEST004",
+            agent_id => "1004",
+            customer_phone => "7135551234",
+            customer_state => "TX",
+            customer_zip => "77001"
+        },
+        {
+            name => "No location data",
+            campaign_id => "TEST005",
+            agent_id => "1005",
             customer_phone => "5555551234",
             customer_state => "",
             customer_zip => ""
@@ -377,47 +502,142 @@ sub test_did_selection {
 
     my $ua = LWP::UserAgent->new(
         timeout => $config{api_timeout},
-        agent => 'VICIdial-DID-Optimizer-Test/1.0'
+        agent => 'VICIdial-DID-Optimizer-Test/2.0'
     );
 
-    for my $test (@test_cases) {
-        print "    Testing: $test->{name}\n";
+    # Test multiple rounds to verify rotation
+    my $total_tests = scalar(@test_cases);
+    my $rotation_rounds = $debug ? 3 : 1;  # Test rotation in debug mode
 
-        my $url = "$config{api_base_url}/api/v1/dids/next";
-        my @params = (
-            "campaign_id=$test->{campaign_id}",
-            "agent_id=$test->{agent_id}",
-            "customer_phone=$test->{customer_phone}",
-            "customer_state=$test->{customer_state}",
-            "customer_zip=$test->{customer_zip}"
-        );
-        $url .= '?' . join('&', @params);
+    debug_print('DEBUG', "Running $rotation_rounds rotation rounds with $total_tests test cases each");
 
-        print "      URL: $url\n" if $verbose;
+    my %did_usage = ();
+    my $test_count = 0;
 
-        my $request = HTTP::Request->new(GET => $url);
-        $request->header('x-api-key' => $config{api_key});
+    for my $round (1..$rotation_rounds) {
+        print "    Round $round:\n" if $rotation_rounds > 1;
 
-        my $response = $ua->request($request);
+        for my $test (@test_cases) {
+            $test_count++;
+            print "    Test $test_count: $test->{name}\n";
 
-        if ($response->is_success) {
-            my $data = eval { decode_json($response->content) };
-            if ($data && $data->{did} && $data->{did}->{number}) {
-                print "      ✅ Selected DID: $data->{did}->{number}\n";
-                print "      Is fallback: " . ($data->{did}->{is_fallback} ? 'yes' : 'no') . "\n" if $verbose;
-                print "      Campaign: " . ($data->{metadata}->{campaign_id} // 'unknown') . "\n" if $verbose && $data->{metadata};
-            } else {
-                print "      ⚠️  No DID returned in response\n";
-                print "      Response: " . $response->content . "\n" if $verbose;
+            my $url = "$config{api_base_url}/api/v1/dids/next";
+            my @params = (
+                "campaign_id=$test->{campaign_id}",
+                "agent_id=$test->{agent_id}",
+                "customer_phone=$test->{customer_phone}",
+                "customer_state=$test->{customer_state}",
+                "customer_zip=$test->{customer_zip}"
+            );
+            $url .= '?' . join('&', @params);
+
+            debug_print('DEBUG', "Request URL: $url");
+
+            my $request = HTTP::Request->new(GET => $url);
+            $request->header('x-api-key' => $config{api_key});
+            $request->header('User-Agent' => 'VICIdial-DID-Optimizer-Test/2.0');
+
+            debug_print('DEBUG', "Sending DID selection request...");
+
+            my $start_time = time();
+            my $response = $ua->request($request);
+            my $duration = time() - $start_time;
+
+            debug_print('DEBUG', sprintf("DID request completed in %.3f seconds", $duration));
+
+            if ($trace) {
+                trace_http_request($request, $response);
             }
-        } else {
-            print "      ❌ Request failed: " . $response->code . " " . $response->message . "\n";
-            if ($verbose) {
-                print "      Response: " . $response->content . "\n";
+
+            if ($response->is_success) {
+                my $data = eval { decode_json($response->content) };
+
+                if ($@) {
+                    print "      ❌ JSON parsing error: $@\n";
+                    debug_print('DEBUG', "Raw response: " . $response->content);
+                    next;
+                }
+
+                if ($data && ref($data) eq 'HASH') {
+                    debug_print('DEBUG', "Response structure: " . Dumper($data)) if $debug;
+
+                    if ($data->{success} && $data->{did} && $data->{did}->{number}) {
+                        my $selected_did = $data->{did}->{number};
+                        $did_usage{$selected_did}++;
+
+                        print "      ✅ Selected DID: $selected_did\n";
+                        print "      Is fallback: " . ($data->{did}->{is_fallback} ? 'yes' : 'no') . "\n";
+
+                        if ($verbose || $debug) {
+                            print "      Carrier: " . ($data->{did}->{carrier} // 'unknown') . "\n";
+                            print "      Location: " . ($data->{did}->{location} // 'unknown') . "\n";
+                            print "      Description: " . ($data->{did}->{description} // 'none') . "\n";
+                        }
+
+                        if ($data->{metadata}) {
+                            print "      Campaign: " . ($data->{metadata}->{campaign_id} // 'unknown') . "\n" if $verbose;
+                            print "      Agent: " . ($data->{metadata}->{agent_id} // 'unknown') . "\n" if $verbose;
+                            print "      Timestamp: " . ($data->{metadata}->{timestamp} // 'unknown') . "\n" if $debug;
+                        }
+
+                        # Track usage for rotation analysis
+                        debug_print('DEBUG', "DID usage count for $selected_did: " . $did_usage{$selected_did});
+
+                    } elsif ($data->{success} && $data->{did}) {
+                        print "      ⚠️  API returned success but incomplete DID data\n";
+                        debug_print('DEBUG', "DID object: " . Dumper($data->{did}));
+                    } else {
+                        print "      ❌ API returned failure or no DID\n";
+                        print "      Error: " . ($data->{message} || $data->{error} || 'unknown') . "\n" if $data->{message} || $data->{error};
+                        debug_print('DEBUG', "Full response: " . Dumper($data));
+                    }
+                } else {
+                    print "      ❌ Invalid response format\n";
+                    debug_print('DEBUG', "Response: " . $response->content);
+                }
+            } else {
+                print "      ❌ HTTP request failed: " . $response->code . " " . $response->message . "\n";
+                if ($verbose || $debug) {
+                    print "      Response body: " . $response->content . "\n";
+                }
+
+                # Provide troubleshooting hints
+                if ($response->code == 401) {
+                    debug_print('DEBUG', "Authentication failed - check API key");
+                } elsif ($response->code == 404) {
+                    debug_print('DEBUG', "Endpoint not found - check API URL and path");
+                } elsif ($response->code == 500) {
+                    debug_print('DEBUG', "Server error - check server logs");
+                }
+            }
+
+            sleep(0.5);  # Small delay between requests
+        }
+
+        print "\n" if $rotation_rounds > 1 && $round < $rotation_rounds;
+    }
+
+    # Analyze rotation results if we tested multiple rounds
+    if ($rotation_rounds > 1 && %did_usage) {
+        print "\n  📊 DID Rotation Analysis:\n";
+        my $unique_dids = scalar(keys %did_usage);
+        print "    Unique DIDs returned: $unique_dids\n";
+        print "    Total requests: $test_count\n";
+
+        if ($debug) {
+            print "    DID usage distribution:\n";
+            for my $did (sort keys %did_usage) {
+                print "      $did: $did_usage{$did} times\n";
             }
         }
 
-        sleep(1);  # Be nice to the API
+        if ($unique_dids > 1) {
+            print "    ✅ Rotation appears to be working (multiple DIDs returned)\n";
+        } elsif ($unique_dids == 1) {
+            print "    ⚠️  Only one DID returned across all tests\n";
+        } else {
+            print "    ❌ No DIDs returned\n";
+        }
     }
 }
 
@@ -498,16 +718,28 @@ sub test_invalid_endpoint {
 }
 
 sub print_help {
-    print "VICIdial DID Optimizer - API Test Script\n\n";
+    print "VICIdial DID Optimizer - FULL DEBUG API Test Script v2.0\n\n";
     print "Usage: $0 [options]\n\n";
     print "Options:\n";
-    print "  --verbose     Show detailed output\n";
-    print "  --config-only Only test configuration loading\n";
+    print "  --verbose     Show detailed output and additional information\n";
+    print "  --debug       MAXIMUM debug output with network diagnostics and rotation analysis\n";
+    print "  --trace       HTTP request/response tracing with full headers and bodies\n";
+    print "  --config-only Only test configuration loading and exit\n";
     print "  --help        Show this help message\n\n";
+    print "Debug Levels:\n";
+    print "  Normal:   Basic test results and errors\n";
+    print "  Verbose:  + API responses, timing, and extra details\n";
+    print "  Debug:    + Network connectivity, rotation analysis, data structures\n";
+    print "  Trace:    + Full HTTP headers, request/response bodies, timestamps\n\n";
     print "Examples:\n";
-    print "  sudo -u asterisk $0          # Basic test\n";
-    print "  sudo -u asterisk $0 --verbose # Detailed test\n";
-    print "  $0 --config-only             # Just check config\n";
+    print "  sudo -u asterisk $0                    # Basic test\n";
+    print "  sudo -u asterisk $0 --verbose          # Detailed test\n";
+    print "  sudo -u asterisk $0 --debug            # Maximum debugging\n";
+    print "  sudo -u asterisk $0 --trace            # Full HTTP tracing\n";
+    print "  $0 --config-only                       # Just check config files\n\n";
+    print "Remote Testing:\n";
+    print "  If testing from a remote server, make sure you have the latest version\n";
+    print "  of this script with correct API endpoints (/api/health, /api/v1/dids/next)\n";
 }
 
 # Run as asterisk user reminder
