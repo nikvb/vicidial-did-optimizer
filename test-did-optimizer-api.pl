@@ -256,7 +256,7 @@ sub load_vicidial_config {
 sub merge_configurations {
     # Set defaults
     my %defaults = (
-        api_base_url => 'http://localhost:3001',
+        api_base_url => 'http://localhost:3000',
         api_timeout => 10,
         max_retries => 3,
         fallback_did => '+18005551234',
@@ -561,17 +561,36 @@ sub test_did_selection {
                 if ($data && ref($data) eq 'HASH') {
                     debug_print('DEBUG', "Response structure: " . Dumper($data)) if $debug;
 
-                    if ($data->{success} && $data->{did} && $data->{did}->{number}) {
-                        my $selected_did = $data->{did}->{number};
+                    # Enhanced DID parsing with detailed debug information
+                    my $success = $data->{success};
+                    my $did_obj = $data->{did};
+                    my $did_number = $did_obj ? $did_obj->{number} : undef;
+
+                    debug_print('DEBUG', "Parsing check: success=$success, did_obj=" . ($did_obj ? "present" : "missing") . ", number=" . ($did_number || "missing"));
+
+                    if ($success && $did_obj && $did_number) {
+                        my $selected_did = $did_number;
                         $did_usage{$selected_did}++;
 
                         print "      ✅ Selected DID: $selected_did\n";
-                        print "      Is fallback: " . ($data->{did}->{is_fallback} ? 'yes' : 'no') . "\n";
+                        print "      Is fallback: " . ($did_obj->{is_fallback} ? 'yes' : 'no') . "\n";
 
                         if ($verbose || $debug) {
-                            print "      Carrier: " . ($data->{did}->{carrier} // 'unknown') . "\n";
-                            print "      Location: " . ($data->{did}->{location} // 'unknown') . "\n";
-                            print "      Description: " . ($data->{did}->{description} // 'none') . "\n";
+                            print "      Carrier: " . ($did_obj->{carrier} // 'unknown') . "\n";
+                            # Handle location object properly
+                            my $location = $did_obj->{location};
+                            my $location_str = 'unknown';
+                            if (ref($location) eq 'HASH') {
+                                if (%$location) {
+                                    $location_str = join(', ', map { "$_: $location->{$_}" } keys %$location);
+                                } else {
+                                    $location_str = 'not specified';
+                                }
+                            } elsif ($location) {
+                                $location_str = $location;
+                            }
+                            print "      Location: $location_str\n";
+                            print "      Description: " . ($did_obj->{description} // 'none') . "\n";
                         }
 
                         if ($data->{metadata}) {
@@ -583,17 +602,22 @@ sub test_did_selection {
                         # Track usage for rotation analysis
                         debug_print('DEBUG', "DID usage count for $selected_did: " . $did_usage{$selected_did});
 
-                    } elsif ($data->{success} && $data->{did}) {
+                    } elsif ($success && $did_obj) {
                         print "      ⚠️  API returned success but incomplete DID data\n";
-                        debug_print('DEBUG', "DID object: " . Dumper($data->{did}));
+                        print "      DID object missing number field\n";
+                        debug_print('DEBUG', "DID object: " . Dumper($did_obj));
+                    } elsif ($success) {
+                        print "      ⚠️  API returned success but no DID object\n";
+                        debug_print('DEBUG', "Full response: " . Dumper($data));
                     } else {
-                        print "      ❌ API returned failure or no DID\n";
+                        print "      ❌ API returned failure\n";
                         print "      Error: " . ($data->{message} || $data->{error} || 'unknown') . "\n" if $data->{message} || $data->{error};
                         debug_print('DEBUG', "Full response: " . Dumper($data));
                     }
                 } else {
-                    print "      ❌ Invalid response format\n";
-                    debug_print('DEBUG', "Response: " . $response->content);
+                    print "      ❌ Invalid response format (not a hash)\n";
+                    debug_print('DEBUG', "Response type: " . ref($data));
+                    debug_print('DEBUG', "Raw response: " . $response->content);
                 }
             } else {
                 print "      ❌ HTTP request failed: " . $response->code . " " . $response->message . "\n";
