@@ -23,6 +23,7 @@ This system provides intelligent Direct Inward Dialing (DID) optimization for VI
 - **Geographic Algorithm**: Uses Haversine formula for precise distance calculations
 - **Usage Balancing**: Automatically distributes calls across DID pools
 - **State/Area Code Matching**: Prioritizes local presence for better answer rates
+- **Reputation Filtering**: Automatically excludes DIDs with poor reputation scores (<50)
 - **Fallback Strategies**: Multiple algorithms ensure calls always get a DID
 
 ### VICIdial Integration
@@ -39,17 +40,64 @@ This system provides intelligent Direct Inward Dialing (DID) optimization for VI
 
 ## 🚀 Quick Installation
 
-### Option 1: Automated Installation (Recommended)
+### Prerequisites
+
+- VICIdial server with Asterisk
+- MongoDB server for DID Optimizer data
+- Node.js 18+ for the API server
+- Root access on VICIdial server for installation
+
+### Step 1: Install DID Optimizer API Server
+
+```bash
+# Clone the repository
+git clone https://github.com/nikvb/vicidial-did-optimizer.git
+cd vicidial-did-optimizer
+
+# Install dependencies
+npm install
+
+# Configure environment variables
+cp .env.example .env
+# Edit .env with your settings (MongoDB URL, API key, etc.)
+
+# Start the server
+PORT=5000 node server-full.js
+```
+
+### Step 2: Install VICIdial Integration (on VICIdial server)
 
 ```bash
 # 1. Download the installer
-wget https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/install-vicidial-integration.sh
+wget https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/install-vicidial-integration-autodetect.sh
 
 # 2. Make it executable
-chmod +x install-vicidial-integration.sh
+chmod +x install-vicidial-integration-autodetect.sh
 
 # 3. Run the installer (as root)
-sudo ./install-vicidial-integration.sh
+sudo ./install-vicidial-integration-autodetect.sh
+```
+
+The installer will:
+- ✅ Auto-detect your VICIdial database settings
+- ✅ Auto-detect your AGI directory location
+- ✅ Install all required AGI scripts
+- ✅ Configure the API endpoint settings
+- ✅ Set up logging in `/var/log/astguiclient/`
+- ✅ Install Perl dependencies automatically
+
+### Step 3: Configure API Endpoint
+
+After installation, edit `/etc/asterisk/dids.conf` to set your API server details:
+
+```ini
+[general]
+# Your DID Optimizer API server
+api_base_url=http://your-api-server:5000
+api_key=YOUR_ACTUAL_API_KEY_HERE
+
+# Fallback DID when API is unavailable
+fallback_did=+18005551234
 ```
 
 ### Option 2: Manual Installation
