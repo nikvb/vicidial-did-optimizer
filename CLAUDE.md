@@ -4,102 +4,322 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Multi-Tenant DID (Direct Inward Dialing) Optimization Service for VICIdial, designed to manage phone number pools with intelligent rotation algorithms, real-time analytics, and machine learning-based optimization.
+VICIdial DID Optimizer - A Node.js/Express application providing intelligent phone number (DID) rotation for VICIdial call centers with Google OAuth authentication and real-time analytics.
 
 ## Architecture
 
-### Microservices Structure
-- **Authentication Service** (Node.js/Express): Google OAuth, JWT, tenant/user management
-- **DID Management Service** (Go/Gin): DID CRUD, rotation algorithms, VICIdial API integration
-- **Analytics Service** (Python/FastAPI): Metrics processing, reporting, data aggregation
-- **ML Service** (Python/TensorFlow/PyTorch): Model training, inference, feature engineering
-- **Notification Service** (Node.js): Webhooks, email, WebSocket updates
+### Single Application Structure
+- **Main Server**: `server-full.js` - Express.js application with ES modules
+- **Database**: MongoDB with Mongoose ODM (inline model definitions)
+- **Frontend**: React SPA source in `temp_clone/frontend/` (Create React App)
+- **Frontend Build**: Pre-built static files in `frontend/` directory
+- **VICIdial Integration**: Perl scripts and Asterisk dialplan configuration
 
-### Data Stores
-- **PostgreSQL**: Main transactional data (tenants, users, DIDs, campaigns)
-- **Redis**: Caching, session storage, rate limiting
-- **ClickHouse**: Time-series analytics data
-- **MongoDB**: ML models, feature stores, audit logs
-- **MinIO**: Object storage for exports and backups
+### Key Models (Mongoose)
+- **User**: Authentication, Google OAuth, tenant association
+- **DID**: Phone numbers with rotation tracking and reputation scores
+- **CallRecord**: Call history and outcomes
+- **AuditLog**: System activity tracking
 
-### Infrastructure
-- Service Mesh: Istio for inter-service communication
-- Message Queue: Kafka for event streaming
-- API Gateway: Kong/AWS API Gateway
-- Load Balancer: Cloudflare/AWS ALB
+## Common Commands
+
+### Running the Application
+```bash
+# Start the server (no npm scripts defined in root)
+node server-full.js
+
+# With specific port (Cloudflare forwards https://endpoint.amdy.io to this)
+PORT=5000 node server-full.js
+
+# For development with frontend bypass
+DANGEROUSLY_DISABLE_HOST_CHECK=true npm start
+```
+
+### Frontend Development
+```bash
+# Navigate to frontend source
+cd temp_clone/frontend
+
+# Install dependencies
+npm install
+
+# Start development server (port 3000)
+npm start
+
+# Build for production
+npm run build
+
+# Run frontend tests
+npm test
+```
+
+### Testing
+```bash
+# E2E tests with Playwright
+node test-dashboard-api-v2.cjs  # Latest dashboard test
+node test-final-cloudflare.cjs  # Full integration test
+node test-login.cjs             # Authentication test
+
+# With display for debugging
+DISPLAY=:0 node test-login-debug.cjs
+```
+
+### VICIdial Integration
+```bash
+# Install integration
+sudo ./install-vicidial-integration.sh
+
+# Test Perl configuration
+perl vicidial-did-optimizer-config.pl --test
+
+# Test with parameters
+perl vicidial-did-optimizer-config.pl "CAMPAIGN001" "1001" "4155551234" "CA" "94102"
+```
 
 ## Key API Endpoints
 
-### DID Management
-- `GET /api/v1/dids/next`: Get next available DID (VICIdial integration)
-- `POST /api/v1/dids`: Create new DID
-- `PUT /api/v1/dids/:id`: Update DID
-- `DELETE /api/v1/dids/:id`: Delete DID
-- `POST /api/v1/dids/bulk`: Bulk DID operations
+### Core VICIdial Integration
+- `GET /api/v1/dids/next` - Main endpoint for DID selection (requires `x-api-key` header)
+  - Parameters: `campaign_id`, `agent_id`, `customer_phone`, `customer_state`, `customer_zip`
+  - Returns: Selected DID with rotation tracking
 
-### Analytics
-- `GET /api/v1/analytics/metrics`: Real-time metrics
-- `GET /api/v1/analytics/reports`: Generate reports
-- `POST /api/v1/analytics/export`: Export data
+### Authentication
+- `GET /api/v1/auth/google` - Initiate Google OAuth
+- `GET /api/v1/auth/google/callback` - OAuth callback
+- `POST /api/v1/auth/login` - Basic authentication
+- `GET /api/v1/auth/logout` - Session logout
+- `GET /api/v1/auth/check` - Verify authentication status
 
-## Database Schema Highlights
+### Health & Status
+- `GET /api/v1/health` - Service health check (API key required)
 
-Key tables in PostgreSQL:
-- `tenants`: Multi-tenant organization data
-- `users`: User accounts with Google OAuth integration
-- `dids`: Phone numbers with rotation metadata
-- `did_pools`: Logical groupings of DIDs
-- `campaigns`: VICIdial campaign configurations
-- `rotation_rules`: Customizable rotation algorithms
-- `usage_logs`: DID usage tracking for analytics
+## Environment Variables
+
+Required in `.env`:
+```bash
+# MongoDB (local database)
+MONGODB_URI=mongodb://127.0.0.1:27017/did_optimizer
+
+# Authentication
+JWT_SECRET=your_jwt_secret
+JWT_REFRESH_SECRET=your_refresh_secret
+API_KEY=your_api_key  # For VICIdial endpoint
+
+# Google OAuth
+GOOGLE_CLIENT_ID=your_client_id
+GOOGLE_CLIENT_SECRET=your_client_secret
+
+# Application
+PORT=5000
+FRONTEND_URL=https://dids.amdy.io
+SESSION_SECRET=your_session_secret
+```
+
+Frontend `.env` (temp_clone/frontend/.env):
+```bash
+# API endpoint (both dev and production)
+REACT_APP_API_URL=https://endpoint.amdy.io
+
+# Google OAuth
+REACT_APP_GOOGLE_CLIENT_ID=your_client_id
+```
+
+## Implementation Details
+
+### DID Rotation Algorithm (server-full.js:200-350)
+- Round-robin selection with daily usage limits
+- Tracks usage per DID with automatic daily reset
+- Fallback DID when pool exhausted
+- State/area code matching for geographic optimization
+
+### Authentication Flow
+- Google OAuth 2.0 with Passport.js
+- MongoDB session storage (7-day expiry)
+- JWT tokens for API authentication
+- Session-based web authentication
+
+### CORS Configuration
+Production domains:
+- `https://dids.amdy.io` (frontend)
+- `https://endpoint.amdy.io` (API - used for both development and production)
+- Frontend development server (when running locally)
+
+### Key Dependencies
+
+**Backend:**
+- Express 5.1.0 (note: v5, not v4)
+- Mongoose 8.18.2 for MongoDB
+- Passport with Google OAuth strategy
+- Playwright for E2E testing
+- Multiple unused dependencies (TensorFlow, Kafka, etc.) - likely for future features
+
+**Frontend (temp_clone/frontend):**
+- React 18.2.0 with Create React App
+- React Router v6 for routing
+- Tailwind CSS 3.3.6 for styling
+- React Query 3.39.3 for API state management
+- React Hook Form 7.48.2 for forms
+- Recharts 2.8.0 for data visualization
+- Axios 1.6.2 for HTTP requests
+- Headless UI & Heroicons for UI components
+
+## VICIdial Integration Files
+
+- `/etc/asterisk/dids.conf` - API configuration
+- `/usr/share/astguiclient/vicidial-did-optimizer-config.pl` - Perl integration script
+- Installation scripts: `install-vicidial-integration*.sh`
+
+## Testing Approach
+
+All tests use Playwright with headless Chromium:
+- Login flow verification
+- Dashboard API interactions
+- Cloudflare bypass handling
+- Screenshot capture on failure
 
 ## Frontend Structure
 
-React SPA with:
-- Components organized by feature (did/, analytics/, settings/)
-- React Query for API state management
-- Tailwind CSS for styling
-- Recharts for data visualization
-- React Hook Form for form handling
+### Pages (temp_clone/frontend/src/pages/)
+- `LandingPage.js` - Public landing page
+- `LoginPage.js` - Authentication with Google OAuth
+- `Dashboard.js` - Main dashboard overview
+- `DIDManagement.js` & `DIDManagementAdvanced.js` - DID management interfaces
+- `Analytics.js` - Analytics and reporting
+- `UserManagement.js` - User administration
+- `Settings.js` - Application settings
+- `Billing.js` - Billing and subscriptions
 
-## ML Models
+### Components (temp_clone/frontend/src/components/)
+- `auth/` - Authentication components
+- `common/` - Reusable UI components
+- `layouts/` - Page layouts
+- `navigation/` - Navigation components
+- `settings/` - Settings-related components
 
-The system implements several ML models:
-- **Conversion Predictor**: Random Forest for predicting DID conversion rates
-- **Anomaly Detector**: Isolation Forest for detecting unusual patterns
-- **Time Series Forecaster**: LSTM for volume predictions
-- **Churn Predictor**: XGBoost for identifying at-risk DIDs
+### Services (temp_clone/frontend/src/services/)
+API service layer for backend communication
 
-## Security Considerations
+## UI Design System
 
-- JWT-based authentication with refresh tokens
-- Google OAuth 2.0 integration
-- Row-level security in PostgreSQL
-- API rate limiting via Redis
-- Encrypted data at rest and in transit
-- Audit logging for compliance
+### Design Philosophy
+- **Dark Theme First**: Optimized for 24/7 call center operations
+- **Data-First Design**: Information hierarchy optimized for telecom operations
+- **Real-Time Focus**: Live data visualization with status indicators
+- **Progressive Disclosure**: Complex features revealed gradually
 
-## Environment Configuration
+### Color Palette (from UI-DESIGN-GUIDE.md)
+```css
+/* Dark Theme Base */
+--bg-primary: #0f172a;        /* Main background */
+--bg-secondary: #1e293b;      /* Card backgrounds */
+--bg-tertiary: #334155;       /* Hover states */
 
-Services expect these environment variables:
-- `DATABASE_URL`: PostgreSQL connection string
-- `REDIS_URL`: Redis connection string
-- `KAFKA_BROKERS`: Kafka broker addresses
-- `JWT_SECRET`: JWT signing secret
-- `GOOGLE_CLIENT_ID/SECRET`: OAuth credentials
-- `VICIDIAL_API_URL`: VICIdial API endpoint
-- `CLICKHOUSE_URL`: ClickHouse connection
-- `MONGODB_URI`: MongoDB connection string
+/* Status Colors */
+--success-green: #10b981;     /* Active DIDs */
+--warning-amber: #f59e0b;     /* Warnings */
+--error-red: #ef4444;         /* Errors/Inactive */
+--info-cyan: #06b6d4;         /* Information */
 
-## VICIdial Integration
-
-The service provides a REST API endpoint that VICIdial can call to get the next available DID:
+/* Text Colors */
+--text-primary: #f8fafc;      /* Primary text */
+--text-secondary: #cbd5e1;    /* Secondary text */
+--text-muted: #64748b;        /* Muted text */
 ```
-GET /api/v1/dids/next?campaign_id={campaign_id}&agent_id={agent_id}
+
+### Component Patterns
+
+#### Status Badges
+```jsx
+// Use for DID status, call states, system health
+<StatusBadge status="active" pulse={true} />
+// Colors: active (green), inactive (red), warning (yellow), processing (blue)
 ```
 
-This endpoint implements intelligent rotation based on:
-- Usage history
-- Time-based cooling periods
-- ML-predicted performance
-- Custom rotation rules per campaign
+#### Metric Cards
+```jsx
+// Dashboard statistics display
+<MetricCard
+  title="Active DIDs"
+  value="2,847"
+  change="+12%"
+  trend="up"
+/>
+```
+
+#### Data Tables
+```jsx
+// Smart tables with sorting, filtering, pagination
+<SmartTable
+  data={dids}
+  columns={didColumns}
+  pagination={true}
+  sortable={true}
+  selectable={true}
+/>
+```
+
+### Layout Patterns
+
+#### Dashboard Grid
+- Mobile: 1 column
+- Tablet (768px+): 2 columns
+- Desktop (1024px+): 3 columns
+- Large (1280px+): 4 columns
+
+#### DID Management Layout
+```jsx
+// Header with actions
+<div className="flex justify-between items-center">
+  <h1>DID Management</h1>
+  <div className="flex gap-3">
+    <Button variant="outline">Bulk Upload</Button>
+    <Button>Add DID</Button>
+  </div>
+</div>
+```
+
+### VICIdial-Specific Components
+
+#### Call Status Grid
+Visual representation of call states using colored squares:
+- Green: Active calls
+- Yellow (pulsing): Ringing
+- Blue: On hold
+- Gray: Idle
+
+#### DID Pool Cards
+Display pool statistics with:
+- Total DIDs count
+- Active/Inactive breakdown
+- Utilization percentage bar
+- Real-time status indicators
+
+### Accessibility Requirements
+- WCAG 2.1 AA compliance
+- Focus ring on all interactive elements
+- High contrast mode support
+- Screen reader friendly components
+- Keyboard navigation support
+
+### Performance Guidelines
+- Use React.lazy() for route-based code splitting
+- Implement virtual scrolling for large lists
+- Cache API responses with React Query
+- Optimize bundle size (<500KB initial load)
+- Target 90+ Lighthouse score
+
+### Implementation Notes
+Reference the detailed specifications in:
+- `temp_clone/UI-DESIGN-GUIDE.md` - Complete design system
+- `temp_clone/DID_MANAGEMENT_SPEC.md` - DID management page specs
+
+## Important Notes
+
+1. **Express 5.x**: Using Express v5 (not v4), some middleware may be incompatible
+2. **Two frontend directories**: Source in `temp_clone/frontend/`, built files in `frontend/`
+3. **API URL**: Always uses `https://endpoint.amdy.io` for both dev and production
+4. **Simple architecture**: Despite complex dependencies, actual implementation is straightforward
+5. **API Key security**: VICIdial endpoint requires `x-api-key` header
+6. **Session-based auth**: Web uses sessions, API uses JWT tokens
+- never USE any mock data if there is no data in DB display 0
+- use http://api3.amdy.io:3000 and http://api3.amdy.io:5000 do not use localhost
