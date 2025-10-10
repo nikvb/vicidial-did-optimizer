@@ -1,0 +1,111 @@
+; =========================================
+; DID Optimizer AGI Configuration Template
+; Version: 4.0 - Production Ready
+; =========================================
+
+; API Connection Settings
+api_key=did_315b95e7b2107598f4c5c6f51d21b3ac1768892fa81c1bb3ea38756bb1c2b43e
+api_base_url=http://api3.amdy.io:5000
+api_version=v1
+
+; =========================================
+; PRIVACY SETTINGS
+; =========================================
+; Privacy mode controls what customer data is sent to the API
+; 0 = OFF (default) - Send all available data for best DID matching
+; 1 = ON - Protect customer PII, only send anonymized/necessary data
+privacy_mode=0
+
+; What privacy_mode=1 does:
+; - Hashes lead IDs and phone numbers (SHA256)
+; - Removes customer zip, city, and full phone number
+; - Keeps only state and area code for geographic routing
+; - Masks phone numbers in logs
+; - Marks statistics as REDACTED
+
+; =========================================
+; TIMEOUT AND RETRY SETTINGS
+; =========================================
+api_timeout=5                ; Seconds to wait for API response
+api_retry_count=3            ; Number of retry attempts
+api_retry_delay=1            ; Seconds between retries
+
+; =========================================
+; FALLBACK CONFIGURATION
+; =========================================
+fallback_did=+18005551234    ; DID to use if API fails
+fallback_on_error=1          ; Use fallback on API errors
+fallback_on_timeout=1        ; Use fallback on timeout
+
+; =========================================
+; CACHING SETTINGS
+; =========================================
+cache_enabled=1              ; Enable DID caching for performance
+cache_ttl=300               ; Cache time-to-live in seconds (5 minutes)
+cache_size=1000             ; Maximum cache entries
+
+; =========================================
+; LOGGING CONFIGURATION
+; =========================================
+debug_mode=0                ; Enable debug logging (0=off, 1=on)
+log_level=INFO              ; Log level: DEBUG, INFO, WARNING, ERROR
+log_file=/var/log/astguiclient/did-optimizer.log
+log_rotation=daily          ; Log rotation: daily, weekly, size
+log_max_size=100M           ; Maximum log file size
+
+; When privacy_mode=1, logs will mask:
+; - Phone numbers (show only area code)
+; - Lead IDs
+; - API URLs containing sensitive data
+
+; =========================================
+; PERFORMANCE SETTINGS
+; =========================================
+connection_pool=1           ; Use connection pooling
+max_connections=10          ; Maximum API connections
+request_queue_size=100      ; Maximum queued requests
+
+; =========================================
+; GEOGRAPHIC PREFERENCES
+; =========================================
+; These settings work even in privacy mode using area codes
+prefer_local_state=1        ; Prefer DIDs from customer's state
+prefer_local_area=1         ; Prefer DIDs from customer's area code
+state_match_weight=10       ; Weight for state matching (0-100)
+area_match_weight=20        ; Weight for area code matching (0-100)
+
+; =========================================
+; ADVANCED SETTINGS
+; =========================================
+use_reputation_scoring=1    ; Consider DID reputation scores
+min_reputation_score=70     ; Minimum acceptable reputation
+rotation_algorithm=round_robin  ; Options: round_robin, weighted, random
+exclude_blacklisted=1       ; Exclude blacklisted DIDs
+
+; =========================================
+; GDPR/CCPA COMPLIANCE NOTES
+; =========================================
+; For GDPR/CCPA compliance, consider:
+; - Setting privacy_mode=1
+; - Implementing data retention policies
+; - Regular log rotation and deletion
+; - Documenting data usage in privacy policy
+
+; =========================================
+; PRODUCTION RECOMMENDATIONS
+; =========================================
+; For production use:
+; 1. Set debug_mode=0 (reduces log volume)
+; 2. Set log_level=WARNING or ERROR
+; 3. Enable cache_enabled=1 (improves performance)
+; 4. Consider privacy_mode=1 for compliance
+; 5. Use secure API key storage (consider encryption)
+; 6. Implement log rotation to manage disk space
+; 7. Monitor fallback_did usage for API health
+
+; =========================================
+; TESTING SETTINGS (COMMENT OUT IN PRODUCTION)
+; =========================================
+; test_mode=1                ; Test mode (uses test DIDs)
+; test_did_prefix=555        ; Test DID prefix
+; verbose_errors=1           ; Detailed error messages

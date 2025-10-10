@@ -41,15 +41,87 @@ import tenantRoutes from './temp_clone/routes/tenants.js';
 // import { validateApiKey } from './middleware/auth.js';
 // import DID from './models/DID.js';
 
-// Simple API key validation middleware
-const validateApiKey = (req, res, next) => {
-  const apiKey = req.headers['x-api-key'];
-  if (!apiKey || apiKey !== process.env.API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
+// Define Tenant model using the existing mongoose connection
+const TenantSchema = new mongoose.Schema({
+  name: String,
+  domain: String,
+  isActive: Boolean,
+  apiKeys: [{
+    key: String,
+    name: String,
+    permissions: [String],
+    isActive: Boolean,
+    lastUsed: Date,
+    createdAt: Date
+  }],
+  rotationState: {
+    currentIndex: Number,
+    lastReset: Date,
+    usedDidsInCycle: [String]
   }
-  next();
+});
+
+// Get or create Tenant model
+let Tenant;
+try {
+  Tenant = mongoose.model('Tenant');
+} catch (error) {
+  Tenant = mongoose.model('Tenant', TenantSchema);
+}
+
+// API key validation middleware using the same DB connection
+const validateApiKey = async (req, res, next) => {
+  try {
+    console.log('🔍 API Key Validation - Headers:', req.headers);
+    const apiKey = req.headers['x-api-key'];
+
+    console.log('🔑 API Key received:', apiKey ? `${apiKey.substring(0, 8)}...` : 'NONE');
+
+    if (!apiKey) {
+      console.log('❌ No API key provided');
+      return res.status(401).json({
+        success: false,
+        message: 'API key required'
+      });
+    }
+
+    console.log('🔍 Looking up tenant for API key...');
+    const tenant = await Tenant.findOne({
+      'apiKeys.key': apiKey,
+      'apiKeys.isActive': true,
+      isActive: true
+    });
+
+    if (!tenant) {
+      console.log('❌ No tenant found for API key');
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid API key'
+      });
+    }
+
+    console.log('✅ Tenant found:', tenant.name, 'ID:', tenant._id);
+
+    // Update last used timestamp
+    const apiKeyObj = tenant.apiKeys.find(key => key.key === apiKey);
+    if (apiKeyObj) {
+      apiKeyObj.lastUsed = new Date();
+      await tenant.save();
+      console.log('✅ API key last used timestamp updated');
+    }
+
+    req.tenant = tenant;
+    req.apiKey = apiKeyObj;
+    next();
+  } catch (error) {
+    console.error('💥 API key validation error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'API key validation failed',
+      error: error.message
+    });
+  }
 };
-// import Tenant from './models/Tenant.js'; // Commented out until model created
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -87,7 +159,7 @@ try {
   DID = mongoose.model('DID');
 } catch (error) {
   DID = mongoose.model('DID', new mongoose.Schema({
-    tenantId: String,
+    tenantId: mongoose.Schema.Types.ObjectId,  // Fixed: Changed from String to ObjectId
     phoneNumber: String,
     status: String,
     reputation: {
@@ -112,6 +184,7 @@ try {
     timestamp: Date,
     duration: Number,
     outcome: String,
+    metadata: Object,
     createdAt: { type: Date, default: Date.now }
   }));
 }
@@ -215,7 +288,7 @@ app.use(cors({
     // Allow requests with no origin (mobile apps, automated tests)
     if (!origin) return callback(null, true);
 
-    const allowedOrigins = ['https://dids.amdy.io', 'http://api3.amdy.io:3000', 'https://endpoint.amdy.io', 'http://localhost:3000'];
+    const allowedOrigins = ['https://dids.amdy.io', 'http://api3.amdy.io:3000', 'http://api3.amdy.io:5000', 'https://endpoint.amdy.io', 'http://localhost:3000', 'http://localhost:5000'];
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
@@ -418,6 +491,27 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
     did.usageCount = (did.usageCount || 0) + 1;
     await did.save();
 
+    // Create call record for tracking
+    const callRecord = new CallRecord({
+      didId: did._id.toString(),
+      tenantId: req.tenant._id.toString(),
+      callId: `${campaign_id}_${agent_id}_${Date.now()}`, // Generate unique call ID
+      timestamp: new Date(),
+      duration: 0, // Will be updated when call completes
+      outcome: 'initiated', // Initial state
+      metadata: {
+        campaign_id,
+        agent_id,
+        customer_phone,
+        customer_state,
+        customer_area_code
+      },
+      createdAt: new Date()
+    });
+    await callRecord.save();
+
+    console.log('📞 Call record created:', callRecord.callId);
+
     console.log('✅ Rotation state updated:', {
       selectedDID: did.phoneNumber,
       newIndex: rotationState.currentIndex,
@@ -584,7 +678,8 @@ app.post('/api/v1/auth/login', async (req, res) => {
           email: user.email,
           firstName: user.firstName,
           lastName: user.lastName,
-          role: user.role
+          role: user.role,
+          tenant: user.tenant
         }
       }
     });
@@ -617,7 +712,8 @@ app.get('/api/v1/auth/me', async (req, res) => {
           email: user.email,
           firstName: user.firstName,
           lastName: user.lastName,
-          role: user.role
+          role: user.role,
+          tenant: user.tenant
         }
       }
     });
@@ -632,30 +728,62 @@ app.get('/api/v1/dashboard/stats', async (req, res) => {
   console.log('🔍 Dashboard stats endpoint called');
   console.log('Headers:', req.headers);
   try {
+    // Get user from token
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    let userTenantId = null;
+    let isAdmin = false;
+
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        const user = await User.findById(decoded.id);
+        if (user) {
+          userTenantId = user.tenant;
+          isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+          console.log('👤 User role:', user.role, 'Tenant:', userTenantId);
+        }
+      } catch (error) {
+        console.error('Token decode error:', error.message);
+      }
+    }
+
     // Get actual data from database
     const totalUsers = await User.countDocuments();
     const totalTenants = await User.distinct('tenant').then(tenants => tenants.filter(Boolean).length);
 
-    // Get DID statistics from real database
-    const totalDIDs = await DID.countDocuments();
-    const activeDIDs = await DID.countDocuments({ status: 'active' });
+    // Build DID query based on user role
+    // Convert tenant ID to ObjectId for proper MongoDB comparison
+    const didQuery = userTenantId && !isAdmin ? {
+      tenantId: mongoose.Types.ObjectId.isValid(userTenantId) ?
+        new mongoose.Types.ObjectId(userTenantId) : userTenantId
+    } : {};
+    console.log('📊 DID Query filter:', didQuery);
 
-    // Get today's calls
+    // Get DID statistics from real database
+    const totalDIDs = await DID.countDocuments(didQuery);
+    const activeDIDs = await DID.countDocuments({ ...didQuery, status: 'active' });
+
+    // Get today's calls (filter by tenant for non-admin users)
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    const callQuery = userTenantId && !isAdmin ? { tenantId: userTenantId.toString() } : {};
     const callsToday = await CallRecord.countDocuments({
+      ...callQuery,
       createdAt: { $gte: today }
     });
 
-    // API calls could be same as calls for now
+    // API calls are the total number of DID requests made today
     const apiCalls = callsToday;
-    const apiUsage = totalUsers * 100; // Simple calculation based on users
+    // API Usage is total API calls made by this tenant
+    const apiUsage = callsToday;
 
     // Calculate success rate from actual call records
     const totalCallsToday = await CallRecord.countDocuments({
+      ...callQuery,
       createdAt: { $gte: today }
     });
     const successfulCalls = await CallRecord.countDocuments({
+      ...callQuery,
       createdAt: { $gte: today },
       outcome: 'success'
     });
@@ -850,6 +978,43 @@ app.get('/api/v1/dids/:id', async (req, res) => {
     console.error('DID details error:', error);
     res.status(500).json({ message: 'Failed to load DID details' });
   }
+});
+
+// API Keys endpoints are handled by tenant routes
+// The tenant routes provide the actual implementation for:
+// GET    /api/v1/tenants/api-keys     - Get all API keys
+// POST   /api/v1/tenants/api-keys     - Create new API key
+// DELETE /api/v1/tenants/api-keys/:id - Delete API key
+
+// Mock rotation rules endpoints for Settings page
+app.get('/api/v1/rotation-rules', async (req, res) => {
+  res.json({
+    data: {
+      rules: []
+    }
+  });
+});
+
+app.get('/api/v1/rotation-rules/templates/list', async (req, res) => {
+  res.json({
+    data: {
+      templates: []
+    }
+  });
+});
+
+app.get('/api/v1/rotation-rules/analytics/overview', async (req, res) => {
+  res.json({
+    data: {
+      analytics: {
+        totalRules: 0,
+        activeRules: 0,
+        averageEffectiveness: 85,
+        recentViolations: [],
+        algorithmDistribution: {}
+      }
+    }
+  });
 });
 
 // Health check

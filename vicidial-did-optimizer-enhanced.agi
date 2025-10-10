@@ -1,0 +1,460 @@
+#!/usr/bin/perl
+#
+# vicidial-did-optimizer-enhanced.agi - Complete DID Optimizer AGI Script
+# Version: 3.0 - Captures ALL available AGI and VICIdial data
+#
+
+use strict;
+use warnings;
+use Asterisk::AGI;
+use LWP::UserAgent;
+use JSON;
+use URI::Escape;
+use Time::HiRes qw(gettimeofday tv_interval);
+use Cache::FileCache;
+use POSIX qw(strftime);
+
+# Initialize AGI
+my $AGI = new Asterisk::AGI;
+my %input = $AGI->ReadParse();
+
+# Initialize cache if enabled
+my $cache;
+my %config = read_config('/etc/asterisk/dids.conf');
+
+if ($config{cache_enabled}) {
+    $cache = Cache::FileCache->new({
+        namespace => 'did_optimizer',
+        default_expires_in => $config{cache_ttl} || 300,
+        cache_root => '/tmp/did_cache'
+    });
+}
+
+# Start timer for performance tracking
+my $start_time = [gettimeofday];
+
+# Get ALL available data - comprehensive capture
+my %call_data = get_all_call_data();
+
+# Log the complete request with all data
+log_message("INFO", "DID Request - Campaign: $call_data{campaign_id}, Agent: $call_data{agent_id}, Dialed: $call_data{dialed_number}, Customer: $call_data{customer_phone}");
+log_message("DEBUG", "Full call data: " . encode_json(\%call_data));
+
+# Check cache first
+my $cache_key = generate_cache_key(%call_data);
+my $selected_did;
+
+if ($config{cache_enabled} && $cache) {
+    $selected_did = $cache->get($cache_key);
+    if ($selected_did) {
+        log_message("DEBUG", "Cache hit for key: $cache_key");
+    }
+}
+
+# If not in cache, call API with ALL data
+if (!$selected_did) {
+    $selected_did = get_did_from_api_with_retry(%call_data);
+
+    # Store in cache if successful
+    if ($config{cache_enabled} && $cache && $selected_did ne $config{fallback_did}) {
+        $cache->set($cache_key, $selected_did);
+        log_message("DEBUG", "Cached DID for key: $cache_key");
+    }
+}
+
+# Set comprehensive channel variables
+$AGI->set_variable('OPTIMIZER_DID', $selected_did);
+$AGI->set_variable('OPTIMIZER_STATUS', $selected_did ? 'SUCCESS' : 'FAILURE');
+$AGI->set_variable('OPTIMIZER_FALLBACK', $selected_did eq $config{fallback_did} ? 'YES' : 'NO');
+$AGI->set_variable('OPTIMIZER_TIMESTAMP', time());
+$AGI->set_variable('OPTIMIZER_DIALED', $call_data{dialed_number});
+
+# Calculate and log execution time
+my $elapsed = tv_interval($start_time);
+log_message("INFO", sprintf("DID selection completed in %.3f seconds - Selected: %s for dialed: %s",
+    $elapsed, $selected_did, $call_data{dialed_number}));
+
+# Update statistics with complete data
+update_statistics($selected_did, $elapsed, \%call_data);
+
+exit 0;
+
+# =====================================
+# Subroutines
+# =====================================
+
+sub get_all_call_data {
+    my %data;
+
+    # ===== STANDARD AGI VARIABLES =====
+    # These come from Asterisk automatically via %input hash
+    $data{request} = $input{request} || '';           # AGI script name
+    $data{channel} = $input{channel} || '';           # Channel name (e.g., SIP/trunk-00000001)
+    $data{language} = $input{language} || 'en';       # Language code
+    $data{type} = $input{type} || '';                 # Channel type (SIP, IAX2, etc.)
+    $data{uniqueid} = $input{uniqueid} || '';         # Unique call ID
+    $data{version} = $input{version} || '';           # Asterisk version
+    $data{callerid} = $input{callerid} || '';         # Caller ID number
+    $data{calleridname} = $input{calleridname} || ''; # Caller ID name
+    $data{callingpres} = $input{callingpres} || '';   # Calling presentation
+    $data{callingani2} = $input{callingani2} || '';   # ANI2 (Info digits)
+    $data{callington} = $input{callington} || '';      # Calling type of number
+    $data{callingtns} = $input{callingtns} || '';     # Transit Network Selector
+    $data{dnid} = $input{dnid} || '';                 # Dialed Number Identifier
+    $data{rdnis} = $input{rdnis} || '';               # Redirected Dialed Number ID Service
+    $data{context} = $input{context} || '';           # Dialplan context
+    $data{extension} = $input{extension} || '';       # Extension (DIALED NUMBER!)
+    $data{priority} = $input{priority} || '';         # Dialplan priority
+    $data{enhanced} = $input{enhanced} || '';         # Enhanced AGI
+    $data{accountcode} = $input{accountcode} || '';   # Account code
+    $data{threadid} = $input{threadid} || '';         # Thread ID
+
+    # ===== CRITICAL: DIALED NUMBER =====
+    # The extension field contains the actual number being dialed
+    $data{dialed_number} = $input{extension} || '';
+
+    # Strip common dial prefixes if present (9, 91, 8, 81, etc.)
+    my $cleaned_dialed = $data{dialed_number};
+    $cleaned_dialed =~ s/^9//;   # Remove dial-9 prefix
+    $cleaned_dialed =~ s/^91//;  # Remove dial-91 prefix
+    $cleaned_dialed =~ s/^8//;   # Remove dial-8 prefix
+    $cleaned_dialed =~ s/^81//;  # Remove dial-81 prefix
+    $data{dialed_number_clean} = $cleaned_dialed;
+
+    # ===== VICIDIAL CAMPAIGN VARIABLES =====
+    # These are set by VICIdial in the dialplan
+    $data{campaign_id} = $AGI->get_variable('CAMPAIGN_ID') ||
+                        $AGI->get_variable('CAMPAIGN') ||
+                        $AGI->get_variable('CAMPCUST') ||
+                        'DEFAULT';
+
+    $data{campaign_name} = $AGI->get_variable('CAMPAIGN_NAME') || '';
+
+    # ===== AGENT INFORMATION =====
+    $data{agent_id} = $AGI->get_variable('AGENT_USER') ||
+                     $AGI->get_variable('AGENT') ||
+                     $AGI->get_variable('AGENTUSER') ||
+                     $AGI->get_variable('CIDname') ||  # Sometimes agent is in CIDname
+                     '0';
+
+    $data{agent_name} = $AGI->get_variable('AGENT_NAME') || '';
+    $data{agent_phone} = $AGI->get_variable('AGENT_PHONE') || '';
+    $data{agent_station} = $AGI->get_variable('AGENT_STATION') || '';
+
+    # ===== CUSTOMER/LEAD INFORMATION =====
+    $data{lead_id} = $AGI->get_variable('LEAD_ID') ||
+                    $AGI->get_variable('LEADID') ||
+                    $AGI->get_variable('VENDLEADCODE') || '';
+
+    $data{list_id} = $AGI->get_variable('LIST_ID') ||
+                    $AGI->get_variable('LISTID') || '';
+
+    $data{customer_phone} = $AGI->get_variable('CUSTOMER_PHONE') ||
+                           $AGI->get_variable('PHONE_NUMBER') ||
+                           $data{dialed_number_clean} ||  # Use dialed number as fallback
+                           $input{callerid} || '';
+
+    $data{customer_state} = $AGI->get_variable('CUSTOMER_STATE') ||
+                           $AGI->get_variable('STATE') ||
+                           $AGI->get_variable('PROVINCE') || '';
+
+    $data{customer_zip} = $AGI->get_variable('CUSTOMER_ZIP') ||
+                         $AGI->get_variable('POSTAL_CODE') ||
+                         $AGI->get_variable('ZIP') || '';
+
+    $data{customer_city} = $AGI->get_variable('CUSTOMER_CITY') ||
+                          $AGI->get_variable('CITY') || '';
+
+    $data{customer_first_name} = $AGI->get_variable('FIRST_NAME') || '';
+    $data{customer_last_name} = $AGI->get_variable('LAST_NAME') || '';
+    $data{customer_address} = $AGI->get_variable('ADDRESS1') || '';
+    $data{customer_email} = $AGI->get_variable('EMAIL') || '';
+
+    # ===== VICIDIAL SPECIFIC VARIABLES =====
+    $data{epoch} = $AGI->get_variable('EPOCH') || time();
+    $data{uniqueid_epoch} = $AGI->get_variable('UNIQUEID') || $data{uniqueid};
+    $data{user} = $AGI->get_variable('USER') || '';
+    $data{pass} = $AGI->get_variable('PASS') || '';
+    $data{phone_code} = $AGI->get_variable('PHONE_CODE') || '1';  # Country code
+    $data{vendor_lead_code} = $AGI->get_variable('VENDOR_LEAD_CODE') || '';
+    $data{source_id} = $AGI->get_variable('SOURCE_ID') || '';
+    $data{rank} = $AGI->get_variable('RANK') || '';
+    $data{owner} = $AGI->get_variable('OWNER') || '';
+    $data{comments} = $AGI->get_variable('COMMENTS') || '';
+    $data{security_phrase} = $AGI->get_variable('SECURITY_PHRASE') || '';
+
+    # ===== CALL ROUTING INFORMATION =====
+    $data{dial_prefix} = $AGI->get_variable('DIAL_PREFIX') || '';
+    $data{dial_timeout} = $AGI->get_variable('DIAL_TIMEOUT') || '60';
+    $data{trunk} = $AGI->get_variable('TRUNK') ||
+                  $AGI->get_variable('TRUNKX') || '';
+    $data{carrier} = $AGI->get_variable('CARRIER') || '';
+    $data{dial_ingroup} = $AGI->get_variable('DIAL_INGROUP') || '';
+
+    # ===== CUSTOM FIELDS =====
+    # Check for any custom fields (custom_01 through custom_10)
+    for (my $i = 1; $i <= 10; $i++) {
+        my $field_name = sprintf("custom_%02d", $i);
+        $data{$field_name} = $AGI->get_variable(uc($field_name)) || '';
+    }
+
+    # ===== HOPPER AND LIST INFORMATION =====
+    $data{hopper_id} = $AGI->get_variable('HOPPER_ID') || '';
+    $data{hopper_priority} = $AGI->get_variable('HOPPER_PRIORITY') || '';
+    $data{list_name} = $AGI->get_variable('LIST_NAME') || '';
+    $data{gmt_offset} = $AGI->get_variable('GMT_OFFSET') || '';
+    $data{called_count} = $AGI->get_variable('CALLED_COUNT') || '0';
+
+    # ===== INBOUND/OUTBOUND INDICATORS =====
+    $data{call_type} = $AGI->get_variable('CALL_TYPE') || 'OUTBOUND';
+    $data{dnis} = $AGI->get_variable('DNIS') || $input{dnid} || '';
+
+    # ===== RECORDING INFORMATION =====
+    $data{recording_id} = $AGI->get_variable('RECORDING_ID') || '';
+    $data{recording_filename} = $AGI->get_variable('REC_FILENAME') || '';
+
+    # ===== SCRIPT AND STATUS =====
+    $data{script} = $AGI->get_variable('SCRIPT') || '';
+    $data{status} = $AGI->get_variable('STATUS') || 'NEW';
+
+    # ===== TIME ZONE INFORMATION =====
+    $data{local_time} = $AGI->get_variable('LOCAL_TIME') || '';
+    $data{tz_code} = $AGI->get_variable('TZ_CODE') || '';
+
+    # ===== FILTER INFORMATION =====
+    $data{filter_phone_group} = $AGI->get_variable('FILTER_PHONE_GROUP') || '';
+    $data{filter_url} = $AGI->get_variable('FILTER_URL') || '';
+
+    # ===== ADDITIONAL METADATA =====
+    $data{timestamp} = time();
+    $data{timestamp_formatted} = strftime("%Y-%m-%d %H:%M:%S", localtime);
+
+    # Extract area code and exchange from dialed number
+    if ($data{dialed_number_clean} =~ /^(\d{3})(\d{3})/) {
+        $data{dialed_area_code} = $1;
+        $data{dialed_exchange} = $2;
+        $data{dialed_npa_nxx} = "$1$2";
+    }
+
+    # Extract area code from customer phone
+    if ($data{customer_phone} =~ /^1?(\d{3})/) {
+        $data{customer_area_code} = $1;
+    }
+
+    return %data;
+}
+
+sub get_did_from_api_with_retry {
+    my (%call_data) = @_;
+
+    my $max_retries = $config{api_retry_count} || 3;
+    my $retry_delay = $config{api_retry_delay} || 1;
+
+    for (my $attempt = 1; $attempt <= $max_retries; $attempt++) {
+        my $did = call_optimizer_api(%call_data);
+
+        if ($did && $did ne $config{fallback_did}) {
+            return $did;
+        }
+
+        if ($attempt < $max_retries) {
+            log_message("WARNING", "API attempt $attempt failed, retrying in $retry_delay seconds...");
+            sleep($retry_delay);
+        }
+    }
+
+    log_message("ERROR", "All API attempts failed, using fallback DID");
+    return $config{fallback_did};
+}
+
+sub call_optimizer_api {
+    my (%call_data) = @_;
+
+    my $ua = LWP::UserAgent->new(
+        timeout => $config{api_timeout} || 5,
+        agent => 'VICIdial-DID-Optimizer/3.0'
+    );
+
+    # Build URL with ALL relevant parameters
+    my $url = $config{api_base_url} . '/api/' . ($config{api_version} || 'v1') . '/dids/next';
+    my @params;
+
+    # Required parameters
+    push @params, 'campaign_id=' . uri_escape($call_data{campaign_id});
+    push @params, 'agent_id=' . uri_escape($call_data{agent_id});
+
+    # IMPORTANT: Pass the dialed number!
+    push @params, 'dialed_number=' . uri_escape($call_data{dialed_number_clean}) if $call_data{dialed_number_clean};
+
+    # Customer information
+    push @params, 'customer_phone=' . uri_escape($call_data{customer_phone}) if $call_data{customer_phone};
+    push @params, 'customer_state=' . uri_escape($call_data{customer_state}) if $call_data{customer_state};
+    push @params, 'customer_zip=' . uri_escape($call_data{customer_zip}) if $call_data{customer_zip};
+    push @params, 'customer_city=' . uri_escape($call_data{customer_city}) if $call_data{customer_city};
+    push @params, 'customer_area_code=' . uri_escape($call_data{customer_area_code}) if $call_data{customer_area_code};
+
+    # Lead and list information
+    push @params, 'lead_id=' . uri_escape($call_data{lead_id}) if $call_data{lead_id};
+    push @params, 'list_id=' . uri_escape($call_data{list_id}) if $call_data{list_id};
+    push @params, 'vendor_lead_code=' . uri_escape($call_data{vendor_lead_code}) if $call_data{vendor_lead_code};
+
+    # Call metadata
+    push @params, 'uniqueid=' . uri_escape($call_data{uniqueid}) if $call_data{uniqueid};
+    push @params, 'called_count=' . uri_escape($call_data{called_count}) if $call_data{called_count};
+    push @params, 'hopper_priority=' . uri_escape($call_data{hopper_priority}) if $call_data{hopper_priority};
+
+    # Dialed number details
+    push @params, 'dialed_area_code=' . uri_escape($call_data{dialed_area_code}) if $call_data{dialed_area_code};
+    push @params, 'dialed_exchange=' . uri_escape($call_data{dialed_exchange}) if $call_data{dialed_exchange};
+
+    $url .= '?' . join('&', @params);
+
+    log_message("DEBUG", "API Request: $url");
+
+    # Prepare headers with additional metadata
+    my %headers = (
+        'x-api-key' => $config{api_key},
+        'Content-Type' => 'application/json',
+        'X-Request-ID' => $call_data{uniqueid},
+        'X-Campaign-ID' => $call_data{campaign_id},
+        'X-Agent-ID' => $call_data{agent_id},
+        'X-Dialed-Number' => $call_data{dialed_number_clean}
+    );
+
+    # Make API request
+    my $response = $ua->get($url, %headers);
+
+    if ($response->is_success) {
+        my $content = $response->content;
+        log_message("DEBUG", "API Response: $content");
+
+        eval {
+            my $data = decode_json($content);
+            if ($data->{success} && $data->{data}->{phoneNumber}) {
+                # Set additional variables if available
+                if ($data->{data}->{provider}) {
+                    $AGI->set_variable('OPTIMIZER_PROVIDER', $data->{data}->{provider});
+                }
+                if ($data->{data}->{state}) {
+                    $AGI->set_variable('OPTIMIZER_STATE', $data->{data}->{state});
+                }
+                if ($data->{data}->{areaCode}) {
+                    $AGI->set_variable('OPTIMIZER_AREACODE', $data->{data}->{areaCode});
+                }
+                if ($data->{data}->{reputation}) {
+                    $AGI->set_variable('OPTIMIZER_SCORE', $data->{data}->{reputation});
+                }
+                if ($data->{data}->{didId}) {
+                    $AGI->set_variable('OPTIMIZER_DID_ID', $data->{data}->{didId});
+                }
+
+                return $data->{data}->{phoneNumber};
+            }
+        };
+
+        if ($@) {
+            log_message("ERROR", "JSON decode error: $@");
+        }
+    } else {
+        log_message("ERROR", "API request failed: " . $response->status_line);
+    }
+
+    return undef;
+}
+
+sub generate_cache_key {
+    my (%call_data) = @_;
+
+    # Create cache key including dialed number for better granularity
+    my @key_parts = (
+        $call_data{campaign_id},
+        $call_data{customer_state} || 'XX',
+        $call_data{dialed_area_code} || substr($call_data{dialed_number_clean} || '0000', 0, 3),
+        substr($call_data{customer_phone} || '0000000000', 0, 6)  # Area code + prefix
+    );
+
+    return join(':', @key_parts);
+}
+
+sub read_config {
+    my ($config_file) = @_;
+    my %config;
+
+    if (!-e $config_file) {
+        die "Configuration file not found: $config_file";
+    }
+
+    open(my $fh, '<', $config_file) or die "Cannot open config file: $!";
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^[;#]/;  # Skip comments
+        next if $line =~ /^\s*$/;  # Skip empty lines
+
+        if ($line =~ /^(\w+)\s*=\s*(.+)$/) {
+            my ($key, $value) = ($1, $2);
+            $value =~ s/\s+$//;  # Trim trailing whitespace
+            $config{$key} = $value;
+        }
+    }
+    close($fh);
+
+    # Validate required configuration
+    die "Missing api_key in configuration" unless $config{api_key};
+    die "Missing api_base_url in configuration" unless $config{api_base_url};
+    die "Missing fallback_did in configuration" unless $config{fallback_did};
+
+    return %config;
+}
+
+sub log_message {
+    my ($level, $message) = @_;
+
+    # Check log level
+    my %log_levels = (
+        DEBUG => 0,
+        INFO => 1,
+        WARNING => 2,
+        ERROR => 3
+    );
+
+    my $config_level = $log_levels{$config{log_level} || 'INFO'};
+    my $message_level = $log_levels{$level};
+
+    return if $message_level < $config_level;
+    return if !$config{debug_mode} && $level eq 'DEBUG';
+
+    my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    my $log_file = $config{log_file} || '/var/log/astguiclient/did-optimizer.log';
+
+    open(my $log, '>>', $log_file) or return;
+    flock($log, 2);  # Exclusive lock
+    print $log "[$timestamp] [$level] $message\n";
+    close($log);
+}
+
+sub update_statistics {
+    my ($did, $response_time, $call_data_ref) = @_;
+
+    # Update statistics file with comprehensive data
+    my $stats_file = '/var/log/astguiclient/did-optimizer-stats.log';
+    open(my $stats, '>>', $stats_file) or return;
+    flock($stats, 2);
+
+    my $timestamp = time();
+    my $is_fallback = $did eq $config{fallback_did} ? 1 : 0;
+
+    # Log comprehensive stats including dialed number
+    print $stats join(',',
+        $timestamp,
+        $did,
+        $response_time,
+        $is_fallback,
+        $call_data_ref->{campaign_id} || '',
+        $call_data_ref->{agent_id} || '',
+        $call_data_ref->{dialed_number_clean} || '',
+        $call_data_ref->{customer_state} || '',
+        $call_data_ref->{dialed_area_code} || ''
+    ) . "\n";
+
+    close($stats);
+}

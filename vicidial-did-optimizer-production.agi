@@ -1,0 +1,448 @@
+#!/usr/bin/perl
+#
+# vicidial-did-optimizer-production.agi - Production-Ready DID Optimizer AGI Script
+# Version: 4.0 - With privacy mode and realistic data capture
+#
+
+use strict;
+use warnings;
+use Asterisk::AGI;
+use LWP::UserAgent;
+use JSON;
+use URI::Escape;
+use Time::HiRes qw(gettimeofday tv_interval);
+use Cache::FileCache;
+use POSIX qw(strftime);
+use Digest::SHA qw(sha256_hex);
+
+# Initialize AGI
+my $AGI = new Asterisk::AGI;
+my %input = $AGI->ReadParse();
+
+# Read configuration first to check privacy settings
+my %config = read_config('/etc/asterisk/dids.conf');
+
+# Initialize cache if enabled
+my $cache;
+if ($config{cache_enabled}) {
+    $cache = Cache::FileCache->new({
+        namespace => 'did_optimizer',
+        default_expires_in => $config{cache_ttl} || 300,
+        cache_root => '/tmp/did_cache'
+    });
+}
+
+# Start timer for performance tracking
+my $start_time = [gettimeofday];
+
+# Get available call data (respecting privacy mode)
+my %call_data = get_realistic_call_data();
+
+# Log the request (with privacy consideration)
+if ($config{privacy_mode}) {
+    log_message("INFO", sprintf("DID Request - Campaign: %s, Agent: %s, Dialed: %s (Privacy mode ON)",
+        $call_data{campaign_id},
+        $call_data{agent_id},
+        mask_phone_number($call_data{dialed_number})));
+} else {
+    log_message("INFO", sprintf("DID Request - Campaign: %s, Agent: %s, Dialed: %s",
+        $call_data{campaign_id},
+        $call_data{agent_id},
+        $call_data{dialed_number}));
+}
+
+# Check cache first
+my $cache_key = generate_cache_key(%call_data);
+my $selected_did;
+
+if ($config{cache_enabled} && $cache) {
+    $selected_did = $cache->get($cache_key);
+    if ($selected_did) {
+        log_message("DEBUG", "Cache hit for key: $cache_key");
+    }
+}
+
+# If not in cache, call API
+if (!$selected_did) {
+    $selected_did = get_did_from_api_with_retry(%call_data);
+
+    # Store in cache if successful
+    if ($config{cache_enabled} && $cache && $selected_did ne $config{fallback_did}) {
+        $cache->set($cache_key, $selected_did);
+        log_message("DEBUG", "Cached DID for key: $cache_key");
+    }
+}
+
+# Set channel variables for dialplan use
+$AGI->set_variable('OPTIMIZER_DID', $selected_did);
+$AGI->set_variable('OPTIMIZER_STATUS', $selected_did ? 'SUCCESS' : 'FAILURE');
+$AGI->set_variable('OPTIMIZER_FALLBACK', $selected_did eq $config{fallback_did} ? 'YES' : 'NO');
+$AGI->set_variable('OPTIMIZER_TIMESTAMP', time());
+
+# Calculate and log execution time
+my $elapsed = tv_interval($start_time);
+log_message("INFO", sprintf("DID selection completed in %.3f seconds - Selected: %s",
+    $elapsed, $selected_did));
+
+# Update statistics
+update_statistics($selected_did, $elapsed, \%call_data);
+
+exit 0;
+
+# =====================================
+# Subroutines
+# =====================================
+
+sub get_realistic_call_data {
+    my %data;
+
+    # ===== ALWAYS AVAILABLE FROM AGI =====
+    # These are standard AGI variables that Asterisk provides
+    $data{channel} = $input{channel} || '';           # Channel name
+    $data{uniqueid} = $input{uniqueid} || '';         # Unique call ID
+    $data{context} = $input{context} || '';           # Current context
+    $data{extension} = $input{extension} || '';       # DIALED NUMBER!
+    $data{priority} = $input{priority} || '';         # Priority in dialplan
+    $data{callerid} = $input{callerid} || '';         # Caller ID (if set)
+    $data{accountcode} = $input{accountcode} || '';   # Account code
+
+    # ===== CRITICAL: DIALED NUMBER PROCESSING =====
+    $data{dialed_number} = $input{extension} || '';
+
+    # Clean common dial prefixes
+    my $cleaned = $data{dialed_number};
+    $cleaned =~ s/^9//;   # Remove dial-9 prefix
+    $cleaned =~ s/^91//;  # Remove dial-91 prefix
+    $cleaned =~ s/^8//;   # Remove dial-8 prefix
+    $cleaned =~ s/^81//;  # Remove dial-81 prefix
+    $cleaned =~ s/^011//; # Remove international prefix
+    $data{dialed_number_clean} = $cleaned;
+
+    # Extract geographic info from dialed number
+    if ($cleaned =~ /^1?(\d{3})(\d{3})/) {
+        $data{dialed_area_code} = $1;
+        $data{dialed_exchange} = $2;
+    }
+
+    # ===== CAMPAIGN AND AGENT INFO (IF SET BY DIALPLAN) =====
+    # These need to be explicitly set in the dialplan
+    $data{campaign_id} = $AGI->get_variable('CAMPAIGN_ID') ||
+                        $AGI->get_variable('CAMPAIGN') ||
+                        'DEFAULT';
+
+    $data{agent_id} = $AGI->get_variable('AGENT_USER') ||
+                     $AGI->get_variable('AGENT') ||
+                     '0';
+
+    # ===== PRIVACY MODE HANDLING =====
+    if (!$config{privacy_mode}) {
+        # Only capture customer data if privacy mode is OFF
+
+        # Lead/Customer information (IF passed by VICIdial)
+        $data{lead_id} = $AGI->get_variable('LEAD_ID') || '';
+        $data{list_id} = $AGI->get_variable('LIST_ID') || '';
+
+        # Customer phone might be in CUSTOMER_PHONE variable
+        $data{customer_phone} = $AGI->get_variable('CUSTOMER_PHONE') || '';
+
+        # Geographic data (IF available from lead record)
+        $data{customer_state} = $AGI->get_variable('STATE') || '';
+        $data{customer_zip} = $AGI->get_variable('ZIP') || '';
+        $data{customer_city} = $AGI->get_variable('CITY') || '';
+
+        # Extract area code from customer phone if available
+        if ($data{customer_phone} =~ /^1?(\d{3})/) {
+            $data{customer_area_code} = $1;
+        }
+    } else {
+        # Privacy mode ON - anonymize/hash sensitive data
+
+        # Hash the lead ID if present (for tracking without exposing)
+        my $lead_id = $AGI->get_variable('LEAD_ID') || '';
+        $data{lead_id_hash} = $lead_id ? sha256_hex($lead_id) : '';
+
+        # Only use geographic data for routing, not specific customer info
+        $data{customer_state} = $AGI->get_variable('STATE') || '';
+
+        # Hash phone numbers for tracking
+        my $cust_phone = $AGI->get_variable('CUSTOMER_PHONE') || '';
+        if ($cust_phone) {
+            # Keep area code for geographic routing
+            if ($cust_phone =~ /^1?(\d{3})/) {
+                $data{customer_area_code} = $1;
+            }
+            # Hash full number for tracking
+            $data{customer_phone_hash} = sha256_hex($cust_phone);
+        }
+
+        # Clear any PII fields
+        $data{customer_phone} = '';
+        $data{customer_zip} = '';
+        $data{customer_city} = '';
+        $data{lead_id} = '';
+    }
+
+    # ===== OPTIONAL VICIDIAL DATA (IF AVAILABLE) =====
+    # These may or may not be set depending on dialplan configuration
+    $data{hopper_priority} = $AGI->get_variable('HOPPER_PRIORITY') || '';
+    $data{called_count} = $AGI->get_variable('CALLED_COUNT') || '0';
+    $data{vendor_lead_code} = $AGI->get_variable('VENDOR_LEAD_CODE') || '';
+
+    # ===== METADATA =====
+    $data{timestamp} = time();
+    $data{privacy_mode} = $config{privacy_mode} ? 1 : 0;
+
+    return %data;
+}
+
+sub get_did_from_api_with_retry {
+    my (%call_data) = @_;
+
+    my $max_retries = $config{api_retry_count} || 3;
+    my $retry_delay = $config{api_retry_delay} || 1;
+
+    for (my $attempt = 1; $attempt <= $max_retries; $attempt++) {
+        my $did = call_optimizer_api(%call_data);
+
+        if ($did && $did ne $config{fallback_did}) {
+            return $did;
+        }
+
+        if ($attempt < $max_retries) {
+            log_message("WARNING", "API attempt $attempt failed, retrying in $retry_delay seconds...");
+            sleep($retry_delay);
+        }
+    }
+
+    log_message("ERROR", "All API attempts failed, using fallback DID");
+    return $config{fallback_did};
+}
+
+sub call_optimizer_api {
+    my (%call_data) = @_;
+
+    my $ua = LWP::UserAgent->new(
+        timeout => $config{api_timeout} || 5,
+        agent => 'VICIdial-DID-Optimizer/4.0'
+    );
+
+    # Build URL with parameters
+    my $url = $config{api_base_url} . '/api/' . ($config{api_version} || 'v1') . '/dids/next';
+    my @params;
+
+    # Always send these core parameters
+    push @params, 'campaign_id=' . uri_escape($call_data{campaign_id});
+    push @params, 'agent_id=' . uri_escape($call_data{agent_id});
+    push @params, 'dialed_number=' . uri_escape($call_data{dialed_number_clean}) if $call_data{dialed_number_clean};
+    push @params, 'dialed_area_code=' . uri_escape($call_data{dialed_area_code}) if $call_data{dialed_area_code};
+
+    # Send data based on privacy settings
+    if (!$config{privacy_mode}) {
+        # Normal mode - send all available data
+        push @params, 'customer_phone=' . uri_escape($call_data{customer_phone}) if $call_data{customer_phone};
+        push @params, 'customer_state=' . uri_escape($call_data{customer_state}) if $call_data{customer_state};
+        push @params, 'customer_zip=' . uri_escape($call_data{customer_zip}) if $call_data{customer_zip};
+        push @params, 'customer_city=' . uri_escape($call_data{customer_city}) if $call_data{customer_city};
+        push @params, 'lead_id=' . uri_escape($call_data{lead_id}) if $call_data{lead_id};
+        push @params, 'list_id=' . uri_escape($call_data{list_id}) if $call_data{list_id};
+    } else {
+        # Privacy mode - send only anonymized/necessary data
+        push @params, 'customer_state=' . uri_escape($call_data{customer_state}) if $call_data{customer_state};
+        push @params, 'customer_area_code=' . uri_escape($call_data{customer_area_code}) if $call_data{customer_area_code};
+        push @params, 'lead_hash=' . uri_escape($call_data{lead_id_hash}) if $call_data{lead_id_hash};
+        push @params, 'privacy_mode=1';
+    }
+
+    # Optional VICIdial data
+    push @params, 'called_count=' . uri_escape($call_data{called_count}) if $call_data{called_count};
+    push @params, 'hopper_priority=' . uri_escape($call_data{hopper_priority}) if $call_data{hopper_priority};
+
+    $url .= '?' . join('&', @params);
+
+    # Log API request (with privacy consideration)
+    if ($config{privacy_mode}) {
+        log_message("DEBUG", "API Request (privacy mode): " . mask_api_url($url));
+    } else {
+        log_message("DEBUG", "API Request: $url");
+    }
+
+    # Make API request
+    my $response = $ua->get($url,
+        'x-api-key' => $config{api_key},
+        'Content-Type' => 'application/json',
+        'X-Request-ID' => $call_data{uniqueid},
+        'X-Privacy-Mode' => $config{privacy_mode} ? '1' : '0'
+    );
+
+    if ($response->is_success) {
+        my $content = $response->content;
+
+        eval {
+            my $data = decode_json($content);
+            if ($data->{success} && $data->{data}->{phoneNumber}) {
+                # Set additional variables if available
+                if ($data->{data}->{provider}) {
+                    $AGI->set_variable('OPTIMIZER_PROVIDER', $data->{data}->{provider});
+                }
+                if ($data->{data}->{state}) {
+                    $AGI->set_variable('OPTIMIZER_STATE', $data->{data}->{state});
+                }
+                if ($data->{data}->{reputation}) {
+                    $AGI->set_variable('OPTIMIZER_SCORE', $data->{data}->{reputation});
+                }
+
+                return $data->{data}->{phoneNumber};
+            }
+        };
+
+        if ($@) {
+            log_message("ERROR", "JSON decode error: $@");
+        }
+    } else {
+        log_message("ERROR", "API request failed: " . $response->status_line);
+    }
+
+    return undef;
+}
+
+sub generate_cache_key {
+    my (%call_data) = @_;
+
+    # Create cache key based on available data
+    my @key_parts = ($call_data{campaign_id});
+
+    # Add geographic routing hints
+    push @key_parts, $call_data{dialed_area_code} || 'XXX';
+
+    if (!$config{privacy_mode}) {
+        push @key_parts, $call_data{customer_state} || 'XX';
+        push @key_parts, substr($call_data{customer_phone} || '0000', 0, 6);
+    } else {
+        push @key_parts, $call_data{customer_state} || 'XX';
+        push @key_parts, $call_data{customer_area_code} || 'XXX';
+    }
+
+    return join(':', @key_parts);
+}
+
+sub read_config {
+    my ($config_file) = @_;
+    my %config;
+
+    if (!-e $config_file) {
+        die "Configuration file not found: $config_file";
+    }
+
+    open(my $fh, '<', $config_file) or die "Cannot open config file: $!";
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^[;#]/;  # Skip comments
+        next if $line =~ /^\s*$/;  # Skip empty lines
+
+        if ($line =~ /^(\w+)\s*=\s*(.+)$/) {
+            my ($key, $value) = ($1, $2);
+            $value =~ s/\s+$//;  # Trim trailing whitespace
+            $config{$key} = $value;
+        }
+    }
+    close($fh);
+
+    # Validate required configuration
+    die "Missing api_key in configuration" unless $config{api_key};
+    die "Missing api_base_url in configuration" unless $config{api_base_url};
+    die "Missing fallback_did in configuration" unless $config{fallback_did};
+
+    # Set privacy mode default (OFF by default for backward compatibility)
+    $config{privacy_mode} = $config{privacy_mode} || 0;
+
+    return %config;
+}
+
+sub log_message {
+    my ($level, $message) = @_;
+
+    # Check log level
+    my %log_levels = (
+        DEBUG => 0,
+        INFO => 1,
+        WARNING => 2,
+        ERROR => 3
+    );
+
+    my $config_level = $log_levels{$config{log_level} || 'INFO'};
+    my $message_level = $log_levels{$level};
+
+    return if $message_level < $config_level;
+    return if !$config{debug_mode} && $level eq 'DEBUG';
+
+    my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    my $log_file = $config{log_file} || '/var/log/astguiclient/did-optimizer.log';
+
+    open(my $log, '>>', $log_file) or return;
+    flock($log, 2);  # Exclusive lock
+    print $log "[$timestamp] [$level] $message\n";
+    close($log);
+}
+
+sub update_statistics {
+    my ($did, $response_time, $call_data_ref) = @_;
+
+    # Update statistics file
+    my $stats_file = '/var/log/astguiclient/did-optimizer-stats.log';
+    open(my $stats, '>>', $stats_file) or return;
+    flock($stats, 2);
+
+    my $timestamp = time();
+    my $is_fallback = $did eq $config{fallback_did} ? 1 : 0;
+
+    # Log statistics (respecting privacy mode)
+    if (!$config{privacy_mode}) {
+        print $stats join(',',
+            $timestamp,
+            $did,
+            $response_time,
+            $is_fallback,
+            $call_data_ref->{campaign_id} || '',
+            $call_data_ref->{agent_id} || '',
+            $call_data_ref->{dialed_number_clean} || '',
+            $call_data_ref->{customer_state} || '',
+            $call_data_ref->{dialed_area_code} || ''
+        ) . "\n";
+    } else {
+        # Privacy mode - don't log specific numbers
+        print $stats join(',',
+            $timestamp,
+            $did,
+            $response_time,
+            $is_fallback,
+            $call_data_ref->{campaign_id} || '',
+            $call_data_ref->{agent_id} || '',
+            'REDACTED',  # Don't log actual dialed number
+            $call_data_ref->{customer_state} || '',
+            $call_data_ref->{dialed_area_code} || ''
+        ) . "\n";
+    }
+
+    close($stats);
+}
+
+sub mask_phone_number {
+    my ($number) = @_;
+    return '' unless $number;
+
+    # Show area code and mask the rest
+    if (length($number) >= 10) {
+        my $area = substr($number, 0, 3);
+        return "${area}XXX-XXXX";
+    }
+    return "XXX-XXXX";
+}
+
+sub mask_api_url {
+    my ($url) = @_;
+    # Mask sensitive parameters in URL for logging
+    $url =~ s/(customer_phone=)[^&]+/$1REDACTED/g;
+    $url =~ s/(lead_id=)[^&]+/$1REDACTED/g;
+    $url =~ s/(customer_zip=)[^&]+/$1REDACTED/g;
+    return $url;
+}
