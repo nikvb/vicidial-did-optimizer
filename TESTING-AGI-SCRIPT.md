@@ -18,6 +18,19 @@ The AGI script has **TWO types of logging**:
 
 ---
 
+## How to Call the Script from VICIdial
+
+The AGI script accepts the phone number as an argument (recommended):
+
+```
+exten => _X.,1,AGI(vicidial-did-optimizer-production.agi,${PHONE_NUMBER})
+```
+
+**Order of phone number sources (priority):**
+1. **AGI argument** (passed to script) - RECOMMENDED ✅
+2. **Channel variable** PHONE_NUMBER or CUSTOMER_PHONE
+3. **Extension field** (fallback - has prefixes, less reliable)
+
 ## Manual Testing (Without Asterisk)
 
 ### Option 1: Simple Test (Recommended)
@@ -28,7 +41,7 @@ cd /home/na/didapi
 ```
 
 This simulates an Asterisk call with:
-- Extension: 18005551234
+- Phone number: 18005551234 (via AGI argument)
 - Caller ID: 5551234567
 - Channel: SIP/trunk-00000123
 - Unique ID: 1760138000.123

@@ -9,7 +9,8 @@ echo "=================================================="
 echo ""
 
 # Create simulated AGI environment input
-cat <<'EOF' | ./vicidial-did-optimizer-production.agi
+# Pass phone number as argument to script
+cat <<'EOF' | ./vicidial-did-optimizer-production.agi 18005551234
 agi_request: vicidial-did-optimizer-production.agi
 agi_channel: SIP/trunk-00000123
 agi_language: en
