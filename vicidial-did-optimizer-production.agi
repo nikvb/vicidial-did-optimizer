@@ -30,6 +30,13 @@ force_log("STARTUP", "AGI Input received - Channel: " . ($input{channel} || 'NON
     " Extension: " . ($input{extension} || 'NONE') .
     " UniqueID: " . ($input{uniqueid} || 'NONE'));
 
+# Get AGI arguments (phone number passed to script)
+my @agi_args = @ARGV;
+force_log("STARTUP", "AGI Arguments count: " . scalar(@agi_args));
+for (my $i = 0; $i < @agi_args; $i++) {
+    force_log("STARTUP", "AGI ARG[$i]: " . ($agi_args[$i] || 'EMPTY'));
+}
+
 # Read configuration first to check privacy settings
 force_log("CONFIG", "Reading configuration from /etc/asterisk/dids.conf...");
 my %config = read_config('/etc/asterisk/dids.conf');
@@ -61,7 +68,7 @@ force_log("TIMER", "Performance timer started");
 
 # Get available call data (respecting privacy mode)
 force_log("DATA", "======== COLLECTING CALL DATA ========");
-my %call_data = get_realistic_call_data();
+my %call_data = get_realistic_call_data(\@agi_args);
 force_log("DATA", "======== CALL DATA COLLECTION COMPLETE ========");
 
 # Log the request (with privacy consideration)
@@ -142,6 +149,8 @@ exit 0;
 # =====================================
 
 sub get_realistic_call_data {
+    my ($agi_args_ref) = @_;
+    my @agi_args = @{$agi_args_ref || []};
     my %data;
 
     force_log("DATA", "--- Collecting AGI Input Variables ---");
@@ -164,26 +173,50 @@ sub get_realistic_call_data {
 
     # ===== CRITICAL: DIALED NUMBER PROCESSING =====
     force_log("DATA", "--- Processing Dialed Number ---");
-    $data{dialed_number} = $input{extension} || '';
-    force_log("DATA", "Raw dialed number: " . ($data{dialed_number} || 'EMPTY'));
 
-    # Clean common dial prefixes
-    my $cleaned = $data{dialed_number};
-    $cleaned =~ s/^9//;   # Remove dial-9 prefix
-    $cleaned =~ s/^91//;  # Remove dial-91 prefix
-    $cleaned =~ s/^8//;   # Remove dial-8 prefix
-    $cleaned =~ s/^81//;  # Remove dial-81 prefix
-    $cleaned =~ s/^011//; # Remove international prefix
-    $data{dialed_number_clean} = $cleaned;
-    force_log("DATA", "Cleaned dialed number: " . ($cleaned || 'EMPTY'));
+    # Get phone number from AGI arguments first (passed directly without prefixes)
+    my $phone_from_arg = $agi_args[0] || '';
+    force_log("DATA", "Phone from AGI argument: " . ($phone_from_arg || 'NOT PROVIDED'));
+
+    # Or get from channel variable PHONE_NUMBER or CUSTOMER_PHONE
+    my $phone_from_var = $AGI->get_variable('PHONE_NUMBER') ||
+                         $AGI->get_variable('CUSTOMER_PHONE') || '';
+    force_log("DATA", "Phone from channel variable: " . ($phone_from_var || 'NOT SET'));
+
+    # Use argument first, then channel variable, then extension as fallback
+    if ($phone_from_arg) {
+        $data{dialed_number} = $phone_from_arg;
+        $data{dialed_number_clean} = $phone_from_arg;  # Already clean, no prefix
+        force_log("DATA", "Using phone from AGI argument: " . $phone_from_arg);
+    } elsif ($phone_from_var) {
+        $data{dialed_number} = $phone_from_var;
+        $data{dialed_number_clean} = $phone_from_var;  # Already clean, no prefix
+        force_log("DATA", "Using phone from channel variable: " . $phone_from_var);
+    } else {
+        # Fallback to extension (with prefix removal)
+        $data{dialed_number} = $input{extension} || '';
+        force_log("DATA", "Fallback to extension (has prefix): " . ($data{dialed_number} || 'EMPTY'));
+
+        # Clean common dial prefixes
+        my $cleaned = $data{dialed_number};
+        $cleaned =~ s/^9//;   # Remove dial-9 prefix
+        $cleaned =~ s/^91//;  # Remove dial-91 prefix
+        $cleaned =~ s/^8//;   # Remove dial-8 prefix
+        $cleaned =~ s/^81//;  # Remove dial-81 prefix
+        $cleaned =~ s/^011//; # Remove international prefix
+        $data{dialed_number_clean} = $cleaned;
+        force_log("DATA", "Cleaned dialed number: " . ($cleaned || 'EMPTY'));
+    }
+
+    force_log("DATA", "Final dialed number (clean): " . ($data{dialed_number_clean} || 'EMPTY'));
 
     # Extract geographic info from dialed number
-    if ($cleaned =~ /^1?(\d{3})(\d{3})/) {
+    if ($data{dialed_number_clean} && $data{dialed_number_clean} =~ /^1?(\d{3})(\d{3})/) {
         $data{dialed_area_code} = $1;
         $data{dialed_exchange} = $2;
         force_log("DATA", "Extracted area code: $1, exchange: $2");
     } else {
-        force_log("DATA", "Could not extract area code from: $cleaned");
+        force_log("DATA", "Could not extract area code from: " . ($data{dialed_number_clean} || 'EMPTY'));
     }
 
     # ===== CAMPAIGN AND AGENT INFO (IF SET BY DIALPLAN) =====

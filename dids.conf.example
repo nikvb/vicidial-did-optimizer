@@ -1,0 +1,31 @@
+# VICIdial DID Optimizer Configuration
+# Copy this file to /etc/asterisk/dids.conf on your VICIdial server
+
+# ===== REQUIRED SETTINGS =====
+
+# API Configuration
+api_key = did_315b95e7b2107598f4c5c6f51d21b3ac1768892fa81c1bb3ea38756bb1c2b43e
+api_base_url = http://api3.amdy.io:5000
+api_version = v1
+
+# Fallback DID (used when API fails or no DIDs available)
+fallback_did = +15551234567
+
+# ===== OPTIONAL SETTINGS =====
+
+# API Timeout and Retry
+api_timeout = 5
+api_retry_count = 3
+api_retry_delay = 1
+
+# Caching (reduces API calls)
+cache_enabled = 1
+cache_ttl = 300
+
+# Logging
+log_file = /var/log/astguiclient/did-optimizer.log
+log_level = INFO
+debug_mode = 0
+
+# Privacy Mode (anonymize customer data in logs)
+privacy_mode = 0
