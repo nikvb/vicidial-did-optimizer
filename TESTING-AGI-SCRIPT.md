@@ -28,9 +28,18 @@ exten => _X.,1,AGI(vicidial-did-optimizer-production.agi)
 
 **Phone Number Processing:**
 - Phone number comes from AGI EXTENSION variable
-- Script automatically removes common dial prefixes (9, 91, 8, 81, 011)
-- Example: `918005551234` → `8005551234`
+- Script automatically removes dial prefixes configured in `dids.conf`
+- **Default prefixes** (if not in config): `9341, 011, 91, 81, 9, 8`
+- **Longest prefix matched first** to avoid partial matches
+- Example: `93418005551234` → `8005551234` (prefix `9341` removed)
+- Example: `918005551234` → `18005551234` (prefix `9` removed)
 - Logs show both raw and cleaned numbers for debugging
+
+**Configure Custom Prefixes in `/etc/asterisk/dids.conf`:**
+```
+# Comma-separated, longest first for proper matching
+dial_prefixes = 9341,011,91,81,9,8
+```
 
 ## Manual Testing (Without Asterisk)
 

@@ -178,15 +178,33 @@ sub get_realistic_call_data {
     $data{dialed_number} = $input{extension} || '';
     force_log("DATA", "Phone from AGI EXTENSION (raw with prefix): " . ($data{dialed_number} || 'EMPTY'));
 
-    # Clean common dial prefixes
+    # Get dial prefixes from config (comma-separated, longest first for proper matching)
+    my @prefixes = ();
+    if ($config{dial_prefixes}) {
+        @prefixes = split(/\s*,\s*/, $config{dial_prefixes});
+        force_log("DATA", "Dial prefixes from config: " . join(', ', @prefixes));
+    } else {
+        # Default prefixes if not in config (longest first to avoid partial matches)
+        @prefixes = ('9341', '011', '91', '81', '9', '8');
+        force_log("DATA", "Using default dial prefixes: " . join(', ', @prefixes));
+    }
+
+    # Clean dial prefixes (try longest first to avoid partial matches)
     my $cleaned = $data{dialed_number};
-    $cleaned =~ s/^9//;   # Remove dial-9 prefix
-    $cleaned =~ s/^91//;  # Remove dial-91 prefix
-    $cleaned =~ s/^8//;   # Remove dial-8 prefix
-    $cleaned =~ s/^81//;  # Remove dial-81 prefix
-    $cleaned =~ s/^011//; # Remove international prefix
+    my $prefix_removed = '';
+    foreach my $prefix (@prefixes) {
+        if ($cleaned =~ s/^$prefix//) {
+            $prefix_removed = $prefix;
+            last;  # Stop after first match
+        }
+    }
+
     $data{dialed_number_clean} = $cleaned;
-    force_log("DATA", "Cleaned dialed number (removed prefix): " . ($cleaned || 'EMPTY'));
+    if ($prefix_removed) {
+        force_log("DATA", "Removed prefix '$prefix_removed' -> cleaned: " . ($cleaned || 'EMPTY'));
+    } else {
+        force_log("DATA", "No prefix found -> using as-is: " . ($cleaned || 'EMPTY'));
+    }
 
     force_log("DATA", "Final dialed number (clean): " . ($data{dialed_number_clean} || 'EMPTY'));
 

@@ -13,6 +13,11 @@ fallback_did = +15551234567
 
 # ===== OPTIONAL SETTINGS =====
 
+# Dial Prefixes (comma-separated, longest first for proper matching)
+# These prefixes are removed from the extension before processing
+# If not set, defaults to: 9341,011,91,81,9,8
+dial_prefixes = 9341,011,91,81,9,8
+
 # API Timeout and Retry
 api_timeout = 5
 api_retry_count = 3
