@@ -174,39 +174,19 @@ sub get_realistic_call_data {
     # ===== CRITICAL: DIALED NUMBER PROCESSING =====
     force_log("DATA", "--- Processing Dialed Number ---");
 
-    # Get phone number from AGI arguments first (passed directly without prefixes)
-    my $phone_from_arg = $agi_args[0] || '';
-    force_log("DATA", "Phone from AGI argument: " . ($phone_from_arg || 'NOT PROVIDED'));
+    # Phone number comes in AGI EXTENSION variable (with prefixes)
+    $data{dialed_number} = $input{extension} || '';
+    force_log("DATA", "Phone from AGI EXTENSION (raw with prefix): " . ($data{dialed_number} || 'EMPTY'));
 
-    # Or get from channel variable PHONE_NUMBER or CUSTOMER_PHONE
-    my $phone_from_var = $AGI->get_variable('PHONE_NUMBER') ||
-                         $AGI->get_variable('CUSTOMER_PHONE') || '';
-    force_log("DATA", "Phone from channel variable: " . ($phone_from_var || 'NOT SET'));
-
-    # Use argument first, then channel variable, then extension as fallback
-    if ($phone_from_arg) {
-        $data{dialed_number} = $phone_from_arg;
-        $data{dialed_number_clean} = $phone_from_arg;  # Already clean, no prefix
-        force_log("DATA", "Using phone from AGI argument: " . $phone_from_arg);
-    } elsif ($phone_from_var) {
-        $data{dialed_number} = $phone_from_var;
-        $data{dialed_number_clean} = $phone_from_var;  # Already clean, no prefix
-        force_log("DATA", "Using phone from channel variable: " . $phone_from_var);
-    } else {
-        # Fallback to extension (with prefix removal)
-        $data{dialed_number} = $input{extension} || '';
-        force_log("DATA", "Fallback to extension (has prefix): " . ($data{dialed_number} || 'EMPTY'));
-
-        # Clean common dial prefixes
-        my $cleaned = $data{dialed_number};
-        $cleaned =~ s/^9//;   # Remove dial-9 prefix
-        $cleaned =~ s/^91//;  # Remove dial-91 prefix
-        $cleaned =~ s/^8//;   # Remove dial-8 prefix
-        $cleaned =~ s/^81//;  # Remove dial-81 prefix
-        $cleaned =~ s/^011//; # Remove international prefix
-        $data{dialed_number_clean} = $cleaned;
-        force_log("DATA", "Cleaned dialed number: " . ($cleaned || 'EMPTY'));
-    }
+    # Clean common dial prefixes
+    my $cleaned = $data{dialed_number};
+    $cleaned =~ s/^9//;   # Remove dial-9 prefix
+    $cleaned =~ s/^91//;  # Remove dial-91 prefix
+    $cleaned =~ s/^8//;   # Remove dial-8 prefix
+    $cleaned =~ s/^81//;  # Remove dial-81 prefix
+    $cleaned =~ s/^011//; # Remove international prefix
+    $data{dialed_number_clean} = $cleaned;
+    force_log("DATA", "Cleaned dialed number (removed prefix): " . ($cleaned || 'EMPTY'));
 
     force_log("DATA", "Final dialed number (clean): " . ($data{dialed_number_clean} || 'EMPTY'));
 

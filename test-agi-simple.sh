@@ -9,8 +9,8 @@ echo "=================================================="
 echo ""
 
 # Create simulated AGI environment input
-# Pass phone number as argument to script
-cat <<'EOF' | ./vicidial-did-optimizer-production.agi 18005551234
+# Phone number comes in agi_extension with prefix (simulating 9+18005551234)
+cat <<'EOF' | ./vicidial-did-optimizer-production.agi
 agi_request: vicidial-did-optimizer-production.agi
 agi_channel: SIP/trunk-00000123
 agi_language: en
@@ -26,7 +26,7 @@ agi_callingtns: 0
 agi_dnid: 18005551234
 agi_rdnis: unknown
 agi_context: vicidial-auto
-agi_extension: 18005551234
+agi_extension: 918005551234
 agi_priority: 1
 agi_enhanced: 0.0
 agi_accountcode:
