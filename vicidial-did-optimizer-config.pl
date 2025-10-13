@@ -102,10 +102,14 @@ log_message("INFO", "Starting DID selection for campaign=$campaign_id, agent=$ag
 my $selected_did = get_optimal_did($campaign_id, $agent_id, $phone_number);
 
 if ($selected_did) {
-    log_message("INFO", "Selected DID: $selected_did->{phoneNumber} (algorithm: $selected_did->{algorithm})");
+    # Handle both API formats: current (number) and legacy (phoneNumber)
+    my $phone = $selected_did->{number} || $selected_did->{phoneNumber};
+    my $algorithm = $selected_did->{algorithm} || 'round-robin';
+
+    log_message("INFO", "Selected DID: $phone (algorithm: $algorithm)");
 
     # Output the selected DID for VICIdial
-    print $selected_did->{phoneNumber} . "\n";
+    print $phone . "\n";
 
     # Log selection details for analytics
     log_selection_details($selected_did, $campaign_id, $agent_id);
@@ -279,10 +283,25 @@ sub get_optimal_did {
 
             log_message("DEBUG", "API Response: " . $response->content);
 
-            # Store API response data for call result reporting
-            store_call_context($data->{data}, $phone_number);
+            # Check which format the API returned
+            my $did_obj = undef;
+            if ($data->{did}) {
+                # Current format: {"success": true, "did": {"number": "+1...", ...}}
+                $did_obj = $data->{did};
+                log_message("DEBUG", "Using current API format (did.number)");
+            } elsif ($data->{data}) {
+                # Legacy format: {"success": true, "data": {"phoneNumber": "+1...", ...}}
+                $did_obj = $data->{data};
+                log_message("DEBUG", "Using legacy API format (data.phoneNumber)");
+            } else {
+                log_message("ERROR", "API response missing both 'did' and 'data' fields");
+                next;
+            }
 
-            return $data->{data};
+            # Store API response data for call result reporting
+            store_call_context($did_obj, $phone_number);
+
+            return $did_obj;
         } else {
             log_message("ERROR", "API request failed (attempt $attempt): " . $response->status_line);
 
@@ -307,8 +326,8 @@ sub store_call_context {
 
     # Store call context for later call result reporting
     my $context = {
-        did_id => $did_data->{didId},
-        phone_number => $did_data->{phoneNumber},
+        did_id => $did_data->{didId} || $did_data->{id},
+        phone_number => $did_data->{number} || $did_data->{phoneNumber},
         campaign_id => $did_data->{campaign_id},
         agent_id => $did_data->{agent_id},
         selected_at => $did_data->{selectedAt},
@@ -452,8 +471,10 @@ sub run_tests {
     my $test_did = get_optimal_did('TEST_CAMPAIGN', 'TEST_AGENT', '4155551234');
     if ($test_did) {
         print "   ✅ DID Selection: PASSED\n";
-        print "   📞 Selected: $test_did->{phoneNumber}\n";
-        print "   🎯 Algorithm: $test_did->{algorithm}\n";
+        my $phone = $test_did->{number} || $test_did->{phoneNumber};
+        my $algorithm = $test_did->{algorithm} || 'round-robin';
+        print "   📞 Selected: $phone\n";
+        print "   🎯 Algorithm: $algorithm\n";
     } else {
         print "   ❌ DID Selection: FAILED\n";
         return;
