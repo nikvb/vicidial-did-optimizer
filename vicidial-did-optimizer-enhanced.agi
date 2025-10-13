@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 # vicidial-did-optimizer-enhanced.agi - Complete DID Optimizer AGI Script
-# Version: 3.0 - Captures ALL available AGI and VICIdial data
+# Version: 3.1 - Fixed API response parsing for did.number format
 #
 
 use strict;
@@ -330,8 +330,36 @@ sub call_optimizer_api {
 
         eval {
             my $data = decode_json($content);
-            if ($data->{success} && $data->{data}->{phoneNumber}) {
+            my $phone = undef;
+
+            # Format 1 (CURRENT): {"success": true, "did": {"number": "+12282777397", "provider": "..."}}
+            if ($data->{success} && $data->{did} && $data->{did}->{number}) {
+                $phone = $data->{did}->{number};
+                log_message("DEBUG", "Phone found in did.number: $phone");
+
                 # Set additional variables if available
+                if ($data->{did}->{provider}) {
+                    $AGI->set_variable('OPTIMIZER_PROVIDER', $data->{did}->{provider});
+                }
+                if ($data->{did}->{state}) {
+                    $AGI->set_variable('OPTIMIZER_STATE', $data->{did}->{state});
+                }
+                if ($data->{did}->{areaCode}) {
+                    $AGI->set_variable('OPTIMIZER_AREACODE', $data->{did}->{areaCode});
+                }
+                if ($data->{did}->{reputation}) {
+                    $AGI->set_variable('OPTIMIZER_SCORE', $data->{did}->{reputation});
+                }
+                if ($data->{did}->{is_fallback}) {
+                    $AGI->set_variable('OPTIMIZER_FALLBACK', $data->{did}->{is_fallback} ? 'YES' : 'NO');
+                }
+            }
+            # Format 2 (LEGACY): {"success": true, "data": {"phoneNumber": "+1..."}}
+            elsif ($data->{success} && $data->{data} && $data->{data}->{phoneNumber}) {
+                $phone = $data->{data}->{phoneNumber};
+                log_message("DEBUG", "Phone found in data.phoneNumber (legacy): $phone");
+
+                # Set additional variables if available (legacy format)
                 if ($data->{data}->{provider}) {
                     $AGI->set_variable('OPTIMIZER_PROVIDER', $data->{data}->{provider});
                 }
@@ -347,8 +375,12 @@ sub call_optimizer_api {
                 if ($data->{data}->{didId}) {
                     $AGI->set_variable('OPTIMIZER_DID_ID', $data->{data}->{didId});
                 }
+            } else {
+                log_message("ERROR", "Invalid API response format - no phone number found");
+            }
 
-                return $data->{data}->{phoneNumber};
+            if ($phone) {
+                return $phone;
             }
         };
 
