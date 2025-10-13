@@ -421,31 +421,60 @@ sub call_optimizer_api {
             force_log("API", "JSON decoded successfully");
             force_log("API", "Response 'success' field: " . ($data->{success} ? 'TRUE' : 'FALSE'));
 
-            if ($data->{success} && $data->{data}->{phoneNumber}) {
-                my $phone = $data->{data}->{phoneNumber};
-                force_log("API", "✓ Phone number found in response: $phone");
+            # Check for phone number in different response formats
+            my $phone = undef;
 
-                # Set additional variables if available
+            # Format 1: {"success": true, "did": {"number": "+12282777397"}}
+            if ($data->{success} && $data->{did} && $data->{did}->{number}) {
+                $phone = $data->{did}->{number};
+                force_log("API", "✓ Phone found in did.number: $phone");
+
+                # Set additional DID metadata
+                if ($data->{did}->{provider}) {
+                    force_log("API", "Setting OPTIMIZER_PROVIDER: " . $data->{did}->{provider});
+                    $AGI->set_variable('OPTIMIZER_PROVIDER', $data->{did}->{provider});
+                }
+                if ($data->{did}->{state}) {
+                    force_log("API", "Setting OPTIMIZER_STATE: " . $data->{did}->{state});
+                    $AGI->set_variable('OPTIMIZER_STATE', $data->{did}->{state});
+                }
+                if ($data->{did}->{reputation}) {
+                    force_log("API", "Setting OPTIMIZER_SCORE: " . $data->{did}->{reputation});
+                    $AGI->set_variable('OPTIMIZER_SCORE', $data->{did}->{reputation});
+                }
+                if ($data->{did}->{is_fallback}) {
+                    force_log("API", "Setting OPTIMIZER_FALLBACK: " . ($data->{did}->{is_fallback} ? 'YES' : 'NO'));
+                }
+            }
+            # Format 2 (legacy): {"success": true, "data": {"phoneNumber": "+1..."}}
+            elsif ($data->{success} && $data->{data} && $data->{data}->{phoneNumber}) {
+                $phone = $data->{data}->{phoneNumber};
+                force_log("API", "✓ Phone found in data.phoneNumber: $phone");
+
+                # Set additional metadata
                 if ($data->{data}->{provider}) {
-                    force_log("API", "Setting OPTIMIZER_PROVIDER: " . $data->{data}->{provider});
                     $AGI->set_variable('OPTIMIZER_PROVIDER', $data->{data}->{provider});
                 }
                 if ($data->{data}->{state}) {
-                    force_log("API", "Setting OPTIMIZER_STATE: " . $data->{data}->{state});
                     $AGI->set_variable('OPTIMIZER_STATE', $data->{data}->{state});
                 }
                 if ($data->{data}->{reputation}) {
-                    force_log("API", "Setting OPTIMIZER_SCORE: " . $data->{data}->{reputation});
                     $AGI->set_variable('OPTIMIZER_SCORE', $data->{data}->{reputation});
                 }
+            }
 
+            if ($phone) {
                 force_log("API", "Returning phone number: $phone");
                 return $phone;
             } else {
-                force_log("API", "✗ Response success=false OR phoneNumber missing");
-                force_log("API", "Response 'data' field exists: " . ($data->{data} ? 'YES' : 'NO'));
+                force_log("API", "✗ Response success=false OR phone number missing");
+                force_log("API", "Response structure - did field: " . ($data->{did} ? 'EXISTS' : 'MISSING'));
+                force_log("API", "Response structure - data field: " . ($data->{data} ? 'EXISTS' : 'MISSING'));
+                if ($data->{did}) {
+                    force_log("API", "did.number field: " . ($data->{did}->{number} || 'MISSING/EMPTY'));
+                }
                 if ($data->{data}) {
-                    force_log("API", "phoneNumber field: " . ($data->{data}->{phoneNumber} || 'MISSING/EMPTY'));
+                    force_log("API", "data.phoneNumber field: " . ($data->{data}->{phoneNumber} || 'MISSING/EMPTY'));
                 }
             }
         };
