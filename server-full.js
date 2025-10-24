@@ -2440,6 +2440,124 @@ app.use((req, res, next) => {
   });
 });
 
+// ============================================================================
+// ROTATION SETTINGS API
+// ============================================================================
+
+// Update global rotation settings
+app.patch('/api/v1/settings/rotation', async (req, res) => {
+  try {
+    // Authenticate user
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'No token provided'
+      });
+    }
+
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid token'
+      });
+    }
+
+    const { globalCapacity } = req.body;
+
+    if (!globalCapacity || typeof globalCapacity !== 'number' || globalCapacity < 1) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid globalCapacity value'
+      });
+    }
+
+    // Update tenant's default DID capacity
+    const tenant = await Tenant.findById(user.tenantId);
+    if (!tenant) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tenant not found'
+      });
+    }
+
+    // Store in tenant settings
+    if (!tenant.settings) {
+      tenant.settings = {};
+    }
+    tenant.settings.defaultDidCapacity = globalCapacity;
+    await tenant.save();
+
+    // Also update environment default for new DIDs
+    process.env.DEFAULT_DID_CAPACITY = globalCapacity.toString();
+
+    console.log(`✅ Global capacity updated to ${globalCapacity} for tenant ${tenant.name}`);
+
+    res.json({
+      success: true,
+      message: 'Global capacity updated successfully',
+      data: {
+        globalCapacity
+      }
+    });
+  } catch (error) {
+    console.error('Error updating rotation settings:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update rotation settings'
+    });
+  }
+});
+
+// Get rotation settings
+app.get('/api/v1/settings/rotation', async (req, res) => {
+  try {
+    // Authenticate user
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'No token provided'
+      });
+    }
+
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid token'
+      });
+    }
+
+    const tenant = await Tenant.findById(user.tenantId);
+    if (!tenant) {
+      return res.status(404).json({
+        success: false,
+        error: 'Tenant not found'
+      });
+    }
+
+    const globalCapacity = tenant.settings?.defaultDidCapacity ||
+                          parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
+
+    res.json({
+      success: true,
+      data: {
+        globalCapacity
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching rotation settings:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch rotation settings'
+    });
+  }
+});
+
 // Error handling middleware (must be last)
 // Middleware - commented out until middleware files are created
 // app.use(notFound);
