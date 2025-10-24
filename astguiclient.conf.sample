@@ -1,0 +1,42 @@
+# Sample VICIdial astguiclient.conf
+# This is the standard VICIdial configuration file format
+# Location: /etc/astguiclient.conf
+#
+# The DID Optimizer sync script (process-call-results.pl) reads database
+# configuration from this file automatically.
+
+# Database Configuration
+$VARDB_server => 'localhost';
+$VARDB_database => 'asterisk';
+$VARDB_user => 'cron';
+$VARDB_pass => '1234';
+$VARDB_port => '3306';
+
+# Custom MySQL SSL Options (optional)
+$VARDB_custom_user => '';
+$VARDB_custom_pass => '';
+
+# Active Keep-alive
+$VARACTIVE_KEEPALIVES => '123456';
+
+# Timeclock settings
+$VARDB_timeclock_user => 'cron';
+$VARDB_timeclock_pass => '1234';
+$VARDB_timeclock_server => 'localhost';
+$VARDB_timeclock_database => 'asterisk';
+$VARDB_timeclock_port => '3306';
+
+# System settings
+$VARSERVER_ip => '10.0.0.1';
+$VARREPORT_host => '10.0.0.1';
+$VARREPORT_user => 'cron';
+$VARREPORT_pass => '1234';
+$VARREPORT_port => '3306';
+$VARREPORT_database => 'asterisk';
+
+# Archive settings (optional)
+$VARDB_archive_server => 'localhost';
+$VARDB_archive_database => 'asterisk_archive';
+$VARDB_archive_user => 'cron';
+$VARDB_archive_pass => '1234';
+$VARDB_archive_port => '3306';

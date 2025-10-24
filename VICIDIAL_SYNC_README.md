@@ -14,21 +14,38 @@ This integration automatically syncs call results from VICIdial's `vicidial_log`
 
 ## Setup Instructions
 
-### 1. Configure Environment Variables
+### 1. VICIdial Database Configuration
 
-Add these to `/home/na/didapi/.env`:
+The sync script automatically reads VICIdial database credentials from `/etc/astguiclient.conf` (standard VICIdial configuration file).
 
-```bash
-# VICIdial Database Configuration
-VICIDIAL_DB_HOST=localhost
-VICIDIAL_DB_USER=cron
-VICIDIAL_DB_PASSWORD=1234
-VICIDIAL_DB_NAME=asterisk
+**No additional database configuration needed!** The script uses the same database credentials as VICIdial itself.
 
-# DID Optimizer API Configuration
-DID_OPTIMIZER_API_URL=http://localhost:5000
-API_KEY=your_api_key_here
+If `/etc/astguiclient.conf` doesn't exist on your system, the script will fall back to:
+- Environment variables (VICIDIAL_DB_HOST, VICIDIAL_DB_USER, etc.)
+- Default values (localhost, cron, 1234, asterisk)
+
+### 2. DID Optimizer API Configuration
+
+Add API configuration to `/etc/asterisk/dids.conf` (same file used by AGI script):
+
+```ini
+[general]
+# DID Optimizer API
+api_base_url=http://localhost:5000
+api_key=your_api_key_here
+
+# These are optional - script reads from /etc/astguiclient.conf instead
+# db_host=localhost
+# db_user=cron
+# db_pass=1234
+# db_name=asterisk
 ```
+
+**Configuration Priority:**
+1. `/etc/astguiclient.conf` - VICIdial database configuration (VARDB_* variables)
+2. `/etc/asterisk/dids.conf` - DID Optimizer API configuration (api_base_url, api_key)
+3. Environment variables - Override for testing
+4. Defaults - Fallback values
 
 ### 2. Grant Database Access
 

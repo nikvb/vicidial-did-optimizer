@@ -18,24 +18,28 @@ use JSON;
 use POSIX qw(strftime);
 
 ###############################################################################
-# CONFIG - Configuration is read from /etc/asterisk/dids.conf (same as AGI script)
+# CONFIG - Configuration is read from multiple sources:
+# 1. /etc/astguiclient.conf - VICIdial database configuration (standard VICIdial)
+# 2. /etc/asterisk/dids.conf - DID Optimizer API configuration (same as AGI script)
+# 3. Environment variables - Override for testing
 ###############################################################################
 
-my $CONFIG_FILE = '/etc/asterisk/dids.conf';
+my $ASTGUICLIENT_CONF = '/etc/astguiclient.conf';
+my $DID_CONFIG_FILE = '/etc/asterisk/dids.conf';
 my $LAST_CHECK_FILE = '/tmp/did-optimizer-last-check.txt';
 my $LOG_FILE = '/var/log/did-optimizer-sync.log';
 my $BATCH_SIZE = 500;
 
-# Configuration hash (populated from config file)
+# Configuration hash (populated from config files)
 my %config;
 
-# VICIdial Database Configuration (defaults, overridden by config file)
+# VICIdial Database Configuration (from astguiclient.conf)
 my $VICIDIAL_DB_HOST;
 my $VICIDIAL_DB_USER;
 my $VICIDIAL_DB_PASSWORD;
 my $VICIDIAL_DB_NAME;
 
-# DID Optimizer API Configuration (defaults, overridden by config file)
+# DID Optimizer API Configuration (from dids.conf)
 my $API_URL;
 my $API_KEY;
 
@@ -51,38 +55,89 @@ sub load_configuration {
         db_host => $ENV{'VICIDIAL_DB_HOST'} || 'localhost',
         db_user => $ENV{'VICIDIAL_DB_USER'} || 'cron',
         db_pass => $ENV{'VICIDIAL_DB_PASSWORD'} || '1234',
-        db_name => $ENV{'VICIDIAL_DB_NAME'} || 'asterisk'
+        db_name => $ENV{'VICIDIAL_DB_NAME'} || 'asterisk',
+        db_port => $ENV{'VICIDIAL_DB_PORT'} || '3306'
     );
 
-    # Read configuration file if it exists
-    if (-f $CONFIG_FILE && -r $CONFIG_FILE) {
-        open my $fh, '<', $CONFIG_FILE or do {
-            log_message("⚠️  Cannot open configuration file $CONFIG_FILE: $!");
-            return;
+    # 1. Read VICIdial database configuration from astguiclient.conf
+    if (-f $ASTGUICLIENT_CONF && -r $ASTGUICLIENT_CONF) {
+        open my $fh, '<', $ASTGUICLIENT_CONF or do {
+            log_message("⚠️  Cannot open astguiclient.conf: $!");
         };
 
-        while (my $line = <$fh>) {
-            chomp $line;
-            $line =~ s/^\s+|\s+$//g;  # Trim whitespace
+        if ($fh) {
+            while (my $line = <$fh>) {
+                chomp $line;
+                $line =~ s/^\s+|\s+$//g;  # Trim whitespace
 
-            # Skip comments and empty lines
-            next if $line =~ /^#/ || $line eq '';
+                # Skip comments and empty lines
+                next if $line =~ /^[#;]/ || $line eq '';
 
-            # Skip section headers
-            next if $line =~ /^\[(.+)\]$/;
+                # VICIdial format: VAR => value
+                if ($line =~ /^\$?(\w+)\s*=>\s*['"]?([^'"]+)['"]?\s*[,;]?$/) {
+                    my ($key, $value) = ($1, $2);
+                    $value =~ s/['"]//g;  # Remove quotes
 
-            # Key-value pairs
-            if ($line =~ /^(\w+)\s*=\s*(.*)$/) {
-                my ($key, $value) = ($1, $2);
-                $value =~ s/^\s+|\s+$//g;  # Trim value
-                $config{$key} = $value;
+                    # Map VICIdial DB variables to our config
+                    if ($key eq 'VARDB_server' || $key eq 'VARDBserver') {
+                        $config{db_host} = $value;
+                    } elsif ($key eq 'VARDB_database' || $key eq 'VARDBdatabase') {
+                        $config{db_name} = $value;
+                    } elsif ($key eq 'VARDB_user' || $key eq 'VARDBuser') {
+                        $config{db_user} = $value;
+                    } elsif ($key eq 'VARDB_pass' || $key eq 'VARDBpass') {
+                        $config{db_pass} = $value;
+                    } elsif ($key eq 'VARDB_port' || $key eq 'VARDBport') {
+                        $config{db_port} = $value;
+                    }
+                }
             }
+            close $fh;
+            log_message("✅ VICIdial database config loaded from $ASTGUICLIENT_CONF");
         }
-
-        close $fh;
-        log_message("✅ Configuration loaded from $CONFIG_FILE");
     } else {
-        log_message("ℹ️  Configuration file $CONFIG_FILE not found, using defaults/environment variables");
+        log_message("ℹ️  VICIdial config file $ASTGUICLIENT_CONF not found");
+    }
+
+    # 2. Read DID Optimizer API configuration from dids.conf
+    if (-f $DID_CONFIG_FILE && -r $DID_CONFIG_FILE) {
+        open my $fh, '<', $DID_CONFIG_FILE or do {
+            log_message("⚠️  Cannot open DID config file $DID_CONFIG_FILE: $!");
+        };
+
+        if ($fh) {
+            while (my $line = <$fh>) {
+                chomp $line;
+                $line =~ s/^\s+|\s+$//g;  # Trim whitespace
+
+                # Skip comments and empty lines
+                next if $line =~ /^#/ || $line eq '';
+
+                # Skip section headers
+                next if $line =~ /^\[(.+)\]$/;
+
+                # Key-value pairs (INI format)
+                if ($line =~ /^(\w+)\s*=\s*(.*)$/) {
+                    my ($key, $value) = ($1, $2);
+                    $value =~ s/^\s+|\s+$//g;  # Trim value
+                    $config{$key} = $value;
+                }
+            }
+            close $fh;
+            log_message("✅ DID Optimizer config loaded from $DID_CONFIG_FILE");
+        }
+    } else {
+        log_message("ℹ️  DID config file $DID_CONFIG_FILE not found");
+    }
+
+    # 3. Environment variables override file config
+    if ($ENV{'API_KEY'}) {
+        $config{api_key} = $ENV{'API_KEY'};
+        log_message("ℹ️  API_KEY overridden from environment variable");
+    }
+    if ($ENV{'DID_OPTIMIZER_API_URL'}) {
+        $config{api_base_url} = $ENV{'DID_OPTIMIZER_API_URL'};
+        log_message("ℹ️  API URL overridden from environment variable");
     }
 
     # Map config keys to variables
@@ -93,10 +148,20 @@ sub load_configuration {
     $VICIDIAL_DB_PASSWORD = $config{db_pass};
     $VICIDIAL_DB_NAME = $config{db_name};
 
+    log_message("📋 Final configuration:");
+    log_message("   API URL: $API_URL");
+    log_message("   DB Host: $VICIDIAL_DB_HOST:$config{db_port}");
+    log_message("   DB Name: $VICIDIAL_DB_NAME");
+    log_message("   DB User: $VICIDIAL_DB_USER");
+
     # Validate required configuration
     unless ($API_KEY) {
-        print STDERR "❌ API key not found in $CONFIG_FILE or API_KEY environment variable\n";
-        print STDERR "   Please set api_key in $CONFIG_FILE or set API_KEY environment variable\n";
+        print STDERR "❌ API key not found in any configuration source\n";
+        print STDERR "   Checked:\n";
+        print STDERR "   - $DID_CONFIG_FILE (api_key=...)\n";
+        print STDERR "   - Environment variable API_KEY\n";
+        print STDERR "\n";
+        print STDERR "   Please configure API key in one of these locations.\n";
         exit 1;
     }
 }
