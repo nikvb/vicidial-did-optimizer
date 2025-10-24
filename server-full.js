@@ -16,19 +16,18 @@ import jsonwebtoken from 'jsonwebtoken';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createProxyMiddleware } from 'http-proxy-middleware';
+import { Resend } from 'resend';
+import crypto from 'crypto';
 
 // Get __dirname in ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Import routes - commented out until route files are created
-// import authRoutes from './routes/auth.js';
-// import userRoutes from './routes/users.js';
-// import didRoutes from './routes/dids.js';
-// import analyticsRoutes from './routes/analytics.js';
-// import billingRoutes from './routes/billing.js';
-import tenantRoutes from './temp_clone/routes/tenants.js';
-// import dashboardRoutes from './routes/dashboard.js';
+// Frontend build path
+const frontendBuildPath = path.join(__dirname, 'frontend');
+
+// Initialize Resend
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 // Import middleware - commented out until middleware files are created
 // import { errorHandler } from './middleware/errorHandler.js';
@@ -37,37 +36,22 @@ import tenantRoutes from './temp_clone/routes/tenants.js';
 // Import passport configuration AFTER dotenv
 // import './config/passport.js'; // Commented out - passport config included inline
 
-// Import additional modules for VICIdial endpoint - commented out until created
-// import { validateApiKey } from './middleware/auth.js';
-// import DID from './models/DID.js';
+// IMPORTANT: Import models BEFORE routes so mongoose.model() works in route files
+import User from './models/User.js';
+import Tenant from './models/Tenant.js';
+import DID from './models/DID.js';
+import CallRecord from './models/CallRecord.js';
+import AuditLog from './models/AuditLog.js';
+import AreaCodeLocation from './models/AreaCodeLocation.js';
 
-// Define Tenant model using the existing mongoose connection
-const TenantSchema = new mongoose.Schema({
-  name: String,
-  domain: String,
-  isActive: Boolean,
-  apiKeys: [{
-    key: String,
-    name: String,
-    permissions: [String],
-    isActive: Boolean,
-    lastUsed: Date,
-    createdAt: Date
-  }],
-  rotationState: {
-    currentIndex: Number,
-    lastReset: Date,
-    usedDidsInCycle: [String]
-  }
-});
-
-// Get or create Tenant model
-let Tenant;
-try {
-  Tenant = mongoose.model('Tenant');
-} catch (error) {
-  Tenant = mongoose.model('Tenant', TenantSchema);
-}
+// Import routes AFTER models are registered
+// import authRoutes from './routes/auth.js';
+// import userRoutes from './routes/users.js';
+import didRoutes from './temp_clone/routes/dids.js';
+// import analyticsRoutes from './routes/analytics.js';
+// import billingRoutes from './routes/billing.js';
+import tenantRoutes from './temp_clone/routes/tenants.js';
+// import dashboardRoutes from './routes/dashboard.js';
 
 // API key validation middleware using the same DB connection
 const validateApiKey = async (req, res, next) => {
@@ -134,123 +118,6 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/did-optim
     console.log('⚠️ Running without database connection...');
   });
 
-// Define Mongoose models
-let User, DID, CallRecord, AuditLog;
-
-// Get or create User model
-try {
-  User = mongoose.model('User');
-} catch (error) {
-  User = mongoose.model('User', new mongoose.Schema({
-    email: String,
-    password: String,
-    firstName: String,
-    lastName: String,
-    role: String,
-    isActive: Boolean,
-    isEmailVerified: Boolean,
-    lastLogin: Date,
-    tenant: String
-  }));
-}
-
-// Get or create DID model
-try {
-  DID = mongoose.model('DID');
-} catch (error) {
-  DID = mongoose.model('DID', new mongoose.Schema({
-    tenantId: mongoose.Schema.Types.ObjectId,  // Fixed: Changed from String to ObjectId
-    phoneNumber: String,
-    status: String,
-    reputation: {
-      score: Number,
-      callVolume: Number,
-      successRate: Number
-    },
-    lastUsed: Date,
-    createdAt: { type: Date, default: Date.now },
-    updatedAt: { type: Date, default: Date.now }
-  }));
-}
-
-// Get or create CallRecord model
-try {
-  CallRecord = mongoose.model('CallRecord');
-} catch (error) {
-  CallRecord = mongoose.model('CallRecord', new mongoose.Schema({
-    didId: String,
-    tenantId: String,
-    callId: String,
-    timestamp: Date,
-    duration: Number,
-    outcome: String,
-    metadata: Object,
-    createdAt: { type: Date, default: Date.now }
-  }));
-}
-
-// Get or create AuditLog model
-try {
-  AuditLog = mongoose.model('AuditLog');
-} catch (error) {
-  AuditLog = mongoose.model('AuditLog', new mongoose.Schema({
-    tenantId: String,
-    userId: String,
-    action: String,
-    resourceType: String,
-    resourceId: String,
-    timestamp: { type: Date, default: Date.now },
-    metadata: Object
-  }));
-}
-
-// AreaCodeLocation model for location data integration
-let AreaCodeLocation;
-try {
-  AreaCodeLocation = mongoose.model('AreaCodeLocation');
-} catch (error) {
-  AreaCodeLocation = mongoose.model('AreaCodeLocation', new mongoose.Schema({
-    areaCode: {
-      type: String,
-      required: true,
-      index: true,
-      maxlength: 3
-    },
-    city: {
-      type: String,
-      required: true,
-      index: true,
-      trim: true
-    },
-    state: {
-      type: String,
-      required: true,
-      index: true,
-      trim: true
-    },
-    country: {
-      type: String,
-      required: true,
-      default: 'US',
-      maxlength: 2
-    },
-    location: {
-      type: {
-        type: String,
-        enum: ['Point'],
-        default: 'Point'
-      },
-      coordinates: {
-        type: [Number], // [longitude, latitude]
-        required: true
-      }
-    }
-  }, {
-    timestamps: false,
-    versionKey: false
-  }));
-}
-
 // Helper function to get location data from area code
 async function getLocationByAreaCode(areaCode) {
   if (!areaCode || areaCode.length !== 3) {
@@ -288,7 +155,13 @@ app.use(cors({
     // Allow requests with no origin (mobile apps, automated tests)
     if (!origin) return callback(null, true);
 
-    const allowedOrigins = ['https://dids.amdy.io', 'http://api3.amdy.io:3000', 'http://api3.amdy.io:5000', 'https://endpoint.amdy.io', 'http://localhost:3000', 'http://localhost:5000'];
+    const allowedOrigins = [
+      'https://dids.amdy.io',
+      'https://endpoint.amdy.io',
+      process.env.FRONTEND_URL || 'https://dids.amdy.io',
+      'http://localhost:3000',
+      'http://localhost:5000'
+    ];
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
@@ -297,13 +170,16 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key']
 }));
 
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // app.use(mongoSanitize()); // Commented out - incompatible with Express 5
+
+// Serve static frontend build files
+app.use(express.static(frontendBuildPath));
 
 // Session configuration
 app.use(session({
@@ -398,6 +274,33 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
       goodReputation: goodReputationDids
     });
 
+    // Helper function to check if DID has reached daily limit
+    const filterByDailyLimit = async (dids) => {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
+
+      return dids.filter(did => {
+        if (!did.usage || !did.usage.dailyUsage) return true; // No usage data, allow
+
+        const todayUsage = did.usage.dailyUsage.find(day => {
+          const dayDate = new Date(day.date);
+          dayDate.setHours(0, 0, 0, 0);
+          return dayDate.getTime() === today.getTime();
+        });
+
+        const usageCount = todayUsage ? todayUsage.count : 0;
+        const capacity = did.capacity || defaultCapacity;
+        const hasCapacity = usageCount < capacity;
+
+        if (!hasCapacity) {
+          console.log(`⚠️ DID ${did.phoneNumber} has reached daily limit: ${usageCount}/${capacity}`);
+        }
+
+        return hasCapacity;
+      });
+    };
+
     // Strategy 1: Round-robin through unused DIDs in current cycle with good reputation
     let query = {
       tenantId: req.tenant._id,
@@ -411,9 +314,14 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
     }
 
     console.log('🔄 Step 1: Round-robin through unused DIDs in cycle with good reputation');
-    let did = await DID.findOne(query)
+
+    // Fetch multiple DIDs and filter by daily limit
+    let candidateDids = await DID.find(query)
       .sort({ lastUsed: 1, createdAt: 1 })
-      .skip(rotationState.currentIndex % Math.max(1, goodReputationDids));
+      .limit(20); // Get 20 candidates to filter
+
+    let availableDids = await filterByDailyLimit(candidateDids);
+    let did = availableDids[rotationState.currentIndex % Math.max(1, availableDids.length)] || null;
 
     if (!did && usedDidsSet.size > 0) {
       // Strategy 2: If no unused DIDs in cycle, pick least recently used with good reputation
@@ -423,7 +331,10 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
         status: 'active',
         'reputation.score': { $gte: 50 } // Only use DIDs with good reputation (50+ score)
       };
-      did = await DID.findOne(query).sort({ lastUsed: 1, _id: 1 });
+
+      candidateDids = await DID.find(query).sort({ lastUsed: 1, _id: 1 }).limit(20);
+      availableDids = await filterByDailyLimit(candidateDids);
+      did = availableDids[0] || null;
 
       // Reset the cycle
       usedDidsSet.clear();
@@ -433,18 +344,26 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
     if (!did) {
       // Strategy 3: Try good reputation DIDs first, then any active DID as last resort
       console.log('🔄 Step 3: Fallback - trying good reputation DIDs first');
-      did = await DID.findOne({
+
+      candidateDids = await DID.find({
         tenantId: req.tenant._id,
         status: 'active',
         'reputation.score': { $gte: 50 }
-      }).sort({ 'reputation.score': -1, lastUsed: 1 });
+      }).sort({ 'reputation.score': -1, lastUsed: 1 }).limit(20);
+
+      availableDids = await filterByDailyLimit(candidateDids);
+      did = availableDids[0] || null;
 
       if (!did) {
         console.log('⚠️ Step 4: Last resort - using any active DID (even with bad reputation)');
-        did = await DID.findOne({
+
+        candidateDids = await DID.find({
           tenantId: req.tenant._id,
           status: 'active'
-        }).sort({ 'reputation.score': -1, lastUsed: 1 });
+        }).sort({ 'reputation.score': -1, lastUsed: 1 }).limit(20);
+
+        availableDids = await filterByDailyLimit(candidateDids);
+        did = availableDids[0] || null;
       }
     }
 
@@ -457,16 +376,87 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
     console.log('   Good reputation DIDs (≥50):', goodReputationDids);
     console.log('   Bad reputation DIDs (<50):', activeDids - goodReputationDids);
 
-    console.log('🎯 DID Query Result:', did ? `Found: ${did.phoneNumber} (Last used: ${did.lastUsed}, Reputation: ${did.reputation?.score || 'Unknown'})` : 'No DID found');
+    if (did) {
+      const currentUsage = did.getTodayUsage();
+      const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
+      const capacity = did.capacity || defaultCapacity;
+      console.log('🎯 DID Query Result:', `Found: ${did.phoneNumber} (Last used: ${did.usage?.lastUsed || 'Never'}, Reputation: ${did.reputation?.score || 'Unknown'}, Today's usage: ${currentUsage}/${capacity})`);
+    } else {
+      console.log('🎯 DID Query Result: No DID found');
+    }
 
     if (!did) {
-      return res.json({
-        success: true,
-        did: {
-          number: process.env.FALLBACK_DID || '+18005551234',
-          is_fallback: true
+      console.warn('⚠️ WARNING: All DIDs may have reached their daily capacity limits. Selecting DID with lowest over-capacity usage.');
+
+      // Strategy 5: All DIDs exhausted - pick DID with lowest usage over capacity
+      const allActiveDids = await DID.find({
+        tenantId: req.tenant._id,
+        status: 'active'
+      }).sort({ 'reputation.score': -1 });
+
+      if (allActiveDids.length > 0) {
+        // Find DID with lowest today's usage
+        let minUsage = Infinity;
+        let selectedDid = null;
+
+        for (const candidateDid of allActiveDids) {
+          const todayUsage = candidateDid.getTodayUsage();
+          if (todayUsage < minUsage) {
+            minUsage = todayUsage;
+            selectedDid = candidateDid;
+          }
         }
-      });
+
+        did = selectedDid;
+        const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
+        console.log(`📢 OVER CAPACITY: Using ${did.phoneNumber} with ${minUsage} calls today (capacity: ${did.capacity || defaultCapacity})`);
+
+        // Send email notification about capacity exhaustion
+        try {
+          const adminUsers = await User.find({
+            tenantId: req.tenant._id,
+            role: 'ADMIN'
+          });
+
+          const adminEmails = adminUsers.map(u => u.email).filter(Boolean);
+
+          if (adminEmails.length > 0) {
+            await resend.emails.send({
+              from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
+              to: adminEmails,
+              subject: '⚠️ DID Pool Capacity Exhausted',
+              html: `
+                <h2 style="color: #ef4444;">DID Pool Capacity Exhausted</h2>
+                <p>All DIDs in your pool have reached their daily capacity limits.</p>
+                <p><strong>Campaign:</strong> ${campaign_id || 'Unknown'}</p>
+                <p><strong>Agent:</strong> ${agent_id || 'Unknown'}</p>
+                <p><strong>Time:</strong> ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })}</p>
+                <p><strong>Action Taken:</strong> Selected DID ${did.phoneNumber} with lowest over-capacity usage (${minUsage} calls today).</p>
+                <hr style="margin: 20px 0; border: none; border-top: 1px solid #e5e7eb;">
+                <p style="color: #6b7280; font-size: 14px;">
+                  Consider increasing your DID pool capacity or adding more DIDs to handle the call volume.
+                  <br><br>
+                  Log in to your <a href="${process.env.FRONTEND_URL || 'https://dids.amdy.io'}/settings/rotation-rules">DID Optimizer dashboard</a> to manage capacity settings.
+                </p>
+              `
+            });
+            console.log('📧 Capacity exhaustion email sent to admins:', adminEmails.join(', '));
+          }
+        } catch (emailError) {
+          console.error('❌ Failed to send capacity exhaustion email:', emailError);
+        }
+      }
+
+      if (!did) {
+        console.error('❌ CRITICAL: No DIDs available at all. Using fallback.');
+        return res.json({
+          success: true,
+          did: {
+            number: process.env.FALLBACK_DID || '+18005551234',
+            is_fallback: true
+          }
+        });
+      }
     }
 
     // Update rotation state
@@ -486,31 +476,79 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
 
     console.log('✅ Rotation state saved to DB successfully');
 
-    // Update last used timestamp
-    did.lastUsed = new Date();
-    did.usageCount = (did.usageCount || 0) + 1;
-    await did.save();
+    // Update last used timestamp and usage tracking
+    const now = new Date();
+
+    // Initialize usage object if it doesn't exist
+    if (!did.usage) {
+      did.usage = {
+        totalCalls: 0,
+        dailyUsage: [],
+        lastUsed: null,
+        lastCampaign: null,
+        lastAgent: null
+      };
+    }
+
+    did.usage.lastUsed = now;
+    did.usage.totalCalls = (did.usage.totalCalls || 0) + 1;
+    did.usage.lastCampaign = campaign_id;
+    did.usage.lastAgent = agent_id;
+
+    // Increment today's usage count for daily limit tracking
+    did.incrementTodayUsage();
+
+    const todayUsage = did.getTodayUsage();
+    const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
+    const dailyCapacity = did.capacity || defaultCapacity;
+
+    console.log('📝 Updating DID usage:', {
+      did: did.phoneNumber,
+      didId: did._id,
+      oldLastUsed: did.usage.lastUsed,
+      newLastUsed: now,
+      totalCalls: did.usage.totalCalls,
+      todayUsage: todayUsage,
+      dailyCapacity: dailyCapacity,
+      percentageUsed: `${Math.round((todayUsage / dailyCapacity) * 100)}%`,
+      campaign: campaign_id,
+      agent: agent_id
+    });
+
+    try {
+      const savedDid = await did.save();
+      console.log('✅ DID usage updated successfully:', {
+        id: savedDid._id,
+        phone: savedDid.phoneNumber,
+        lastUsed: savedDid.usage?.lastUsed,
+        totalCalls: savedDid.usage?.totalCalls
+      });
+    } catch (saveError) {
+      console.error('❌ ERROR saving DID usage:', saveError);
+      console.error('❌ DID object:', JSON.stringify(did, null, 2));
+    }
 
     // Create call record for tracking
     const callRecord = new CallRecord({
-      didId: did._id.toString(),
-      tenantId: req.tenant._id.toString(),
-      callId: `${campaign_id}_${agent_id}_${Date.now()}`, // Generate unique call ID
-      timestamp: new Date(),
+      didId: did._id,
+      tenantId: req.tenant._id,
+      phoneNumber: customer_phone || 'unknown',
+      callTimestamp: new Date(),
       duration: 0, // Will be updated when call completes
-      outcome: 'initiated', // Initial state
+      result: 'answered', // Default - will be updated when call completes
+      disposition: 'initiated', // Initial state
+      campaignId: campaign_id,
+      agentId: agent_id,
+      customerState: customer_state,
+      customerAreaCode: customer_area_code,
       metadata: {
-        campaign_id,
-        agent_id,
-        customer_phone,
-        customer_state,
-        customer_area_code
-      },
-      createdAt: new Date()
+        callDirection: 'outbound',
+        recording: false
+      }
     });
     await callRecord.save();
 
-    console.log('📞 Call record created:', callRecord.callId);
+    console.log('📞 Call record created:', callRecord._id);
 
     console.log('✅ Rotation state updated:', {
       selectedDID: did.phoneNumber,
@@ -544,31 +582,332 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
   }
 });
 
-// API Routes - commented out until route files are created
+// VICIdial Call Result Reporting endpoint
+app.post('/api/v1/calls/report', validateApiKey, async (req, res) => {
+  console.log('📞 Call result report received');
+  console.log('📊 Report data:', req.body);
+
+  try {
+    const {
+      campaign_id,
+      customer_phone,
+      call_result,
+      call_duration,
+      disposition,
+      timestamp,
+      uniqueid,
+      channel,
+      callerid
+    } = req.body;
+
+    // Validate required fields
+    if (!campaign_id || !customer_phone) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: campaign_id and customer_phone are required'
+      });
+    }
+
+    // Find the call record to update (most recent for this campaign and phone)
+    const callRecord = await CallRecord.findOne({
+      tenantId: req.tenant._id,
+      campaignId: campaign_id,
+      phoneNumber: customer_phone
+    }).sort({ callTimestamp: -1 });
+
+    if (!callRecord) {
+      console.log('⚠️  No call record found for update, creating new one');
+
+      // Create a new call record with the result
+      const newCallRecord = new CallRecord({
+        tenantId: req.tenant._id,
+        phoneNumber: customer_phone,
+        callTimestamp: timestamp ? new Date(timestamp * 1000) : new Date(),
+        duration: call_duration || 0,
+        result: call_result === 'ANSWER' || call_result === 'ANSWERED' ? 'answered' :
+                call_result === 'BUSY' ? 'busy' :
+                call_result === 'NOANSWER' || call_result === 'NO ANSWER' ? 'no_answer' :
+                call_result === 'FAILED' || call_result === 'CANCEL' ? 'failed' :
+                'dropped',
+        disposition: disposition || 'completed',
+        campaignId: campaign_id,
+        metadata: {
+          callDirection: 'outbound',
+          recording: false,
+          uniqueid: uniqueid,
+          channel: channel,
+          callerid: callerid,
+          source: 'vicidial-agi'
+        }
+      });
+
+      await newCallRecord.save();
+      console.log('✅ New call record created with result:', newCallRecord._id);
+
+      return res.json({
+        success: true,
+        message: 'Call result recorded (new record)',
+        call_id: newCallRecord._id
+      });
+    }
+
+    // Update existing call record
+    callRecord.duration = call_duration || callRecord.duration;
+    callRecord.result = call_result === 'ANSWER' || call_result === 'ANSWERED' ? 'answered' :
+                        call_result === 'BUSY' ? 'busy' :
+                        call_result === 'NOANSWER' || call_result === 'NO ANSWER' ? 'no_answer' :
+                        call_result === 'FAILED' || call_result === 'CANCEL' ? 'failed' :
+                        'dropped';
+    callRecord.disposition = disposition || callRecord.disposition;
+
+    // Update metadata
+    if (!callRecord.metadata) callRecord.metadata = {};
+    if (uniqueid) callRecord.metadata.uniqueid = uniqueid;
+    if (channel) callRecord.metadata.channel = channel;
+    if (callerid) callRecord.metadata.callerid = callerid;
+    callRecord.metadata.source = 'vicidial-agi';
+    callRecord.metadata.reportedAt = new Date();
+
+    await callRecord.save();
+
+    console.log('✅ Call record updated with result:', {
+      callId: callRecord._id,
+      result: callRecord.result,
+      duration: callRecord.duration,
+      disposition: callRecord.disposition
+    });
+
+    res.json({
+      success: true,
+      message: 'Call result updated successfully',
+      call_id: callRecord._id,
+      updated: {
+        result: callRecord.result,
+        duration: callRecord.duration,
+        disposition: callRecord.disposition
+      }
+    });
+
+  } catch (error) {
+    console.error('💥 Call result reporting error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+      error: error.message
+    });
+  }
+});
+
+// VICIdial Call Results Sync endpoint (from vicidial_log polling)
+app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
+  try {
+    const {
+      uniqueid,
+      leadId,
+      listId,
+      campaignId,
+      phoneNumber,
+      phoneCode,
+      disposition,
+      duration,
+      agentId,
+      userGroup,
+      termReason,
+      comments,
+      altDial,
+      calledCount,
+      callDate,
+      startEpoch,
+      endEpoch,
+      timestamp
+    } = req.body;
+
+    // Validate required fields
+    if (!uniqueid || !phoneNumber || !campaignId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: uniqueid, phoneNumber, campaignId'
+      });
+    }
+
+    // Check if this call result already exists (prevent duplicates)
+    const existingRecord = await CallRecord.findOne({
+      tenantId: req.tenant._id,
+      'metadata.uniqueid': uniqueid
+    });
+
+    if (existingRecord) {
+      return res.json({
+        success: true,
+        message: 'Call result already processed',
+        recordId: existingRecord._id,
+        duplicate: true
+      });
+    }
+
+    // Determine call result status
+    let result = 'completed';
+    if (disposition === 'SALE' || disposition === 'A') {
+      result = 'answered';
+    } else if (disposition === 'DNC' || disposition === 'B') {
+      result = 'dnc';
+    } else if (disposition === 'NA' || disposition === 'NO') {
+      result = 'no_answer';
+    } else if (disposition === 'BUSY') {
+      result = 'busy';
+    } else if (disposition === 'DROP' || disposition === 'AMD') {
+      result = 'dropped';
+    }
+
+    // Create call record
+    const callRecord = new CallRecord({
+      tenantId: req.tenant._id,
+      phoneNumber: phoneNumber,
+      callTimestamp: endEpoch ? new Date(endEpoch * 1000) : new Date(),
+      duration: duration || 0,
+      result: result,
+      disposition: disposition,
+      campaignId: campaignId,
+      metadata: {
+        callDirection: 'outbound',
+        recording: false,
+        uniqueid: uniqueid,
+        leadId: leadId,
+        listId: listId,
+        phoneCode: phoneCode,
+        agentId: agentId,
+        userGroup: userGroup,
+        termReason: termReason,
+        comments: comments,
+        altDial: altDial,
+        calledCount: calledCount,
+        callDate: callDate,
+        startEpoch: startEpoch,
+        endEpoch: endEpoch,
+        source: 'vicidial-sync'
+      }
+    });
+
+    await callRecord.save();
+
+    // Update DID statistics if we can find which DID was used
+    // Note: VICIdial doesn't store outbound DID in vicidial_log
+    // You may need to join with other tables or track separately
+
+    // Create audit log
+    await AuditLog.create({
+      tenantId: req.tenant._id,
+      action: 'CALL_RESULT_SYNCED',
+      details: {
+        uniqueid: uniqueid,
+        phone: phoneNumber,
+        disposition: disposition,
+        duration: duration,
+        campaign: campaignId,
+        agent: agentId
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Call result recorded',
+      data: {
+        recordId: callRecord._id,
+        uniqueid: uniqueid,
+        disposition: disposition
+      }
+    });
+
+  } catch (error) {
+    console.error('💥 Call results sync error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// API Routes
 // app.use('/api/v1/auth', authRoutes);
 // app.use('/api/v1/users', userRoutes);
-// app.use('/api/v1/dids', didRoutes);
+app.use('/api/v1/dids', didRoutes);
 // app.use('/api/v1/analytics', analyticsRoutes);
 // app.use('/api/v1/billing', billingRoutes);
 app.use('/api/v1/tenants', tenantRoutes);
 // app.use('/api/v1/dashboard', dashboardRoutes);
 
 // Google OAuth Configuration
+const googleCallbackURL = process.env.GOOGLE_CALLBACK_URL || `${process.env.FRONTEND_URL || 'http://localhost:5000'}/api/v1/auth/google/callback`;
+console.log('🔐 Configuring Google OAuth with callback URL:', googleCallbackURL);
+
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  callbackURL: "https://endpoint.amdy.io/api/v1/auth/google/callback"
+  callbackURL: googleCallbackURL,
+  proxy: false  // Disable proxy detection to prevent URL override
 }, async (accessToken, refreshToken, profile, done) => {
   try {
-    // Here you would normally save/update user in database
-    const user = {
-      googleId: profile.id,
-      name: profile.displayName,
-      email: profile.emails[0].value,
-      photo: profile.photos[0].value
-    };
+    const email = profile.emails[0].value;
+
+    // Find or create user in database
+    let user = await User.findOne({ email: email.toLowerCase() });
+
+    if (!user) {
+      // Create a new tenant for the user's organization
+      const orgName = `${profile.name?.givenName || profile.displayName.split(' ')[0] || ''} ${profile.name?.familyName || profile.displayName.split(' ')[1] || ''}`.trim() || email.split('@')[0];
+      const emailDomain = email.split('@')[1];
+
+      // Make domain unique by appending random string for common domains
+      const commonDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com'];
+      const isCommonDomain = commonDomains.includes(emailDomain.toLowerCase());
+
+      const newTenant = new Tenant({
+        name: `${orgName}'s Organization`,
+        domain: isCommonDomain ? `${email.split('@')[0]}.${emailDomain}` : emailDomain,
+        isActive: true,
+        apiKeys: [],
+        rotationState: {
+          currentIndex: 0,
+          lastReset: new Date(),
+          usedDidsInCycle: []
+        }
+      });
+      const savedTenant = await newTenant.save();
+      console.log('✅ New tenant created:', savedTenant.name, 'ID:', savedTenant._id);
+
+      // Create new user with tenant
+      user = new User({
+        email: email.toLowerCase(),
+        firstName: profile.name?.givenName || profile.displayName.split(' ')[0] || '',
+        lastName: profile.name?.familyName || profile.displayName.split(' ')[1] || '',
+        role: 'CLIENT', // Default role for Google OAuth users
+        tenant: savedTenant._id, // Assign the saved tenant ID
+        isActive: true,
+        isEmailVerified: true, // Email verified by Google
+        googleId: profile.id,
+        avatar: profile.photos[0]?.value,
+        lastLogin: new Date()
+      });
+      console.log('🔍 Creating user with tenant ID:', savedTenant._id);
+      await user.save();
+      console.log('✅ New user created via Google OAuth:', email);
+    } else {
+      // Update existing user
+      user.googleId = profile.id;
+      user.avatar = profile.photos[0]?.value;
+      user.lastLogin = new Date();
+      await user.save();
+      console.log('✅ Existing user logged in via Google OAuth:', email);
+    }
+
     return done(null, user);
   } catch (error) {
+    console.error('❌ Google OAuth error:', error);
+    console.error('❌ Error stack:', error.stack);
+    console.error('❌ Error details:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+    console.error('❌ Error name:', error.name);
+    console.error('❌ Error message:', error.message);
+    if (error.code) console.error('❌ Error code:', error.code);
     return done(error, null);
   }
 }));
@@ -582,43 +921,79 @@ passport.deserializeUser((user, done) => {
 });
 
 // Google OAuth Routes
-app.get('/api/v1/auth/google',
-  passport.authenticate('google', { scope: ['profile', 'email'] })
-);
+app.get('/api/v1/auth/google', (req, res, next) => {
+  console.log('🔵 Google OAuth initiated');
+  console.log('🔵 Request URL:', req.url);
+  console.log('🔵 Request headers:', JSON.stringify(req.headers, null, 2));
+  next();
+}, passport.authenticate('google', { scope: ['profile', 'email'] }));
 
-app.get('/api/v1/auth/google/callback',
-  passport.authenticate('google', { failureRedirect: (process.env.FRONTEND_URL || 'https://dids.amdy.io') + '/login' }),
-  (req, res) => {
-    // Successful authentication
-    // Generate JWT token for the user
-    const token = jsonwebtoken.sign(
-      {
-        id: req.user.googleId,
-        email: req.user.email,
-        name: req.user.name
-      },
-      process.env.JWT_SECRET || 'default-secret',
-      { expiresIn: '7d' }
-    );
+app.get('/api/v1/auth/google/callback', (req, res, next) => {
+  console.log('🟢 Google OAuth callback received');
+  console.log('🟢 Callback URL:', req.url);
+  console.log('🟢 Query params:', JSON.stringify(req.query, null, 2));
+  next();
+}, passport.authenticate('google', {
+  failureRedirect: `${process.env.FRONTEND_URL || 'http://localhost:5000'}/login?error=auth_failed`,
+  failureMessage: true
+}), (req, res) => {
+    try {
+      console.log('🟢 Passport authentication succeeded');
+      console.log('🟢 User in request:', req.user ? 'YES' : 'NO');
 
-    // Set token in a cookie and redirect to dashboard
-    res.cookie('auth_token', token, {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'strict',
-      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
-    });
+      // Check if user exists
+      if (!req.user) {
+        console.error('❌ OAuth callback: No user in request');
+        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5000';
+        return res.redirect(`${frontendUrl}/login?error=user_not_found`);
+      }
 
-    // Redirect to frontend dashboard
-    const frontendUrl = process.env.FRONTEND_URL || 'https://dids.amdy.io';
-    res.redirect(`${frontendUrl}/dashboard`);
+      // Successful authentication
+      // Generate JWT access token for the user with database ID
+      const accessToken = jsonwebtoken.sign(
+        {
+          id: req.user._id.toString(),
+          email: req.user.email,
+          firstName: req.user.firstName,
+          lastName: req.user.lastName,
+          role: req.user.role
+        },
+        process.env.JWT_SECRET || 'default-secret',
+        { expiresIn: '7d' }
+      );
+
+      // Generate refresh token (longer expiration)
+      const refreshToken = jsonwebtoken.sign(
+        {
+          id: req.user._id.toString(),
+          type: 'refresh'
+        },
+        process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || 'default-refresh-secret',
+        { expiresIn: '30d' }
+      );
+
+      console.log('🔐 Google OAuth tokens generated for user:', req.user.email);
+
+      // Redirect to configured frontend URL
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5000';
+      console.log('🔗 Redirecting to:', `${frontendUrl}/auth/callback`);
+
+      // Redirect to frontend with both tokens in URL (will be stored by frontend)
+      res.redirect(`${frontendUrl}/auth/callback?token=${accessToken}&refresh=${refreshToken}`);
+    } catch (error) {
+      console.error('❌ OAuth callback error:', error);
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5000';
+      res.redirect(`${frontendUrl}/login?error=callback_failed`);
+    }
   }
 );
 
 app.get('/api/v1/auth/logout', (req, res) => {
   req.logout((err) => {
     if (err) { return res.status(500).json({ error: 'Logout failed' }); }
-    const frontendUrl = process.env.FRONTEND_URL || 'https://dids.amdy.io';
+
+    // Redirect to configured frontend URL
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5000';
     res.redirect(frontendUrl);
   });
 });
@@ -656,7 +1031,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
     // Generate JWT token
     const token = jsonwebtoken.sign(
       {
-        id: user._id,
+        id: user._id.toString(),
         email: user.email,
         firstName: user.firstName,
         lastName: user.lastName,
@@ -674,7 +1049,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
           refreshToken: token // For now, using same token for both
         },
         user: {
-          id: user._id,
+          id: user._id.toString(),
           email: user.email,
           firstName: user.firstName,
           lastName: user.lastName,
@@ -685,6 +1060,330 @@ app.post('/api/v1/auth/login', async (req, res) => {
     });
   } catch (error) {
     console.error('Login error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Registration endpoint
+app.post('/api/v1/auth/register', async (req, res) => {
+  try {
+    const { firstName, lastName, email, password } = req.body;
+
+    // Validate input
+    if (!firstName || !lastName || !email || !password) {
+      return res.status(400).json({ message: 'All fields are required' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters long' });
+    }
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser) {
+      return res.status(400).json({ message: 'Email already registered' });
+    }
+
+    // Create a new tenant for the user's organization
+    const emailDomain = email.split('@')[1];
+    const commonDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com'];
+    const isCommonDomain = commonDomains.includes(emailDomain.toLowerCase());
+
+    const newTenant = new Tenant({
+      name: `${firstName} ${lastName}'s Organization`,
+      domain: isCommonDomain ? `${email.split('@')[0]}.${emailDomain}` : emailDomain,
+      subdomain: `${firstName.toLowerCase()}-${Date.now()}`,
+      isActive: true,
+      apiKeys: [],
+      subscription: {
+        plan: 'starter',
+        status: 'trial',
+        billingCycle: 'monthly'
+      },
+      rotationState: {
+        currentIndex: 0,
+        lastReset: new Date(),
+        usedDidsInCycle: []
+      }
+    });
+    const savedTenant = await newTenant.save();
+    console.log('✅ New tenant created via registration:', savedTenant.name);
+
+    // Generate email verification token
+    const emailVerificationToken = crypto.randomBytes(32).toString('hex');
+
+    // Create new user
+    const newUser = new User({
+      email: email.toLowerCase(),
+      firstName,
+      lastName,
+      password, // Will be hashed by the pre-save middleware
+      role: 'CLIENT',
+      tenant: savedTenant._id,
+      isActive: true,
+      isEmailVerified: false, // Email verification required
+      emailVerificationToken,
+      lastLogin: new Date()
+    });
+    await newUser.save();
+    console.log('✅ New user registered:', email);
+
+    // Send verification email
+    const frontendUrl = process.env.FRONTEND_URL || 'https://dids.amdy.io';
+    const verificationUrl = `${frontendUrl}/verify-email?token=${emailVerificationToken}`;
+
+    try {
+      await resend.emails.send({
+        from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
+        to: email,
+        subject: 'Verify your DID Optimizer account',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2>Welcome to DID Optimizer, ${firstName}!</h2>
+            <p>Thank you for registering. Please verify your email address by clicking the button below:</p>
+            <a href="${verificationUrl}" style="display: inline-block; background-color: #4052B5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 20px 0;">
+              Verify Email Address
+            </a>
+            <p>Or copy and paste this link into your browser:</p>
+            <p style="color: #666; word-break: break-all;">${verificationUrl}</p>
+            <p style="color: #999; font-size: 12px; margin-top: 40px;">
+              If you didn't create an account, you can safely ignore this email.
+            </p>
+          </div>
+        `
+      });
+      console.log('✅ Verification email sent to:', email);
+    } catch (emailError) {
+      console.error('❌ Failed to send verification email:', emailError);
+      // Don't fail registration if email fails
+    }
+
+    // Generate JWT tokens
+    const accessToken = jsonwebtoken.sign(
+      {
+        id: newUser._id.toString(),
+        email: newUser.email,
+        firstName: newUser.firstName,
+        lastName: newUser.lastName,
+        role: newUser.role
+      },
+      process.env.JWT_SECRET || 'default-secret',
+      { expiresIn: '7d' }
+    );
+
+    const refreshToken = jsonwebtoken.sign(
+      {
+        id: newUser._id.toString(),
+        type: 'refresh'
+      },
+      process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || 'default-refresh-secret',
+      { expiresIn: '30d' }
+    );
+
+    res.status(201).json({
+      data: {
+        message: 'Registration successful',
+        tokens: {
+          accessToken,
+          refreshToken
+        },
+        user: {
+          id: newUser._id.toString(),
+          email: newUser.email,
+          firstName: newUser.firstName,
+          lastName: newUser.lastName,
+          role: newUser.role,
+          tenant: savedTenant._id
+        },
+        tenant: {
+          id: savedTenant._id.toString(),
+          name: savedTenant.name,
+          domain: savedTenant.domain
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Email verification endpoint
+app.post('/api/v1/auth/verify-email', async (req, res) => {
+  try {
+    const { token } = req.body;
+
+    if (!token) {
+      return res.status(400).json({ message: 'Verification token is required' });
+    }
+
+    // Find user by verification token
+    const user = await User.findOne({ emailVerificationToken: token });
+
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid or expired verification token' });
+    }
+
+    // Mark email as verified
+    user.isEmailVerified = true;
+    user.emailVerificationToken = null; // Clear the token
+    await user.save();
+
+    console.log('✅ Email verified for user:', user.email);
+
+    res.json({
+      data: {
+        message: 'Email verified successfully',
+        user: {
+          id: user._id.toString(),
+          email: user.email,
+          isEmailVerified: true
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Email verification error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Forgot password endpoint
+app.post('/api/v1/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Find user by email
+    const user = await User.findOne({ email: email.toLowerCase() });
+
+    // Always return success to prevent email enumeration attacks
+    if (!user) {
+      console.log('⚠️ Password reset requested for non-existent email:', email);
+      return res.json({
+        data: {
+          message: 'If an account exists with this email, you will receive a password reset link.'
+        }
+      });
+    }
+
+    // Generate password reset token (valid for 1 hour)
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    user.passwordResetToken = resetToken;
+    user.passwordResetExpires = new Date(Date.now() + 3600000); // 1 hour
+    await user.save();
+
+    console.log('✅ Password reset token generated for:', email);
+
+    // Send password reset email
+    const frontendUrl = process.env.FRONTEND_URL || 'https://dids.amdy.io';
+    const resetUrl = `${frontendUrl}/reset-password?token=${resetToken}`;
+
+    try {
+      await resend.emails.send({
+        from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
+        to: email,
+        subject: 'Reset your DID Optimizer password',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2>Password Reset Request</h2>
+            <p>Hi ${user.firstName},</p>
+            <p>We received a request to reset your password for your DID Optimizer account.</p>
+            <p>Click the button below to reset your password:</p>
+            <a href="${resetUrl}" style="display: inline-block; background-color: #4052B5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 20px 0;">
+              Reset Password
+            </a>
+            <p>Or copy and paste this link into your browser:</p>
+            <p style="color: #666; word-break: break-all;">${resetUrl}</p>
+            <p style="color: #999; font-size: 14px; margin-top: 30px;">
+              This link will expire in 1 hour for security reasons.
+            </p>
+            <p style="color: #999; font-size: 12px; margin-top: 20px;">
+              If you didn't request a password reset, you can safely ignore this email.
+            </p>
+          </div>
+        `
+      });
+      console.log('✅ Password reset email sent to:', email);
+    } catch (emailError) {
+      console.error('❌ Failed to send password reset email:', emailError);
+      // Still return success to user
+    }
+
+    res.json({
+      data: {
+        message: 'If an account exists with this email, you will receive a password reset link.'
+      }
+    });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Reset password endpoint
+app.post('/api/v1/auth/reset-password', async (req, res) => {
+  try {
+    const { token, password } = req.body;
+
+    if (!token || !password) {
+      return res.status(400).json({ message: 'Token and new password are required' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters long' });
+    }
+
+    // Find user by reset token and check expiration
+    const user = await User.findOne({
+      passwordResetToken: token,
+      passwordResetExpires: { $gt: new Date() }
+    });
+
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid or expired password reset token' });
+    }
+
+    // Update password (will be hashed by pre-save middleware)
+    user.password = password;
+    user.passwordResetToken = null;
+    user.passwordResetExpires = null;
+    await user.save();
+
+    console.log('✅ Password reset successful for:', user.email);
+
+    // Send confirmation email
+    try {
+      await resend.emails.send({
+        from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
+        to: user.email,
+        subject: 'Your DID Optimizer password has been changed',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2>Password Changed Successfully</h2>
+            <p>Hi ${user.firstName},</p>
+            <p>Your DID Optimizer password has been successfully changed.</p>
+            <p>If you didn't make this change, please contact our support team immediately.</p>
+            <p style="color: #999; font-size: 12px; margin-top: 40px;">
+              This is an automated security notification.
+            </p>
+          </div>
+        `
+      });
+      console.log('✅ Password change confirmation email sent');
+    } catch (emailError) {
+      console.error('❌ Failed to send confirmation email:', emailError);
+    }
+
+    res.json({
+      data: {
+        message: 'Password reset successful. You can now login with your new password.'
+      }
+    });
+  } catch (error) {
+    console.error('Reset password error:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
@@ -708,7 +1407,7 @@ app.get('/api/v1/auth/me', async (req, res) => {
     res.json({
       data: {
         user: {
-          id: user._id,
+          id: user._id.toString(),
           email: user.email,
           firstName: user.firstName,
           lastName: user.lastName,
@@ -769,7 +1468,7 @@ app.get('/api/v1/dashboard/stats', async (req, res) => {
     const callQuery = userTenantId && !isAdmin ? { tenantId: userTenantId.toString() } : {};
     const callsToday = await CallRecord.countDocuments({
       ...callQuery,
-      createdAt: { $gte: today }
+      callTimestamp: { $gte: today }
     });
 
     // API calls are the total number of DID requests made today
@@ -780,12 +1479,12 @@ app.get('/api/v1/dashboard/stats', async (req, res) => {
     // Calculate success rate from actual call records
     const totalCallsToday = await CallRecord.countDocuments({
       ...callQuery,
-      createdAt: { $gte: today }
+      callTimestamp: { $gte: today }
     });
     const successfulCalls = await CallRecord.countDocuments({
       ...callQuery,
-      createdAt: { $gte: today },
-      outcome: 'success'
+      callTimestamp: { $gte: today },
+      result: 'answered'
     });
     const successRate = totalCallsToday > 0
       ? `${((successfulCalls / totalCallsToday) * 100).toFixed(1)}%`
@@ -980,11 +1679,417 @@ app.get('/api/v1/dids/:id', async (req, res) => {
   }
 });
 
-// API Keys endpoints are handled by tenant routes
-// The tenant routes provide the actual implementation for:
-// GET    /api/v1/tenants/api-keys     - Get all API keys
-// POST   /api/v1/tenants/api-keys     - Create new API key
-// DELETE /api/v1/tenants/api-keys/:id - Delete API key
+// Test endpoint for debugging
+app.get('/api/v1/test-logging', (req, res) => {
+  console.log('🧪 Test logging endpoint called!');
+  res.json({ success: true, message: 'Logging test successful' });
+});
+
+// VICIdial Configuration Generator
+app.get('/api/v1/vicidial/config', async (req, res) => {
+  try {
+    console.log('🔧 VICIdial config generation endpoint called');
+
+    // Get user from session or token
+    let userId = null;
+    let userTenantId = null;
+
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        userId = decoded.id;
+      } catch (error) {
+        console.error('Token decode error:', error.message);
+        return res.status(401).json({
+          success: false,
+          message: 'Invalid or expired token'
+        });
+      }
+    }
+
+    // Fall back to session
+    if (!userId && req.session?.passport?.user) {
+      userId = req.session.passport.user._id || req.session.passport.user;
+    }
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required'
+      });
+    }
+
+    // Get user and their tenant
+    const user = await User.findById(userId).populate('tenant');
+    if (!user || !user.tenant) {
+      return res.status(404).json({
+        success: false,
+        message: 'User or tenant not found'
+      });
+    }
+
+    const tenant = user.tenant;
+
+    // Find an active API key for this tenant
+    const activeApiKey = tenant.apiKeys?.find(key => key.isActive);
+    if (!activeApiKey) {
+      return res.status(400).json({
+        success: false,
+        message: 'No active API keys found. Please generate an API key first.'
+      });
+    }
+
+    // Generate the dids.conf file content
+    const configContent = `# VICIdial DID Optimizer Configuration
+# Generated: ${new Date().toISOString()}
+# Tenant: ${tenant.name}
+# API Key ID: ${activeApiKey.name || activeApiKey._id}
+#
+# IMPORTANT: Keep this file secure. Do not commit to version control.
+
+# API Configuration
+API_BASE_URL=${process.env.API_BASE_URL || process.env.FRONTEND_URL || 'http://localhost:5000'}/api/v1
+API_KEY=${activeApiKey.key}
+
+# VICIdial Database Configuration (update with your values)
+# VICIDIAL_DB_HOST=localhost
+# VICIDIAL_DB_PORT=3306
+# VICIDIAL_DB_NAME=asterisk
+# VICIDIAL_DB_USER=cron
+# VICIDIAL_DB_PASS=your-password
+
+# DID Selection Strategy
+# Options: round-robin, least-used, performance-based, geo-proximity
+DID_SELECTION_STRATEGY=round-robin
+
+# Logging Configuration
+LOG_LEVEL=INFO
+LOG_FILE=/var/log/astguiclient/did-optimizer.log
+
+# Cache Settings (optional)
+CACHE_TTL=300
+ENABLE_CACHE=true
+
+# Rate Limiting
+MAX_REQUESTS_PER_MINUTE=60
+
+# Health Check Settings
+HEALTH_CHECK_INTERVAL=60
+HEALTH_CHECK_TIMEOUT=5
+
+# Tenant Configuration
+TENANT_ID=${tenant._id}
+TENANT_NAME=${tenant.name}
+
+# GitHub Repository
+GITHUB_REPO=https://github.com/yourusername/did-optimizer-vicidial
+`;
+
+    res.set('Content-Type', 'text/plain');
+    res.set('Content-Disposition', 'attachment; filename="dids.conf"');
+    res.send(configContent);
+
+  } catch (error) {
+    console.error('VICIdial config generation error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate configuration',
+      error: error.message
+    });
+  }
+});
+
+// API Keys endpoints - Session-based versions for frontend
+app.get('/api/v1/tenants/api-keys', async (req, res) => {
+  try {
+    console.log('🔑 API Keys endpoint called');
+    console.log('📍 Request URL:', req.originalUrl);
+    console.log('📋 Headers:', {
+      authorization: req.headers.authorization ? 'Bearer token present' : 'No token',
+      contentType: req.headers['content-type'],
+      origin: req.headers.origin
+    });
+
+    // Get user from session or token
+    let userId = null;
+    let userTenantId = null;
+
+    // Try token first
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        console.log('✅ Token decoded successfully:', {
+          id: decoded.id,
+          email: decoded.email,
+          role: decoded.role
+        });
+        userId = decoded.id;
+      } catch (error) {
+        console.error('❌ Token decode error:', error.message);
+        return res.status(401).json({
+          success: false,
+          message: 'Invalid or expired token. Please login again.'
+        });
+      }
+    }
+
+    // Fall back to session
+    if (!userId && req.session && req.session.passport && req.session.passport.user) {
+      userId = req.session.passport.user._id;
+      console.log('📌 Using session user ID:', userId);
+    }
+
+    if (!userId) {
+      console.log('❌ No user ID found from token or session');
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required. Please login.'
+      });
+    }
+
+    console.log('🔍 Looking for user with ID:', userId);
+
+    // Get user and tenant
+    let user = await User.findById(userId);
+    console.log('👤 User found:', user ? `Yes - ${user.email}` : 'No');
+
+    if (!user) {
+      console.log('❌ User not found with ID:', userId);
+      return res.status(404).json({
+        success: false,
+        message: 'User account not found'
+      });
+    }
+
+    if (!user.tenant) {
+      console.log('⚠️ User has no tenant assigned:', user.email);
+      return res.status(404).json({
+        success: false,
+        message: 'No organization found for this user. Please contact support.'
+      });
+    }
+
+    // Handle both ObjectId and String formats for backwards compatibility
+    userTenantId = user.tenant._id || user.tenant;
+    console.log('🏢 User tenant ID:', userTenantId);
+
+    // Get tenant with API keys
+    const tenant = await Tenant.findById(userTenantId);
+    if (!tenant) {
+      console.log('❌ Tenant not found for ID:', userTenantId);
+      return res.status(404).json({
+        success: false,
+        message: 'Organization not found. Please contact support.'
+      });
+    }
+
+    console.log('✅ Tenant found:', tenant.name, 'with', tenant.apiKeys?.length || 0, 'API keys');
+
+    // Format API keys for frontend - include full key for display
+    const apiKeys = (tenant.apiKeys || []).map(key => ({
+      _id: key._id,
+      name: key.name,
+      permissions: key.permissions,
+      isActive: key.isActive,
+      lastUsed: key.lastUsed,
+      createdAt: key.createdAt,
+      key: key.key // Send full key - frontend will handle masking
+    }));
+
+    console.log(`📤 Returning ${apiKeys.length} API keys to frontend`);
+
+    res.json({
+      success: true,
+      data: apiKeys,
+      tenant: {
+        id: tenant._id,
+        name: tenant.name
+      }
+    });
+  } catch (error) {
+    console.error('💥 API Keys list error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to load API keys. Please try again later.',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+app.post('/api/v1/tenants/api-keys', async (req, res) => {
+  try {
+    // Get user from session or token
+    let userId = null;
+
+    // Try token first
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        userId = decoded.id;
+      } catch (error) {
+        console.error('Token decode error:', error.message);
+      }
+    }
+
+    // Fall back to session
+    if (!userId && req.session && req.session.passport && req.session.passport.user) {
+      userId = req.session.passport.user._id;
+    }
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required'
+      });
+    }
+
+    // Get user and tenant
+    const user = await User.findById(userId);
+    if (!user || !user.tenant) {
+      return res.status(404).json({
+        success: false,
+        message: 'User or tenant not found'
+      });
+    }
+
+    const { name, permissions = ['read', 'write'] } = req.body;
+
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        message: 'API key name is required'
+      });
+    }
+
+    // Get tenant
+    const tenant = await Tenant.findById(user.tenant);
+    if (!tenant) {
+      return res.status(404).json({
+        success: false,
+        message: 'Tenant not found'
+      });
+    }
+
+    // Check if API key name already exists
+    const existingKey = tenant.apiKeys.find(key => key.name === name && key.isActive);
+    if (existingKey) {
+      return res.status(409).json({
+        success: false,
+        message: 'API key with this name already exists'
+      });
+    }
+
+    // Generate new API key
+    const crypto = await import('crypto');
+    const apiKey = 'did_' + crypto.randomBytes(32).toString('hex');
+
+    const newKey = {
+      _id: new mongoose.Types.ObjectId(),
+      name,
+      key: apiKey,
+      permissions,
+      isActive: true,
+      lastUsed: null,
+      createdAt: new Date()
+    };
+
+    tenant.apiKeys.push(newKey);
+    await tenant.save();
+
+    res.status(201).json({
+      success: true,
+      message: 'API key created successfully',
+      data: {
+        _id: newKey._id,
+        name: newKey.name,
+        key: apiKey, // Return full key only on creation
+        permissions: newKey.permissions,
+        isActive: newKey.isActive,
+        createdAt: newKey.createdAt
+      }
+    });
+  } catch (error) {
+    console.error('API Key creation error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create API key'
+    });
+  }
+});
+
+app.delete('/api/v1/tenants/api-keys/:keyId', async (req, res) => {
+  try {
+    // Get user from session or token
+    let userId = null;
+
+    // Try token first
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        userId = decoded.id;
+      } catch (error) {
+        console.error('Token decode error:', error.message);
+      }
+    }
+
+    // Fall back to session
+    if (!userId && req.session && req.session.passport && req.session.passport.user) {
+      userId = req.session.passport.user._id;
+    }
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required'
+      });
+    }
+
+    // Get user and tenant
+    const user = await User.findById(userId);
+    if (!user || !user.tenant) {
+      return res.status(404).json({
+        success: false,
+        message: 'User or tenant not found'
+      });
+    }
+
+    // Get tenant
+    const tenant = await Tenant.findById(user.tenant);
+    if (!tenant) {
+      return res.status(404).json({
+        success: false,
+        message: 'Tenant not found'
+      });
+    }
+
+    // Find and deactivate the API key
+    const apiKey = tenant.apiKeys.id(req.params.keyId);
+    if (!apiKey) {
+      return res.status(404).json({
+        success: false,
+        message: 'API key not found'
+      });
+    }
+
+    apiKey.isActive = false;
+    await tenant.save();
+
+    res.json({
+      success: true,
+      message: 'API key deactivated successfully'
+    });
+  } catch (error) {
+    console.error('API Key deletion error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete API key'
+    });
+  }
+});
 
 // Mock rotation rules endpoints for Settings page
 app.get('/api/v1/rotation-rules', async (req, res) => {
@@ -1015,6 +2120,246 @@ app.get('/api/v1/rotation-rules/analytics/overview', async (req, res) => {
       }
     }
   });
+});
+
+// Analytics API Endpoints
+app.get('/api/v1/analytics/realtime', async (req, res) => {
+  try {
+    // Get user from token
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    let userTenantId = null;
+    let isAdmin = false;
+
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        const user = await User.findById(decoded.id);
+        if (user) {
+          userTenantId = user.tenant;
+          isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+        }
+      } catch (error) {
+        console.error('Token decode error:', error.message);
+      }
+    }
+
+    // Build query filters
+    const tenantId = userTenantId && !isAdmin ?
+      (mongoose.Types.ObjectId.isValid(userTenantId) ?
+        new mongoose.Types.ObjectId(userTenantId) : userTenantId) : null;
+
+    const didQuery = tenantId ? { tenantId } : {};
+    const callQuery = tenantId ? { tenantId: tenantId.toString() } : {};
+
+    // Get today's date range
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    // Get real-time stats
+    const [activeCalls, totalCallsToday, successfulCallsToday, totalDids, activeDids] = await Promise.all([
+      CallRecord.countDocuments({ ...callQuery, disposition: 'initiated', callTimestamp: { $gte: today } }),
+      CallRecord.countDocuments({ ...callQuery, callTimestamp: { $gte: today } }),
+      CallRecord.countDocuments({ ...callQuery, result: 'answered', callTimestamp: { $gte: today } }),
+      DID.countDocuments(didQuery),
+      DID.countDocuments({ ...didQuery, status: 'active' })
+    ]);
+
+    const avgAnswerRate = totalCallsToday > 0 ?
+      (successfulCallsToday / totalCallsToday) * 100 : 0;
+
+    const didUtilization = totalDids > 0 ? activeDids / totalDids : 0;
+
+    res.json({
+      data: {
+        activeCalls,
+        todayStats: {
+          totalCallsToday,
+          avgAnswerRate
+        },
+        systemHealth: {
+          didUtilization
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Analytics realtime error:', error);
+    res.status(500).json({ message: 'Failed to load realtime analytics' });
+  }
+});
+
+app.get('/api/v1/analytics/performance', async (req, res) => {
+  try {
+    const { period = 'month', metric = 'calls' } = req.query;
+
+    // Get user from token
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    let userTenantId = null;
+    let isAdmin = false;
+
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        const user = await User.findById(decoded.id);
+        if (user) {
+          userTenantId = user.tenant;
+          isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+        }
+      } catch (error) {
+        console.error('Token decode error:', error.message);
+      }
+    }
+
+    // Build query filters
+    const tenantId = userTenantId && !isAdmin ?
+      (mongoose.Types.ObjectId.isValid(userTenantId) ?
+        new mongoose.Types.ObjectId(userTenantId) : userTenantId) : null;
+
+    const didQuery = tenantId ? { tenantId } : {};
+
+    // Calculate date range based on period
+    const endDate = new Date();
+    const startDate = new Date();
+
+    switch(period) {
+      case 'today':
+        startDate.setHours(0, 0, 0, 0);
+        break;
+      case 'week':
+        startDate.setDate(startDate.getDate() - 7);
+        break;
+      case 'month':
+        startDate.setDate(startDate.getDate() - 30);
+        break;
+      case 'quarter':
+        startDate.setMonth(startDate.getMonth() - 3);
+        break;
+      case 'year':
+        startDate.setFullYear(startDate.getFullYear() - 1);
+        break;
+      default:
+        startDate.setDate(startDate.getDate() - 30);
+    }
+
+    // Get top performing DIDs
+    const topPerformers = await DID.find({
+      ...didQuery,
+      status: 'active',
+      'reputation.score': { $exists: true }
+    })
+    .sort({ 'reputation.score': -1 })
+    .limit(6)
+    .lean();
+
+    const formattedPerformers = topPerformers.map(did => ({
+      number: did.phoneNumber,
+      quality: {
+        score: Math.round((did.reputation?.score || 0) * 100),
+        answerRate: Math.round((did.reputation?.successRate || 0) * 100)
+      }
+    }));
+
+    // Create trends array (simplified for now)
+    const trends = period !== 'today' ? [{
+      date: startDate.toISOString(),
+      value: metric === 'calls' ? 100 :
+             metric === 'answer_rate' ? 85 :
+             metric === 'utilization' ? 75 : 90
+    }] : [];
+
+    res.json({
+      data: {
+        trends,
+        topPerformers: formattedPerformers
+      }
+    });
+  } catch (error) {
+    console.error('Analytics performance error:', error);
+    res.status(500).json({ message: 'Failed to load performance analytics' });
+  }
+});
+
+app.get('/api/v1/analytics/costs', async (req, res) => {
+  try {
+    const { period = 'month' } = req.query;
+
+    // Get user from token
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    let userTenantId = null;
+    let isAdmin = false;
+
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        const user = await User.findById(decoded.id);
+        if (user) {
+          userTenantId = user.tenant;
+          isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+        }
+      } catch (error) {
+        console.error('Token decode error:', error.message);
+      }
+    }
+
+    // Build query filters
+    const tenantId = userTenantId && !isAdmin ?
+      (mongoose.Types.ObjectId.isValid(userTenantId) ?
+        new mongoose.Types.ObjectId(userTenantId) : userTenantId) : null;
+
+    const didQuery = tenantId ? { tenantId } : {};
+    const callQuery = tenantId ? { tenantId: tenantId.toString() } : {};
+
+    // Get DIDs for cost calculation
+    const dids = await DID.find(didQuery).lean();
+    const totalDIDs = dids.length;
+
+    // Calculate costs (example rates)
+    const costPerDID = 2.50; // $2.50 per DID per month
+    const totalMonthlyCosts = totalDIDs * costPerDID;
+    const avgCostPerDID = totalDIDs > 0 ? totalMonthlyCosts / totalDIDs : 0;
+
+    // Group by carrier if available
+    const carrierGroups = {};
+    for (const did of dids) {
+      const carrier = did.carrier || 'Unknown';
+      if (!carrierGroups[carrier]) {
+        carrierGroups[carrier] = {
+          _id: carrier,
+          didCount: 0,
+          totalCalls: 0,
+          totalCosts: 0
+        };
+      }
+      carrierGroups[carrier].didCount++;
+      carrierGroups[carrier].totalCosts += costPerDID;
+
+      // Get call count for this DID
+      const callCount = await CallRecord.countDocuments({
+        ...callQuery,
+        didId: did._id.toString()
+      });
+      carrierGroups[carrier].totalCalls += callCount;
+    }
+
+    const costByCarrier = Object.values(carrierGroups)
+      .sort((a, b) => b.totalCosts - a.totalCosts)
+      .slice(0, 5);
+
+    res.json({
+      data: {
+        summary: {
+          totalMonthlyCosts,
+          totalDIDs,
+          avgCostPerDID
+        },
+        costByCarrier
+      }
+    });
+  } catch (error) {
+    console.error('Analytics costs error:', error);
+    res.status(500).json({ message: 'Failed to load cost analytics' });
+  }
 });
 
 // Health check
@@ -1054,45 +2399,46 @@ app.get('/api/v1', (req, res) => {
 
 // Proxy to React development server on port 3000
 // This serves the dynamic development version instead of static build
-const DEV_SERVER_URL = 'http://localhost:3000';
-const proxy = createProxyMiddleware({
-  target: DEV_SERVER_URL,
-  changeOrigin: true,
-  ws: true, // Enable WebSocket proxying for hot reload
-  logLevel: 'info',
-  onError: (err, req, res) => {
-    console.error('Proxy error:', err);
-    res.status(500).send('Development server not available. Please ensure React dev server is running on port 3000.');
-  }
-});
+// DISABLED: Using static file serving instead
+// const DEV_SERVER_URL = 'http://localhost:3000';
+// const proxy = createProxyMiddleware({
+//   target: DEV_SERVER_URL,
+//   changeOrigin: true,
+//   ws: true, // Enable WebSocket proxying for hot reload
+//   logLevel: 'info',
+//   onError: (err, req, res) => {
+//     console.error('Proxy error:', err);
+//     res.status(500).send('Development server not available. Please ensure React dev server is running on port 3000.');
+//   }
+// });
 
 // Only proxy non-API routes to the development server
-app.use((req, res, next) => {
-  if (req.path.startsWith('/api')) {
-    return next();
-  }
-  proxy(req, res, next);
-});
-
-// All other routes return the React app - commented out for Express 5 compatibility
-// Will be handled by separate frontend server on port 3000
-// app.get('/*', (req, res, next) => {
-//   // Don't serve React app for API routes
+// DISABLED: Using static file serving instead
+// app.use((req, res, next) => {
 //   if (req.path.startsWith('/api')) {
 //     return next();
 //   }
-
-//   const indexPath = path.join(frontendBuildPath, 'index.html');
-//   res.sendFile(indexPath, (err) => {
-//     if (err) {
-//       console.error('Error serving index.html:', err);
-//       res.status(404).json({
-//         error: true,
-//         message: 'Frontend not built. Please run: cd frontend && npm run build'
-//       });
-//     }
-//   });
+//   proxy(req, res, next);
 // });
+
+// All other routes return the React app (catch-all for SPA routing)
+app.use((req, res, next) => {
+  // Don't serve React app for API routes
+  if (req.path.startsWith('/api')) {
+    return next();
+  }
+
+  const indexPath = path.join(frontendBuildPath, 'index.html');
+  res.sendFile(indexPath, (err) => {
+    if (err) {
+      console.error('Error serving index.html:', err);
+      res.status(404).json({
+        error: true,
+        message: 'Frontend not built. Please run: cd frontend && npm run build'
+      });
+    }
+  });
+});
 
 // Error handling middleware (must be last)
 // Middleware - commented out until middleware files are created
@@ -1109,7 +2455,7 @@ const server = app.listen(PORT, () => {
 🔧 Server Port: ${PORT}
 🔐 Google OAuth: ${process.env.GOOGLE_CLIENT_ID ? 'Configured ✅' : 'Not configured ⚠️'}
 📦 Environment: ${process.env.NODE_ENV || 'development'}
-🔗 Frontend Proxy: ${DEV_SERVER_URL} (Development)
+🔗 Frontend: Serving static build from ./frontend
 ================================
 Available Routes:
   /           - Home page
