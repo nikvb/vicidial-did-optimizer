@@ -21,7 +21,7 @@ NC='\033[0m' # No Color
 # Configuration
 AGI_DIR="/var/lib/asterisk/agi-bin"
 AGI_SCRIPT="vicidial-did-optimizer.agi"
-AGI_SOURCE="https://raw.githubusercontent.com/YOUR_ORG/didapi/main/vicidial-integration/vicidial-did-optimizer.agi"
+AGI_SOURCE="https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/vicidial-did-optimizer.agi"
 CONFIG_FILE="/etc/asterisk/dids.conf"
 LOG_DIR="/var/log/astguiclient"
 ASTERISK_USER="asterisk"

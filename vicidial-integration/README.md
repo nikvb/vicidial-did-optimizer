@@ -64,12 +64,27 @@ Complete VICIdial integration using AGI-based approach with web-based setup tool
    sudo ./install-agi.sh
    ```
 
-5. **Generate Modified Dialplan** (2 minutes)
-   - **In VICIdial Admin**: Copy carrier's dialplan from **Admin → Carriers**
-   - **In DID Optimizer**: Paste into dialplan generator at **Settings → VICIdial Integration**
-   - Click **Generate Modified Dialplan**
-   - **In VICIdial Admin**: Replace carrier's dialplan with generated version
-   - Click **Submit** (VICIdial auto-reloads configuration)
+5. **Generate Modified Dialplan Using Website** (2 minutes)
+
+   **IMPORTANT: Use the web-based dialplan generator - DO NOT edit files manually!**
+
+   - **Step A**: In VICIdial Admin, go to **Admin → Carriers**
+   - **Step B**: Select your carrier and copy the entire **Dialplan Entry** content
+   - **Step C**: Go to https://dids.amdy.io and navigate to **Settings → VICIdial Integration**
+   - **Step D**: Scroll to **"Step 2: Generate Modified Dialplan"** section
+   - **Step E**: Paste your carrier's dialplan into the text area
+   - **Step F**: Click **Generate Modified Dialplan** button
+   - **Step G**: The generator will automatically insert the DID Optimizer AGI calls at the correct position
+   - **Step H**: Click **Copy** button to copy the generated dialplan
+   - **Step I**: Back in VICIdial Admin, replace your carrier's **Dialplan Entry** with the generated version
+   - **Step J**: Click **Submit** - VICIdial automatically reloads the configuration
+
+   **Why use the web generator?**
+   - Automatically inserts AGI calls at the correct position
+   - Preserves all existing VICIdial functionality
+   - Handles different dialplan patterns correctly
+   - No risk of syntax errors
+   - Includes proper variable passing
 
 6. **Test Integration** (2 minutes)
    ```bash
@@ -78,20 +93,24 @@ Complete VICIdial integration using AGI-based approach with web-based setup tool
    ```
    - Check DID Optimizer dashboard for call records
 
-### Method 2: Manual Installation
+### Method 2: Command Line Installation (Advanced)
 
-If you prefer manual installation or web interface is unavailable:
+For advanced users who prefer command-line tools:
 
 1. **Install AGI Script**
    ```bash
-   # Download and run installer
    cd /tmp
    wget https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/install-agi.sh
    chmod +x install-agi.sh
    sudo ./install-agi.sh
    ```
 
-2. **Configure dids.conf**
+2. **Get API Key from Website**
+   - Log in to https://dids.amdy.io
+   - Go to **Settings → API Keys**
+   - Create or copy your API key
+
+3. **Configure dids.conf**
    ```bash
    sudo nano /etc/asterisk/dids.conf
    ```
@@ -103,29 +122,25 @@ If you prefer manual installation or web interface is unavailable:
    api_key=YOUR_API_KEY_HERE
    fallback_did=+18005551234
 
-   # Database settings (usually auto-detected)
+   # Database settings (usually auto-detected from /etc/astguiclient.conf)
    db_host=localhost
    db_user=cron
    db_pass=1234
    db_name=asterisk
    ```
 
-3. **Update Carrier Dialplan in VICIdial**
+4. **Generate Dialplan Using Website**
 
-   Go to **VICIdial Admin → Carriers** and modify your carrier's dialplan entry:
+   **IMPORTANT: Even for command-line installation, use the web-based dialplan generator!**
 
-   **Before the Dial command**, add these lines:
-   ```
-   ; DID Optimizer Integration
-   exten => _91NXXNXXXXXX,1,AGI(vicidial-did-optimizer.agi,${EXTEN:1},${campaign_id},${lead_id})
-   exten => _91NXXNXXXXXX,n,Set(CALLERID(num)=${OPTIMIZER_DID})
-   exten => _91NXXNXXXXXX,n,NoOp(Using DID: ${OPTIMIZER_DID})
+   - Go to https://dids.amdy.io → **Settings → VICIdial Integration**
+   - Copy your carrier's dialplan from **VICIdial Admin → Carriers**
+   - Paste into the dialplan generator
+   - Click **Generate Modified Dialplan**
+   - Copy the generated dialplan back to VICIdial Admin
+   - Click **Submit** in VICIdial Admin
 
-   ; Your existing dialplan continues here...
-   exten => _91NXXNXXXXXX,n,Dial(...)
-   ```
-
-   Adjust the pattern (`_91NXXNXXXXXX`) to match your dial pattern.
+   **DO NOT manually edit dialplan files** - the generator ensures correct integration.
 
 ## 🔧 Configuration Reference
 
