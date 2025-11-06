@@ -84,43 +84,44 @@ The install script will:
 - ✓ Create log directory
 - ✓ Verify installation
 
-### Step 6: Configure Asterisk Dialplan (2 minutes)
+### Step 6: Configure Dialplan Integration (2 minutes)
 
-Add DID Optimizer to your outbound dialplan:
+Instead of manually editing dialplan files, use the DID Optimizer web interface to generate the modified dialplan:
 
-```bash
-# Edit your dialplan (adjust path if different)
-sudo nano /etc/asterisk/extensions.conf
-```
+1. Go to **Settings → VICIdial Integration** at https://dids.amdy.io
+2. In the **Dialplan Generator** section:
+   - Paste your existing carrier dialplan entry (from VICIdial Admin → Carriers)
+   - Click **Generate Modified Dialplan**
+   - Copy the generated dialplan with DID Optimizer integration
+3. In VICIdial Admin:
+   - Go to **Admin → Carriers**
+   - Select your carrier
+   - Paste the generated dialplan into the **Dialplan Entry** field
+   - Click **Submit**
 
-Add this to your carrier/admin context (adjust pattern as needed):
-
+**Example:** If your current carrier dialplan is:
 ```asterisk
-; DID Optimizer Integration
-exten => _91NXXNXXXXXX,1,NoOp(Starting DID Optimizer for ${EXTEN})
-exten => _91NXXNXXXXXX,n,Set(CUSTOMER_PHONE=${EXTEN:1})
-exten => _91NXXNXXXXXX,n,AGI(vicidial-did-optimizer.agi)
-exten => _91NXXNXXXXXX,n,NoOp(Selected DID: ${OPTIMIZER_DID})
-exten => _91NXXNXXXXXX,n,Set(CALLERID(num)=${OPTIMIZER_DID})
-exten => _91NXXNXXXXXX,n,AGI(agi://127.0.0.1:4577/call_log)
-exten => _91NXXNXXXXXX,n,set(_AMDMINLEN=7)
-exten => _91NXXNXXXXXX,n,Dial(SIP/gateway/${EXTEN:1},60,tTo)
+exten => _91NXXNXXXXXX,1,AGI(agi://127.0.0.1:4577/call_log)
+exten => _91NXXNXXXXXX,n,Dial(SIP/mycarrier/${EXTEN:1},60,tTo)
 exten => _91NXXNXXXXXX,n,Hangup
 ```
 
-> **Note**: Replace `_91NXXNXXXXXX` with your dial pattern and `SIP/gateway` with your actual carrier configuration.
-
-Save the file (Ctrl+X, then Y, then Enter in nano).
-
-### Step 7: Reload Dialplan (1 minute)
-
-```bash
-# Reload Asterisk dialplan
-asterisk -rx "dialplan reload"
-
-# Verify the dialplan loaded
-asterisk -rx "dialplan show" | grep "DID Optimizer"
+The generator will produce:
+```asterisk
+exten => _91NXXNXXXXXX,1,NoOp(DID Optimizer: ${EXTEN})
+exten => _91NXXNXXXXXX,n,Set(CUSTOMER_PHONE=${EXTEN:1})
+exten => _91NXXNXXXXXX,n,AGI(vicidial-did-optimizer.agi)
+exten => _91NXXNXXXXXX,n,Set(CALLERID(num)=${OPTIMIZER_DID})
+exten => _91NXXNXXXXXX,n,AGI(agi://127.0.0.1:4577/call_log)
+exten => _91NXXNXXXXXX,n,Dial(SIP/mycarrier/${EXTEN:1},60,tTo)
+exten => _91NXXNXXXXXX,n,Hangup
 ```
+
+> **Note**: The generator automatically inserts the DID Optimizer AGI script before your existing call logging and dial commands, preserving all your VICIdial functionality.
+
+### Step 7: Apply Changes (1 minute)
+
+After updating the carrier dialplan in VICIdial Admin, VICIdial will automatically reload the configuration. No manual Asterisk reload is needed.
 
 ### Step 8: Test the Integration (2 minutes)
 
@@ -192,22 +193,23 @@ tail -f /var/log/astguiclient/did-optimizer.log
   curl -H "x-api-key: YOUR_API_KEY" https://dids.amdy.io/api/v1/health
   ```
 
-### Dialplan Not Executing
+### Dialplan Not Working
 
-**Verify dialplan loaded**:
+**Verify dialplan in VICIdial**:
+1. Log into VICIdial Admin
+2. Go to **Admin → Carriers**
+3. Check that your carrier's dialplan entry includes the AGI script calls
+4. Look for `AGI(vicidial-did-optimizer.agi)` in the dialplan
+
+**Check AGI execution in logs**:
 ```bash
-asterisk -rx "dialplan show" | grep -A 10 "DID Optimizer"
+tail -f /var/log/astguiclient/did-optimizer.log
 ```
 
-**Check pattern match**:
-- Make sure your dial pattern matches the calls you're making
-- `_91NXXNXXXXXX` matches 11-digit numbers starting with 91
-- Adjust pattern to match your dialing format
-
-**Test manually**:
-```bash
-asterisk -rx "console dial 91234567890@your-context"
-```
+**Verify dial pattern**:
+- Ensure your carrier dialplan pattern matches your outbound calls
+- Common patterns: `_91NXXNXXXXXX` (11 digits), `_9NXXNXXXXXX` (10 digits)
+- Test by making a call and checking the logs
 
 ### No Call Records in Dashboard
 
