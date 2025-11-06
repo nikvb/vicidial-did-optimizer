@@ -56,7 +56,6 @@ scp dids.conf root@your-vicidial-server:/etc/asterisk/dids.conf
 # Upload dids.conf to /etc/asterisk/dids.conf
 
 # Set proper permissions
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
 ```
 

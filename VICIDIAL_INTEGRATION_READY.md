@@ -168,7 +168,6 @@ The system collects comprehensive data for training AI models:
 6. Upload `dids.conf` to your VICIdial server at `/etc/asterisk/dids.conf`
 7. Set permissions:
    ```bash
-   sudo chown asterisk:asterisk /etc/asterisk/dids.conf
    sudo chmod 600 /etc/asterisk/dids.conf
    ```
 
@@ -181,27 +180,17 @@ The system collects comprehensive data for training AI models:
    ```
 
 ### Step 4: Dialplan Integration
-Add to your Asterisk dialplan (e.g., `/etc/asterisk/extensions.conf`):
+Modify your carrier dialplan using the web-based generator:
 
-```asterisk
-; DID Optimizer Integration
-exten => _91NXXNXXXXXX,1,NoOp(Starting DID Optimizer for ${EXTEN})
-exten => _91NXXNXXXXXX,n,Set(CUSTOMER_PHONE=${EXTEN:1})
-exten => _91NXXNXXXXXX,n,AGI(vicidial-did-optimizer.agi)
-exten => _91NXXNXXXXXX,n,NoOp(Selected DID: ${OPTIMIZER_DID})
-exten => _91NXXNXXXXXX,n,Set(CALLERID(num)=${OPTIMIZER_DID})
-exten => _91NXXNXXXXXX,n,AGI(agi://127.0.0.1:4577/call_log)
-exten => _91NXXNXXXXXX,n,set(_AMDMINLEN=7)
-exten => _91NXXNXXXXXX,n,Dial(SIP/gateway/${EXTEN:1},60,tTo)
-exten => _91NXXNXXXXXX,n,Hangup
-```
+1. **In VICIdial Admin**, go to **Admin → Carriers** and copy your carrier's dialplan entry
+2. **In DID Optimizer** at https://dids.amdy.io, go to **Settings → VICIdial Integration**
+3. Scroll to **Step 2: Generate Modified Dialplan**
+4. Paste your carrier's dialplan and click **Generate Modified Dialplan**
+5. Copy the generated dialplan (includes DID Optimizer AGI calls)
+6. **In VICIdial Admin**, paste the modified dialplan back into your carrier's **Dialplan Entry** field
+7. Click **Submit** - VICIdial automatically reloads the configuration
 
-Then reload the dialplan:
-```bash
-asterisk -rx "dialplan reload"
-```
-
-**Note**: Adjust the dial pattern (`_91NXXNXXXXXX`) and carrier gateway (`SIP/gateway`) to match your VICIdial configuration.
+The generator automatically inserts the DID Optimizer AGI script before your existing call flow, preserving all VICIdial functionality.
 
 ## 📋 Production Deployment Checklist
 
