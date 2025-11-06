@@ -50,54 +50,61 @@ The system automatically captures comprehensive data for AI model training:
 }
 ```
 
-## 🚀 Integration Scripts
+## 🚀 Integration Method: AGI-Based Approach
 
-Three integration options provided:
+**Customer-Managed Integration** - You maintain full control of your dialplan:
 
-### 1. **Perl Script** (`vicidial-did-optimizer.pl`)
-- Full-featured VICIdial integration
-- Database connectivity for customer data
+### **AGI Script** (`vicidial-did-optimizer.agi`)
+- Production-ready Asterisk AGI script
+- Runs during call flow for real-time DID selection
 - Comprehensive logging and error handling
-- Command line and environment variable support
+- File-based caching for performance
+- Sets `${OPTIMIZER_DID}` channel variable
+- Configuration via `/etc/asterisk/dids.conf`
 
-### 2. **PHP Script** (`vicidial-did-optimizer.php`)
-- Web-based integration option
-- RESTful API interface
-- Easy debugging and monitoring
-- Compatible with web-based VICIdial setups
+### **Installation Script** (`install-agi.sh`)
+- Automated installation of AGI script
+- Perl dependency checking and installation
+- Permission and ownership configuration
+- Installation verification
+- Run with: `sudo ./install-agi.sh`
 
-### 3. **Bash Test Script** (`test-vicidial-integration.sh`)
-- Complete integration testing
-- Verification of all features
-- Production readiness validation
+### **Quick Start Guide** (`QUICK_INSTALL.md`)
+- Complete step-by-step installation
+- Total time: ~10-15 minutes
+- Includes troubleshooting guide
+- Verification checklist
 
 ## 📞 API Endpoints Available
 
-### Get Next DID
+### Get Next DID (Used by AGI Script)
 ```bash
-GET /api/v1/vicidial/next-did?campaign_id=SALES01&agent_id=1001&latitude=37.7749&longitude=-122.4194&state=CA
+GET /api/v1/dids/next?campaign_id=SALES01&agent_id=1001&customer_phone=4155551234&customer_state=CA&customer_zip=94102
 Headers: x-api-key: your_api_key
 ```
 
-### Report Call Result
-```bash
-POST /api/v1/vicidial/call-result
-Headers: x-api-key: your_api_key, Content-Type: application/json
-Body: {
-  "phoneNumber": "+14155551001",
-  "campaign_id": "SALES01",
-  "agent_id": "1001",
-  "result": "answered",
-  "duration": 180,
-  "disposition": "SALE",
-  "customerData": { ... }
+**Response:**
+```json
+{
+  "success": true,
+  "did": "+14155551001",
+  "distance": 0,
+  "algorithm": "geographic"
 }
 ```
 
 ### Health Check
 ```bash
-GET /api/v1/vicidial/health
+GET /api/v1/health
 Headers: x-api-key: your_api_key
+```
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "timestamp": "2025-01-05T10:30:00Z"
+}
 ```
 
 ## 🎯 Geographic Proximity Features
@@ -141,34 +148,79 @@ The system collects comprehensive data for training AI models:
 
 ## 🔧 VICIdial Configuration
 
-### Campaign Setup
-1. In VICIdial admin, edit your campaign
-2. Set **"Outbound Cid"** to: `COMPAT_DID_OPTIMIZER`
-3. Save campaign settings
+### Step 1: VICIdial API User Setup
+1. In VICIdial admin panel, go to **Admin → Users**
+2. Create or modify an API user:
+   - Set **User Level** to **8** or higher (9 recommended)
+   - Enable **View Reports** permission
+   - Enable all **API Permissions** (minimum: `version`, `campaigns_list`)
+3. Go to **Admin → User Groups**
+4. Find your API user's group
+5. Set **Allowed Campaigns** field to exactly **`-ALL`**
+6. Save settings
 
-### Dialplan Integration
-Add to your Asterisk dialplan:
+### Step 2: Configuration File Setup
+1. Log in to DID Optimizer at https://dids.amdy.io
+2. Go to **Settings → VICIdial Integration**
+3. Enter VICIdial hostname, username, password
+4. Click **Test Connection** and **Sync Campaigns**
+5. Click **Download dids.conf**
+6. Upload `dids.conf` to your VICIdial server at `/etc/asterisk/dids.conf`
+7. Set permissions:
+   ```bash
+   sudo chown asterisk:asterisk /etc/asterisk/dids.conf
+   sudo chmod 600 /etc/asterisk/dids.conf
+   ```
+
+### Step 3: AGI Script Installation
+1. Download and run the installation script:
+   ```bash
+   wget https://raw.githubusercontent.com/YOUR_ORG/didapi/main/vicidial-integration/install-agi.sh
+   chmod +x install-agi.sh
+   sudo ./install-agi.sh
+   ```
+
+### Step 4: Dialplan Integration
+Add to your Asterisk dialplan (e.g., `/etc/asterisk/extensions.conf`):
 
 ```asterisk
-; Get optimal DID before dialing
-exten => _X.,1,System(/usr/share/astguiclient/vicidial-did-optimizer.pl ${campaign_id} ${agent_id} ${phone_number} ${state} ${zip_code})
-exten => _X.,n,Set(CALLERID(num)=${SYSTEMOUTPUT})
-
-; Report call result after completion
-exten => h,1,System(/usr/share/astguiclient/vicidial-did-optimizer.pl --report ${campaign_id} ${phone_number} ${DIALSTATUS} ${ANSWEREDTIME} ${disposition})
+; DID Optimizer Integration
+exten => _91NXXNXXXXXX,1,NoOp(Starting DID Optimizer for ${EXTEN})
+exten => _91NXXNXXXXXX,n,Set(CUSTOMER_PHONE=${EXTEN:1})
+exten => _91NXXNXXXXXX,n,AGI(vicidial-did-optimizer.agi)
+exten => _91NXXNXXXXXX,n,NoOp(Selected DID: ${OPTIMIZER_DID})
+exten => _91NXXNXXXXXX,n,Set(CALLERID(num)=${OPTIMIZER_DID})
+exten => _91NXXNXXXXXX,n,AGI(agi://127.0.0.1:4577/call_log)
+exten => _91NXXNXXXXXX,n,set(_AMDMINLEN=7)
+exten => _91NXXNXXXXXX,n,Dial(SIP/gateway/${EXTEN:1},60,tTo)
+exten => _91NXXNXXXXXX,n,Hangup
 ```
+
+Then reload the dialplan:
+```bash
+asterisk -rx "dialplan reload"
+```
+
+**Note**: Adjust the dial pattern (`_91NXXNXXXXXX`) and carrier gateway (`SIP/gateway`) to match your VICIdial configuration.
 
 ## 📋 Production Deployment Checklist
 
-- [ ] Update `API_BASE_URL` in integration scripts to your production server
-- [ ] Install Perl modules: `LWP::UserAgent`, `JSON`, `DBI`, `DBD::mysql`
-- [ ] Copy scripts to VICIdial server (`/usr/share/astguiclient/`)
-- [ ] Set executable permissions: `chmod +x vicidial-did-optimizer.pl`
-- [ ] Update VICIdial campaign "Outbound Cid" settings
-- [ ] Modify Asterisk dialplan for script integration
-- [ ] Test with a small campaign first
-- [ ] Monitor logs and performance
-- [ ] Scale to additional campaigns
+- [ ] VICIdial API user created with level 8+ and "View Reports" enabled
+- [ ] User group "Allowed Campaigns" set to `-ALL`
+- [ ] VICIdial connection tested successfully in DID Optimizer
+- [ ] Campaigns synced from VICIdial
+- [ ] `dids.conf` downloaded from DID Optimizer web interface
+- [ ] `dids.conf` uploaded to VICIdial server at `/etc/asterisk/dids.conf`
+- [ ] Configuration file permissions set (600, asterisk:asterisk)
+- [ ] AGI installation script downloaded and executed
+- [ ] Perl dependencies installed (LWP::UserAgent, JSON, URI::Escape, Cache::FileCache, Asterisk::AGI)
+- [ ] AGI script verified at `/var/lib/asterisk/agi-bin/vicidial-did-optimizer.agi`
+- [ ] Asterisk dialplan updated with DID Optimizer integration
+- [ ] Dialplan reloaded successfully
+- [ ] Test call completed and DID selection working
+- [ ] Logs verified at `/var/log/astguiclient/did-optimizer.log`
+- [ ] Dashboard showing call records at https://dids.amdy.io
+- [ ] Monitor performance and scale to additional campaigns
 
 ## 🎊 Ready for Production
 
