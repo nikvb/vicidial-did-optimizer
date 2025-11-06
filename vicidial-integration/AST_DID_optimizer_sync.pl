@@ -180,7 +180,7 @@ sub log_message {
     }
 }
 
-sub get_last_check_time {
+sub get_last_check_uniqueid {
     if (-e $LAST_CHECK_FILE) {
         if (open(my $fh, '<', $LAST_CHECK_FILE)) {
             my $content = <$fh>;
@@ -190,7 +190,7 @@ sub get_last_check_time {
 
             # Return content only if it's not empty
             if ($content && $content ne '') {
-                log_message("📅 Last check: $content");
+                log_message("📅 Last processed uniqueid: $content");
                 return $content;
             }
         } else {
@@ -198,34 +198,36 @@ sub get_last_check_time {
         }
     }
 
-    # Default to start of today (00:00:00) if no checkpoint exists
-    my @now = localtime(time());
-    my $start_of_today = strftime("%Y-%m-%d 00:00:00", 0, 0, 0, $now[3], $now[4], $now[5]);
-    log_message("📅 No checkpoint found - using start of today: $start_of_today");
-    return $start_of_today;
+    # Default to empty string (will fetch oldest records first)
+    log_message("📅 No checkpoint found - starting from beginning");
+    return '';
 }
 
-sub save_last_check_time {
-    my ($timestamp) = @_;
+sub save_last_check_uniqueid {
+    my ($uniqueid) = @_;
 
     if (open(my $fh, '>', $LAST_CHECK_FILE)) {
-        print $fh $timestamp;
+        print $fh $uniqueid;
         close($fh);
-        log_message("💾 Saved checkpoint: $timestamp");
+        log_message("💾 Saved checkpoint: $uniqueid");
     } else {
         log_message("❌ Failed to save checkpoint: $!");
     }
 }
 
 sub fetch_new_call_results {
-    my ($dbh, $last_check) = @_;
+    my ($dbh, $last_uniqueid) = @_;
 
     my $query_start = time();
 
-    # Optimized query using STRAIGHT_JOIN and covering index hints
-    # This prevents table locking and uses indexes efficiently
-    my $sql = <<'SQL';
-SELECT STRAIGHT_JOIN
+    # CRITICAL: Use PRIMARY KEY (uniqueid) instead of sorting by end_epoch
+    # This query is INSTANT (uses primary key index) vs 20+ seconds with ORDER BY end_epoch
+    # Pattern confirmed fast by user: "SELECT * FROM vicidial_log ORDER BY uniqueid DESC LIMIT 600"
+    my $sql;
+    if ($last_uniqueid) {
+        # Continue from last processed uniqueid (uses PRIMARY KEY)
+        $sql = <<'SQL';
+SELECT
     uniqueid,
     lead_id,
     list_id,
@@ -245,16 +247,50 @@ SELECT STRAIGHT_JOIN
     alt_dial,
     called_count
 FROM vicidial_log
-WHERE end_epoch > UNIX_TIMESTAMP(?)
+WHERE uniqueid > ?
     AND status != ''
     AND status IS NOT NULL
     AND length_in_sec > 0
-ORDER BY end_epoch ASC
+ORDER BY uniqueid ASC
 LIMIT ?
 SQL
+    } else {
+        # First run - get oldest records (no WHERE needed)
+        $sql = <<'SQL';
+SELECT
+    uniqueid,
+    lead_id,
+    list_id,
+    campaign_id,
+    call_date,
+    start_epoch,
+    end_epoch,
+    length_in_sec,
+    status,
+    phone_code,
+    phone_number,
+    user,
+    comments,
+    processed,
+    user_group,
+    term_reason,
+    alt_dial,
+    called_count
+FROM vicidial_log
+WHERE status != ''
+    AND status IS NOT NULL
+    AND length_in_sec > 0
+ORDER BY uniqueid ASC
+LIMIT ?
+SQL
+    }
 
     my $sth = $dbh->prepare($sql);
-    $sth->execute($last_check, $BATCH_SIZE);
+    if ($last_uniqueid) {
+        $sth->execute($last_uniqueid, $BATCH_SIZE);
+    } else {
+        $sth->execute($BATCH_SIZE);
+    }
 
     my @calls;
     while (my $row = $sth->fetchrow_hashref()) {
@@ -338,11 +374,11 @@ sub process_call_results {
         });
         log_message('✅ Connected to VICIdial database');
 
-        # Get last check time
-        my $last_check = get_last_check_time();
+        # Get last processed uniqueid
+        my $last_uniqueid = get_last_check_uniqueid();
 
         # Fetch new call results
-        my $calls = fetch_new_call_results($dbh, $last_check);
+        my $calls = fetch_new_call_results($dbh, $last_uniqueid);
         my $call_count = scalar(@$calls);
         log_message("📞 Found $call_count new call results");
 
@@ -354,17 +390,15 @@ sub process_call_results {
         # Process each call
         my $processed = 0;
         my $failed = 0;
-        my $latest_end_epoch = 0;
+        my $latest_uniqueid = '';
 
         foreach my $call (@$calls) {
             eval {
                 send_call_result_to_api($call);
                 $processed++;
 
-                # Track latest end_epoch
-                if ($call->{end_epoch} > $latest_end_epoch) {
-                    $latest_end_epoch = $call->{end_epoch};
-                }
+                # Track latest uniqueid
+                $latest_uniqueid = $call->{uniqueid};
 
                 log_message(sprintf(
                     "✓ %s: %s/%s → %s (%ss)",
@@ -383,13 +417,9 @@ sub process_call_results {
             }
         }
 
-        # Update checkpoint to latest processed call
-        if ($latest_end_epoch > 0) {
-            my $checkpoint_time = strftime(
-                "%Y-%m-%d %H:%M:%S",
-                localtime($latest_end_epoch)
-            );
-            save_last_check_time($checkpoint_time);
+        # Update checkpoint to latest processed uniqueid
+        if ($latest_uniqueid) {
+            save_last_check_uniqueid($latest_uniqueid);
         }
 
         my $duration = sprintf("%.2f", time() - $start_time);
