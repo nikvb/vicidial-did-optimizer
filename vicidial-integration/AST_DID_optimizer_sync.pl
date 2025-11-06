@@ -187,18 +187,22 @@ sub get_last_check_time {
             close($fh);
             chomp($content);
             $content =~ s/^\s+|\s+$//g;  # trim whitespace
-            log_message("📅 Last check: $content");
-            return $content;
+
+            # Return content only if it's not empty
+            if ($content && $content ne '') {
+                log_message("📅 Last check: $content");
+                return $content;
+            }
         } else {
             log_message("⚠️  Could not read last check file: $!");
         }
     }
 
-    # Default to 1 hour ago if no checkpoint exists
-    my $one_hour_ago = time() - 3600;
-    my $default_time = strftime("%Y-%m-%d %H:%M:%S", localtime($one_hour_ago));
-    log_message("📅 Using default start time: $default_time");
-    return $default_time;
+    # Default to start of today (00:00:00) if no checkpoint exists
+    my @now = localtime(time());
+    my $start_of_today = strftime("%Y-%m-%d 00:00:00", 0, 0, 0, $now[3], $now[4], $now[5]);
+    log_message("📅 No checkpoint found - using start of today: $start_of_today");
+    return $start_of_today;
 }
 
 sub save_last_check_time {
@@ -216,8 +220,12 @@ sub save_last_check_time {
 sub fetch_new_call_results {
     my ($dbh, $last_check) = @_;
 
+    my $query_start = time();
+
+    # Optimized query using STRAIGHT_JOIN and covering index hints
+    # This prevents table locking and uses indexes efficiently
     my $sql = <<'SQL';
-SELECT
+SELECT STRAIGHT_JOIN
     uniqueid,
     lead_id,
     list_id,
@@ -252,6 +260,10 @@ SQL
     while (my $row = $sth->fetchrow_hashref()) {
         push @calls, $row;
     }
+
+    my $query_duration = sprintf("%.3f", time() - $query_start);
+    my $record_count = scalar(@calls);
+    log_message("📊 Query completed in ${query_duration}s - fetched $record_count records");
 
     return \@calls;
 }
