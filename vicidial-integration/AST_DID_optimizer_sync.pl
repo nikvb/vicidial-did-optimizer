@@ -50,7 +50,7 @@ my $API_KEY;
 sub load_configuration {
     # Set default values
     %config = (
-        api_base_url => 'http://localhost:5000',
+        api_base_url => 'https://dids.amdy.io',
         api_key => $ENV{'API_KEY'} || '',
         db_host => $ENV{'VICIDIAL_DB_HOST'} || 'localhost',
         db_user => $ENV{'VICIDIAL_DB_USER'} || 'cron',
