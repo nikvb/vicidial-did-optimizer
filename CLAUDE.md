@@ -323,3 +323,7 @@ Reference the detailed specifications in:
 6. **Session-based auth**: Web uses sessions, API uses JWT tokens
 - never USE any mock data if there is no data in DB display 0
 - use http://api3.amdy.io:3000 and http://api3.amdy.io:5000 do not use localhost
+- NEVER USE port 3000 RUN everythign on PORT 5000 and use https://dids.amdy.io as it maps to this host and port 5000 through cloudflare.
+- never use https://endpoint.amdy.io always use https://dids.amdy.io
+- username for testing client@test3.com password: password123
+- check every change in UI with playwright server

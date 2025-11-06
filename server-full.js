@@ -18,6 +18,8 @@ import { fileURLToPath } from 'url';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import { Resend } from 'resend';
 import crypto from 'crypto';
+import multer from 'multer';
+import fetch from 'node-fetch';
 
 // Get __dirname in ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -51,6 +53,7 @@ import didRoutes from './temp_clone/routes/dids.js';
 // import analyticsRoutes from './routes/analytics.js';
 // import billingRoutes from './routes/billing.js';
 import tenantRoutes from './temp_clone/routes/tenants.js';
+import vicidialRoutes from './routes/vicidial.js';
 // import dashboardRoutes from './routes/dashboard.js';
 
 // API key validation middleware using the same DB connection
@@ -178,8 +181,26 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // app.use(mongoSanitize()); // Commented out - incompatible with Express 5
 
+// Configure multer for file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'text/csv' || file.originalname.toLowerCase().endsWith('.csv')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only CSV files are allowed'), false);
+    }
+  }
+});
+
 // Serve static frontend build files
 app.use(express.static(frontendBuildPath));
+
+// Serve screenshots for reputation debugging
+app.use('/screenshots', express.static(path.join(__dirname, 'public', 'screenshots')));
 
 // Session configuration
 app.use(session({
@@ -834,6 +855,7 @@ app.use('/api/v1/dids', didRoutes);
 // app.use('/api/v1/analytics', analyticsRoutes);
 // app.use('/api/v1/billing', billingRoutes);
 app.use('/api/v1/tenants', tenantRoutes);
+app.use('/api/v1/settings/vicidial', vicidialRoutes);
 // app.use('/api/v1/dashboard', dashboardRoutes);
 
 // Google OAuth Configuration
@@ -1559,8 +1581,22 @@ app.get('/api/v1/dids', async (req, res) => {
     // Get total count for pagination
     const totalCount = await DID.countDocuments(query);
 
-    // Get DIDs with pagination
-    const sortObj = { [sortBy]: sortOrder };
+    // Get DIDs with pagination and proper sorting
+    let sortObj = {};
+
+    // Handle nested field sorting
+    if (sortBy === 'usage.lastUsed') {
+      sortObj = { 'usage.lastUsed': sortOrder };
+    } else if (sortBy === 'reputation.score') {
+      sortObj = { 'reputation.score': sortOrder };
+    } else if (sortBy === 'phoneNumber') {
+      sortObj = { phoneNumber: sortOrder };
+    } else if (sortBy === 'status') {
+      sortObj = { status: sortOrder };
+    } else {
+      sortObj = { [sortBy]: sortOrder };
+    }
+
     const dids = await DID.find(query)
       .sort(sortObj)
       .skip(skip)
@@ -1574,7 +1610,7 @@ app.get('/api/v1/dids', async (req, res) => {
 
       // Use actual reputation score or 0 (no mock data)
       const performance = did.reputation && did.reputation.score ?
-        did.reputation.score * 100 : 0;
+        did.reputation.score : 0;
 
       // Extract area code and get location data
       const areaCode = did.phoneNumber ? did.phoneNumber.substring(2, 5) : '';
@@ -1582,11 +1618,17 @@ app.get('/api/v1/dids', async (req, res) => {
 
       return {
         id: skip + index + 1,
+        _id: did._id.toString(), // Include MongoDB ID for cross-page selection
         number: did.phoneNumber || '',
         status: did.status || 'unknown',
         calls: callCount,
-        lastUsed: did.lastUsed ? did.lastUsed.toISOString() : new Date().toISOString(),
         performance: Math.round(performance * 10) / 10,
+        usage: {
+          lastUsed: did.usage?.lastUsed ? did.usage.lastUsed.toISOString() : null,
+          totalCalls: did.usage?.totalCalls || 0,
+          lastCampaign: did.usage?.lastCampaign || null,
+          lastAgent: did.usage?.lastAgent || null
+        },
         reputation: {
           score: did.reputation?.score || 0,
           callVolume: did.reputation?.callVolume || 0,
@@ -1651,8 +1693,8 @@ app.get('/api/v1/dids/:id', async (req, res) => {
       createdAt: did.createdAt,
 
       reputation: {
-        score: did.reputation?.score ? Math.round(did.reputation.score * 100) : 0,
-        status: did.reputation?.reputationStatus || 'Unknown',
+        score: did.reputation?.score || 0,
+        status: did.reputation?.status || 'Unknown',
         lastChecked: did.reputation?.lastChecked || 'Never',
         userReports: did.reputation?.robokillerData?.userReports || 0,
         robokillerStatus: did.reputation?.robokillerData?.robokillerStatus || 'Unknown'
@@ -1795,6 +1837,148 @@ GITHUB_REPO=https://github.com/yourusername/did-optimizer-vicidial
     res.status(500).json({
       success: false,
       message: 'Failed to generate configuration',
+      error: error.message
+    });
+  }
+});
+
+// GET DID Reputation Details
+app.get('/api/v1/dids/:phoneNumber/reputation', async (req, res) => {
+  try {
+    const { phoneNumber } = req.params;
+
+    // Find DID by phone number - try both with and without + prefix
+    const cleanedNumber = phoneNumber.replace(/\D/g, ''); // Remove non-digits
+    const did = await DID.findOne({
+      $or: [
+        { phoneNumber: `+${cleanedNumber}` },  // With + prefix
+        { phoneNumber: cleanedNumber }         // Without prefix
+      ]
+    }).lean();
+
+    if (!did) {
+      return res.status(404).json({
+        success: false,
+        message: 'DID not found'
+      });
+    }
+
+    // Calculate actual metrics from real data
+    const totalCalls = did.usage?.totalCalls || 0;
+    const totalAnswered = did.metrics?.totalAnswered || 0;
+    const totalConnected = did.metrics?.totalConnected || 0;
+    const totalDropped = did.metrics?.totalDropped || 0;
+    const totalFailed = did.metrics?.totalFailed || 0;
+    const totalBusy = did.metrics?.totalBusy || 0;
+    const totalDuration = did.metrics?.totalDuration || 0;
+
+    // Calculate success rate from real metrics
+    const successRate = totalCalls > 0 ? Math.round((totalConnected / totalCalls) * 100) : 0;
+    const answerRate = totalCalls > 0 ? Math.round((totalAnswered / totalCalls) * 100) : 0;
+
+    // Calculate average call duration
+    const avgDuration = totalConnected > 0 ? Math.round(totalDuration / totalConnected) : 0;
+    const avgDurationFormatted = avgDuration > 0 ? `${Math.floor(avgDuration / 60)}m ${avgDuration % 60}s` : '0s';
+
+    // Use real reputation data with intelligent fallbacks
+    const reputationDetails = {
+      score: did.reputation?.score || 50,
+      lastChecked: did.reputation?.lastChecked || did.updatedAt || new Date().toISOString(),
+      robokiller: {
+        status: did.reputation?.robokillerData?.robokillerStatus || 'Unknown',
+        lastChecked: did.reputation?.robokillerData?.lastCallDate || did.reputation?.lastChecked || null,
+        reports: did.reputation?.robokillerData?.userReports || 0,
+        category: did.reputation?.robokillerData?.reputationStatus || 'Not Listed',
+        flagReason: did.reputation?.robokillerData?.flagReason || null,
+        spamScore: did.reputation?.robokillerData?.spamScore || null,
+        callerName: did.reputation?.robokillerData?.callerName || null,
+        commentsCount: did.reputation?.robokillerData?.commentsCount || 0,
+        screenshot: did.reputation?.robokillerData?.screenshot || null
+      },
+      callStats: {
+        totalCalls: totalCalls,
+        answeredCalls: totalAnswered,
+        connectedCalls: totalConnected,
+        droppedCalls: totalDropped,
+        failedCalls: totalFailed,
+        busyCalls: totalBusy,
+        reportedSpam: did.reputation?.robokillerData?.userReports || 0,
+        blockedCalls: totalDropped + totalFailed,
+        averageCallDuration: avgDurationFormatted,
+        successRate: `${successRate}%`,
+        answerRate: `${answerRate}%`,
+        totalDuration: totalDuration
+      },
+      userComments: did.reputation?.userComments || (
+        did.reputation?.robokillerData?.commentsCount > 0
+          ? [
+              {
+                date: did.reputation?.lastChecked || new Date().toISOString(),
+                comment: `${did.reputation.robokillerData.commentsCount} user reports available on RoboKiller`,
+                rating: 'neutral',
+                source: 'RoboKiller Database'
+              }
+            ]
+          : [
+              {
+                date: did.createdAt || new Date().toISOString(),
+                comment: 'No user reports available',
+                rating: 'neutral',
+                source: 'System'
+              }
+            ]
+      ),
+      history: did.reputation?.history || [
+        {
+          date: did.createdAt || new Date().toISOString(),
+          score: did.reputation?.score || 50,
+          event: 'DID added to system',
+          change: 0
+        },
+        ...(did.reputation?.lastChecked ? [{
+          date: did.reputation.lastChecked,
+          score: did.reputation?.score || 50,
+          event: 'Reputation check',
+          change: 0
+        }] : [])
+      ],
+      carrierInfo: {
+        carrier: did.metadata?.carrier || did.reputation?.robokillerData?.carrier || 'Unknown',
+        type: did.metadata?.lineType || 'Unknown',
+        location: {
+          city: did.location?.city || 'Unknown',
+          state: did.location?.state || 'Unknown',
+          areaCode: did.location?.areaCode || phoneNumber.substring(1, 4),
+          country: did.location?.country || 'US'
+        }
+      },
+      riskFactors: did.reputation?.riskFactors || [],
+      lastActivity: did.usage?.lastUsed || did.metrics?.lastCallTimestamp || did.updatedAt || new Date().toISOString(),
+      campaignInfo: {
+        lastCampaign: did.usage?.lastCampaign || 'Unknown',
+        lastAgent: did.usage?.lastAgent || 'Unknown',
+        lastCallResult: did.metrics?.lastCallResult || 'Unknown'
+      },
+      dailyUsage: did.usage?.dailyUsage || [],
+      metadata: {
+        notes: did.metadata?.notes || '',
+        portedDate: did.metadata?.portedDate || null,
+        capacity: did.capacity || 100,
+        status: did.status || 'active',
+        isActive: did.isActive !== false
+      }
+    };
+
+    res.json({
+      success: true,
+      data: reputationDetails
+    });
+
+  } catch (error) {
+    console.error('Error fetching reputation details:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch reputation details',
       error: error.message
     });
   }
@@ -2255,7 +2439,7 @@ app.get('/api/v1/analytics/performance', async (req, res) => {
     const formattedPerformers = topPerformers.map(did => ({
       number: did.phoneNumber,
       quality: {
-        score: Math.round((did.reputation?.score || 0) * 100),
+        score: did.reputation?.score || 0,
         answerRate: Math.round((did.reputation?.successRate || 0) * 100)
       }
     }));
@@ -2359,6 +2543,318 @@ app.get('/api/v1/analytics/costs', async (req, res) => {
   } catch (error) {
     console.error('Analytics costs error:', error);
     res.status(500).json({ message: 'Failed to load cost analytics' });
+  }
+});
+
+// Capacity Analytics Endpoint
+app.get('/api/v1/analytics/capacity', async (req, res) => {
+  try {
+    // Get user from token
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    let userTenantId = null;
+    let isAdmin = false;
+
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        const user = await User.findById(decoded.id);
+        if (user) {
+          userTenantId = user.tenant;
+          isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+        }
+      } catch (error) {
+        console.error('Token decode error:', error.message);
+      }
+    }
+
+    // Calculate last business day (exclude weekends)
+    const getLastBusinessDay = () => {
+      const today = new Date();
+      let lastBusinessDay = new Date(today);
+      lastBusinessDay.setDate(today.getDate() - 1); // Start with yesterday
+
+      // If yesterday was Sunday (0), go back to Friday
+      if (lastBusinessDay.getDay() === 0) {
+        lastBusinessDay.setDate(lastBusinessDay.getDate() - 2);
+      }
+      // If yesterday was Saturday (6), go back to Friday
+      else if (lastBusinessDay.getDay() === 6) {
+        lastBusinessDay.setDate(lastBusinessDay.getDate() - 1);
+      }
+
+      lastBusinessDay.setHours(0, 0, 0, 0);
+      return lastBusinessDay;
+    };
+
+    const lastBusinessDayStart = getLastBusinessDay();
+    const lastBusinessDayEnd = new Date(lastBusinessDayStart);
+    lastBusinessDayEnd.setHours(23, 59, 59, 999);
+
+    console.log('📊 Capacity analytics - Last business day:', lastBusinessDayStart.toISOString().split('T')[0]);
+
+    // Build query filter
+    const filter = { status: 'active' };
+    if (!isAdmin && userTenantId) {
+      filter.tenantId = userTenantId;
+    }
+
+    // Get total DIDs
+    const totalDIDs = await DID.countDocuments(filter);
+
+    // Get DIDs with usage in last 7 days
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const activeDIDs = await DID.countDocuments({
+      ...filter,
+      'usage.lastUsed': { $gte: sevenDaysAgo }
+    });
+
+    // Capacity analysis with utilization rate
+    const capacityStats = await DID.aggregate([
+      { $match: filter },
+      {
+        $project: {
+          phoneNumber: 1,
+          capacity: 1,
+          totalCalls: '$usage.totalCalls',
+          lastUsed: '$usage.lastUsed',
+          location: 1,
+          utilizationRate: {
+            $cond: {
+              if: { $and: [{ $gt: ['$capacity', 0] }, { $gt: ['$usage.totalCalls', 0] }] },
+              then: { $multiply: [{ $divide: ['$usage.totalCalls', '$capacity'] }, 100] },
+              else: 0
+            }
+          }
+        }
+      },
+      { $sort: { utilizationRate: -1 } }
+    ]);
+
+    // Find over-capacity DIDs (>80% utilization)
+    const overCapacityDIDs = capacityStats.filter(d => d.utilizationRate > 80);
+
+    // Area code analysis
+    const areaCodeStats = await DID.aggregate([
+      { $match: { ...filter, 'location.areaCode': { $exists: true } } },
+      {
+        $group: {
+          _id: '$location.areaCode',
+          state: { $first: '$location.state' },
+          city: { $first: '$location.city' },
+          didCount: { $sum: 1 },
+          totalCalls: { $sum: '$usage.totalCalls' },
+          totalCapacity: { $sum: '$capacity' },
+          avgUtilization: {
+            $avg: {
+              $cond: {
+                if: { $and: [{ $gt: ['$capacity', 0] }, { $gt: ['$usage.totalCalls', 0] }] },
+                then: { $multiply: [{ $divide: ['$usage.totalCalls', '$capacity'] }, 100] },
+                else: 0
+              }
+            }
+          }
+        }
+      },
+      { $sort: { totalCalls: -1 } },
+      { $limit: 20 }
+    ]);
+
+    // Calculate overall capacity
+    const totalCapacity = capacityStats.reduce((sum, d) => sum + (d.capacity || 0), 0);
+    const totalUsage = capacityStats.reduce((sum, d) => sum + (d.totalCalls || 0), 0);
+    const overallUtilization = totalCapacity > 0 ? (totalUsage / totalCapacity) * 100 : 0;
+
+    // Analyze DESTINATION area codes (where customers are located)
+    // Use phoneNumber field which contains destination numbers (format: 12015551234 or +12015551234)
+    // Filter by last business day only for recommendations
+    const destinationAreaCodes = await CallRecord.aggregate([
+      {
+        $match: {
+          ...(!isAdmin && userTenantId ? { tenantId: userTenantId } : {}),
+          phoneNumber: { $exists: true, $ne: null, $ne: '' },
+          callTimestamp: { $gte: lastBusinessDayStart, $lte: lastBusinessDayEnd }
+        }
+      },
+      {
+        $addFields: {
+          // Handle both formats: "12015551234" and "+12015551234"
+          cleanPhone: {
+            $cond: {
+              if: { $regexMatch: { input: { $toString: '$phoneNumber' }, regex: /^\+1/ } },
+              then: { $substr: [{ $toString: '$phoneNumber' }, 2, 10] }, // Remove +1
+              else: {
+                $cond: {
+                  if: { $regexMatch: { input: { $toString: '$phoneNumber' }, regex: /^1/ } },
+                  then: { $substr: [{ $toString: '$phoneNumber' }, 1, 10] }, // Remove leading 1
+                  else: { $toString: '$phoneNumber' }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        $addFields: {
+          destAreaCode: {
+            $cond: {
+              if: { $gte: [{ $strLenCP: '$cleanPhone' }, 10] },
+              then: { $substr: ['$cleanPhone', 0, 3] },
+              else: null
+            }
+          }
+        }
+      },
+      {
+        $match: {
+          destAreaCode: { $ne: null, $regex: /^[0-9]{3}$/ }
+        }
+      },
+      {
+        $group: {
+          _id: '$destAreaCode',
+          callCount: { $sum: 1 }
+        }
+      },
+      { $sort: { callCount: -1 } },
+      { $limit: 50 } // Increased from 20 to show more area codes including Canada
+    ]);
+
+    // Check which destination area codes we DON'T have DIDs for
+    const existingDIDAreaCodes = new Set(areaCodeStats.map(ac => ac._id));
+    const destinationStats = await Promise.all(
+      destinationAreaCodes.map(async (dest) => {
+        // Look up location info from AreaCodeLocation collection (includes US + Canada)
+        const locationData = await AreaCodeLocation.findOne({
+          areaCode: dest._id
+        }).lean();
+
+        const hasDIDs = existingDIDAreaCodes.has(dest._id);
+        const currentDIDCount = hasDIDs ?
+          areaCodeStats.find(ac => ac._id === dest._id)?.didCount || 0 : 0;
+
+        return {
+          areaCode: dest._id,
+          callCount: dest.callCount,
+          hasDIDs: hasDIDs,
+          currentDIDCount: currentDIDCount,
+          location: locationData ? {
+            state: locationData.state,
+            city: locationData.city,
+            country: locationData.country,
+            areaCode: dest._id
+          } : null,
+          needsMore: !hasDIDs || currentDIDCount < 5 // Suggest if no DIDs or very few
+        };
+      })
+    );
+
+    // Generate recommendations
+    const recommendations = [];
+
+    // Calculate average DID capacity for recommendations
+    const avgDIDCapacity = totalDIDs > 0 ? totalCapacity / totalDIDs : 100; // Default to 100 if no data
+    const targetCallsPerDID = avgDIDCapacity * 0.7; // Target 70% utilization to avoid overload
+
+    console.log(`📊 Recommendation parameters: Avg DID capacity: ${Math.round(avgDIDCapacity)}, Target calls/DID: ${Math.round(targetCallsPerDID)}`);
+
+    // PRIORITY 1: Destination area codes where we need local presence
+    // Calculate based on YESTERDAY'S call volume and DID capacity
+    const destinationRecommendations = destinationStats
+      .filter(dest => dest.needsMore && dest.callCount > 0)
+      .map(dest => ({
+        type: 'destination',
+        areaCode: dest.areaCode,
+        state: dest.location?.state || 'Unknown',
+        city: dest.location?.city || 'Unknown',
+        currentDIDs: dest.currentDIDCount,
+        totalCalls: dest.callCount, // Yesterday's calls only
+        suggestedDIDs: dest.hasDIDs ?
+          Math.max(1, Math.ceil((dest.callCount / targetCallsPerDID) - dest.currentDIDCount)) :
+          Math.max(1, Math.ceil(dest.callCount / targetCallsPerDID)),
+        reason: dest.hasDIDs ?
+          `Yesterday: ${dest.callCount} calls in this area - need more local DIDs` :
+          `Yesterday: ${dest.callCount} calls to this area - need local presence`,
+        priority: dest.hasDIDs ? 'medium' : 'high'
+      }));
+
+    recommendations.push(...destinationRecommendations);
+
+    // PRIORITY 2: High traffic, low DID count area codes (existing DIDs overloaded)
+    const highTrafficLowDIDs = areaCodeStats.filter(ac => {
+      const callsPerDID = (ac.totalCalls || 0) / ac.didCount;
+      return callsPerDID > 50 && ac.didCount < 10;
+    }).map(ac => ({
+      type: 'capacity',
+      areaCode: ac._id,
+      state: ac.state,
+      city: ac.city,
+      currentDIDs: ac.didCount,
+      totalCalls: ac.totalCalls,
+      callsPerDID: Math.round((ac.totalCalls || 0) / ac.didCount),
+      suggestedDIDs: Math.ceil(((ac.totalCalls || 0) / ac.didCount) / 50),
+      reason: 'High traffic per DID - capacity issue',
+      priority: 'medium'
+    }));
+
+    recommendations.push(...highTrafficLowDIDs);
+
+    // Overall capacity warning
+    if (overallUtilization > 70) {
+      const additionalDIDsNeeded = Math.ceil((totalUsage - totalCapacity * 0.7) / 100);
+      recommendations.push({
+        type: 'system',
+        severity: overallUtilization > 100 ? 'critical' : 'warning',
+        message: `System is running at ${overallUtilization.toFixed(1)}% capacity`,
+        suggestedDIDs: additionalDIDsNeeded,
+        reason: 'Overall system capacity exceeded'
+      });
+    }
+
+    // Top over-capacity DIDs for display
+    const topOverCapacity = overCapacityDIDs.slice(0, 10).map(d => ({
+      phoneNumber: d.phoneNumber,
+      areaCode: d.location?.areaCode || 'N/A',
+      utilizationRate: Math.round(d.utilizationRate),
+      totalCalls: d.totalCalls || 0,
+      capacity: d.capacity || 0
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        summary: {
+          totalDIDs,
+          activeDIDs,
+          overCapacityCount: overCapacityDIDs.length,
+          totalCapacity,
+          totalUsage,
+          overallUtilization: Math.round(overallUtilization * 10) / 10
+        },
+        topOverCapacity,
+        areaCodeStats: areaCodeStats.map(ac => ({
+          areaCode: ac._id,
+          state: ac.state,
+          city: ac.city,
+          didCount: ac.didCount,
+          totalCalls: ac.totalCalls || 0,
+          avgUtilization: Math.round((ac.avgUtilization || 0) * 10) / 10,
+          callsPerDID: Math.round((ac.totalCalls || 0) / ac.didCount)
+        })),
+        destinationStats: destinationStats.map(dest => ({
+          areaCode: dest.areaCode,
+          state: dest.location?.state || 'Unknown',
+          city: dest.location?.city || 'Unknown',
+          callCount: dest.callCount,
+          hasDIDs: dest.hasDIDs,
+          currentDIDCount: dest.currentDIDCount,
+          needsMore: dest.needsMore
+        })),
+        recommendations
+      }
+    });
+  } catch (error) {
+    console.error('Analytics capacity error:', error);
+    res.status(500).json({ success: false, message: 'Failed to load capacity analytics' });
   }
 });
 
@@ -2557,6 +3053,385 @@ app.get('/api/v1/settings/rotation', async (req, res) => {
     });
   }
 });
+
+// ============================================================================
+// AI BOT ENDPOINTS FOR BULK DID MANAGEMENT
+// ============================================================================
+
+// AI Chat endpoint for DID management
+app.post('/api/v1/ai/chat', async (req, res) => {
+  try {
+    // Authenticate user
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'No token provided'
+      });
+    }
+
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid token'
+      });
+    }
+
+    const { message, context } = req.body;
+    if (!message) {
+      return res.status(400).json({
+        success: false,
+        error: 'Message is required'
+      });
+    }
+
+    // Process the message using AI
+    const aiResponse = await processAIMessage(message, context, user.tenantId);
+
+    res.json({
+      success: true,
+      response: aiResponse.response,
+      actions: aiResponse.actions || [],
+      data: aiResponse.data || null
+    });
+
+  } catch (error) {
+    console.error('AI Chat error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process AI request'
+    });
+  }
+});
+
+// AI-powered CSV file upload and parsing
+app.post('/api/v1/ai/upload-csv', upload.single('file'), async (req, res) => {
+  try {
+    // Authenticate user
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'No token provided'
+      });
+    }
+
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid token'
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No file uploaded'
+      });
+    }
+
+    // Parse CSV using AI
+    const csvContent = req.file.buffer.toString('utf-8');
+    const parseResult = await parseCSVWithAI(csvContent, user.tenantId);
+
+    res.json({
+      success: true,
+      data: parseResult
+    });
+
+  } catch (error) {
+    console.error('CSV upload error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process CSV file'
+    });
+  }
+});
+
+// AI-powered bulk DID operations
+app.post('/api/v1/ai/bulk-operation', async (req, res) => {
+  try {
+    // Authenticate user
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'No token provided'
+      });
+    }
+
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid token'
+      });
+    }
+
+    const { operation, criteria, dryRun = false } = req.body;
+    if (!operation || !criteria) {
+      return res.status(400).json({
+        success: false,
+        error: 'Operation and criteria are required'
+      });
+    }
+
+    // Execute bulk operation using AI
+    const result = await executeBulkOperation(operation, criteria, user.tenantId, dryRun);
+
+    res.json({
+      success: true,
+      data: result
+    });
+
+  } catch (error) {
+    console.error('Bulk operation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to execute bulk operation'
+    });
+  }
+});
+
+// ============================================================================
+// AI HELPER FUNCTIONS
+// ============================================================================
+
+async function processAIMessage(message, context, tenantId) {
+  try {
+    // Get current DID statistics for context
+    const didStats = await DID.aggregate([
+      { $match: { tenantId } },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          active: { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
+          inactive: { $sum: { $cond: [{ $eq: ['$status', 'inactive'] }, 1, 0] } },
+          avgReputation: { $avg: '$reputation.score' },
+          lowReputation: { $sum: { $cond: [{ $lt: ['$reputation.score', 30] }, 1, 0] } }
+        }
+      }
+    ]);
+
+    const stats = didStats[0] || { total: 0, active: 0, inactive: 0, avgReputation: 0, lowReputation: 0 };
+
+    // Prepare context for AI
+    const systemContext = `You are a DID (phone number) management assistant. Current system stats:
+- Total DIDs: ${stats.total}
+- Active DIDs: ${stats.active}
+- Inactive DIDs: ${stats.inactive}
+- Average reputation score: ${Math.round(stats.avgReputation || 0)}%
+- DIDs with low reputation (<30%): ${stats.lowReputation}
+
+Available actions: load_csv, delete_bad_reputation, bulk_update_status, export_data, analyze_performance
+
+User context: ${JSON.stringify(context || {})}`;
+
+    // Call AI model
+    const aiResponse = await callAIModel(systemContext, message);
+
+    // Parse AI response for actions
+    const actions = extractActionsFromResponse(aiResponse);
+
+    return {
+      response: aiResponse,
+      actions: actions,
+      data: { stats }
+    };
+
+  } catch (error) {
+    console.error('Error processing AI message:', error);
+    throw error;
+  }
+}
+
+async function parseCSVWithAI(csvContent, tenantId) {
+  try {
+    // First 1000 characters for AI analysis
+    const sampleContent = csvContent.substring(0, 1000);
+
+    const prompt = `Analyze this CSV content and extract DID phone number data:
+
+${sampleContent}
+
+Return JSON with:
+{
+  "headers": ["column1", "column2", ...],
+  "phoneNumberColumn": "column_name",
+  "statusColumn": "column_name_or_null",
+  "capacityColumn": "column_name_or_null",
+  "rows": [
+    {"phoneNumber": "+1234567890", "status": "active", "capacity": 100},
+    ...
+  ]
+}
+
+Phone numbers should be in E.164 format (+1xxxxxxxxxx). If status not provided, default to "active". If capacity not provided, default to 100.`;
+
+    const aiResponse = await callAIModel('You are a CSV parsing assistant for DID management.', prompt);
+
+    // Parse AI response
+    let parsed;
+    try {
+      parsed = JSON.parse(aiResponse);
+    } catch (e) {
+      // Try to extract JSON from response
+      const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        parsed = JSON.parse(jsonMatch[0]);
+      } else {
+        throw new Error('AI response not valid JSON');
+      }
+    }
+
+    // Validate and sanitize parsed data
+    const validRows = parsed.rows
+      .filter(row => row.phoneNumber && /^\+1\d{10}$/.test(row.phoneNumber))
+      .map(row => ({
+        phoneNumber: row.phoneNumber,
+        status: row.status || 'active',
+        capacity: row.capacity || 100
+      }));
+
+    return {
+      total: validRows.length,
+      valid: validRows.length,
+      headers: parsed.headers || [],
+      phoneNumberColumn: parsed.phoneNumberColumn,
+      rows: validRows
+    };
+
+  } catch (error) {
+    console.error('Error parsing CSV with AI:', error);
+    throw error;
+  }
+}
+
+async function executeBulkOperation(operation, criteria, tenantId, dryRun = false) {
+  try {
+    let query = { tenantId };
+    let result = { affected: 0, details: [] };
+
+    // Build query based on criteria
+    if (criteria.reputationThreshold) {
+      query['reputation.score'] = { $lt: criteria.reputationThreshold };
+    }
+    if (criteria.status) {
+      query.status = criteria.status;
+    }
+    if (criteria.lastUsedDays) {
+      const date = new Date();
+      date.setDate(date.getDate() - criteria.lastUsedDays);
+      query['usage.lastUsed'] = { $lt: date };
+    }
+
+    switch (operation) {
+      case 'delete_bad_reputation':
+        const didsToDelete = await DID.find(query);
+        result.affected = didsToDelete.length;
+        result.details = didsToDelete.map(did => ({
+          phoneNumber: did.phoneNumber,
+          reputation: did.reputation?.score || 0
+        }));
+
+        if (!dryRun) {
+          await DID.deleteMany(query);
+        }
+        break;
+
+      case 'update_status':
+        const didsToUpdate = await DID.find(query);
+        result.affected = didsToUpdate.length;
+        result.details = didsToUpdate.map(did => ({
+          phoneNumber: did.phoneNumber,
+          oldStatus: did.status,
+          newStatus: criteria.newStatus
+        }));
+
+        if (!dryRun) {
+          await DID.updateMany(query, { $set: { status: criteria.newStatus } });
+        }
+        break;
+
+      case 'export':
+        const didsToExport = await DID.find(query);
+        result.affected = didsToExport.length;
+        result.data = didsToExport.map(did => ({
+          phoneNumber: did.phoneNumber,
+          status: did.status,
+          reputation: did.reputation?.score || 0,
+          lastUsed: did.usage?.lastUsed || null,
+          totalCalls: did.usage?.totalCalls || 0
+        }));
+        break;
+    }
+
+    return result;
+
+  } catch (error) {
+    console.error('Error executing bulk operation:', error);
+    throw error;
+  }
+}
+
+async function callAIModel(systemPrompt, userMessage) {
+  try {
+    const apiBase = process.env.OPENAI_COMPATIBLE_URL || 'http://71.241.245.11:41924/v1';
+    const model = process.env.OPENAI_COMPATIBLE_MODEL || 'openai/gpt-oss-20b';
+    const apiKey = process.env.OPENAI_COMPATIBLE_KEY || 'not-needed';
+
+    const response = await fetch(`${apiBase}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage }
+        ],
+        temperature: 0.1,
+        max_tokens: 1000
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`AI API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content;
+
+  } catch (error) {
+    console.error('Error calling AI model:', error);
+    throw error;
+  }
+}
+
+function extractActionsFromResponse(aiResponse) {
+  const actions = [];
+
+  // Extract common action patterns from AI response
+  if (aiResponse.includes('delete') && aiResponse.includes('reputation')) {
+    actions.push({ type: 'delete_bad_reputation', suggested: true });
+  }
+  if (aiResponse.includes('upload') || aiResponse.includes('CSV')) {
+    actions.push({ type: 'upload_csv', suggested: true });
+  }
+  if (aiResponse.includes('export')) {
+    actions.push({ type: 'export_data', suggested: true });
+  }
+
+  return actions;
+}
 
 // Error handling middleware (must be last)
 // Middleware - commented out until middleware files are created
