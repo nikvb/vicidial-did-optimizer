@@ -20,9 +20,9 @@ Complete VICIdial integration using AGI-based approach with web-based setup tool
   - Tracks call duration and disposition
   - Used for AI training and performance analytics
   - Auto-configured from VICIdial database
-  - Installs to `/usr/share/astguiclient/bin/` (standard VICIdial location)
+  - Installs to `/usr/share/astguiclient/` (standard VICIdial location)
 - **`install-call-results-sync.sh`** - One-line installer for call results sync
-  - Downloads and installs sync script to VICIdial bin directory
+  - Downloads and installs sync script to VICIdial directory
   - Configures cron job (runs every minute)
   - Sets up logging in `/var/log/astguiclient/`
   - Verifies dependencies
@@ -118,7 +118,7 @@ Complete VICIdial integration using AGI-based approach with web-based setup tool
 
    **What it does**:
    - Installs Perl dependencies (DBI, DBD::mysql, LWP::UserAgent, JSON)
-   - Downloads and installs `AST_DID_optimizer_sync.pl` to `/usr/share/astguiclient/bin/`
+   - Downloads and installs `AST_DID_optimizer_sync.pl` to `/usr/share/astguiclient/`
    - Creates cron job to sync call results every minute
    - Automatically reads config from `/etc/asterisk/dids.conf`
    - Logs to `/var/log/astguiclient/did-optimizer-sync.log`
@@ -359,7 +359,7 @@ mysql -h localhost -u cron -p1234 asterisk -e "SELECT COUNT(*) FROM vicidial_lis
 
 **Check if sync is installed:**
 ```bash
-ls -la /usr/share/astguiclient/bin/AST_DID_optimizer_sync.pl
+ls -la /usr/share/astguiclient/AST_DID_optimizer_sync.pl
 crontab -l | grep AST_DID_optimizer_sync
 ```
 
@@ -384,7 +384,7 @@ grep 'api_key' /etc/asterisk/dids.conf
 **Manual test:**
 ```bash
 # Run sync manually to see output
-sudo perl /usr/share/astguiclient/bin/AST_DID_optimizer_sync.pl
+sudo perl /usr/share/astguiclient/AST_DID_optimizer_sync.pl
 ```
 
 **Common issues:**
@@ -403,7 +403,7 @@ After installation, files will be located at:
 - **Cache**: `/tmp/did_optimizer/` (auto-created)
 
 **Call Results Sync (if installed):**
-- **Sync Script**: `/usr/share/astguiclient/bin/AST_DID_optimizer_sync.pl`
+- **Sync Script**: `/usr/share/astguiclient/AST_DID_optimizer_sync.pl`
 - **Sync Logs**: `/var/log/astguiclient/did-optimizer-sync.log`
 - **State File**: `/tmp/did-optimizer-last-check.txt`
 - **Cron Job**: Runs every minute via root crontab
@@ -428,7 +428,7 @@ Installation complete when:
 
 **Optional (but recommended):**
 - [ ] Call results sync installed (`install-call-results-sync.sh`)
-- [ ] Sync script located at `/usr/share/astguiclient/bin/AST_DID_optimizer_sync.pl`
+- [ ] Sync script located at `/usr/share/astguiclient/AST_DID_optimizer_sync.pl`
 - [ ] Cron job running every minute
 - [ ] Sync logs showing successful uploads (`/var/log/astguiclient/did-optimizer-sync.log`)
 

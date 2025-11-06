@@ -26,7 +26,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-INSTALL_DIR="/usr/share/astguiclient/bin"
+INSTALL_DIR="/usr/share/astguiclient"
 SCRIPT_NAME="AST_DID_optimizer_sync.pl"
 SCRIPT_PATH="$INSTALL_DIR/$SCRIPT_NAME"
 LOG_FILE="/var/log/astguiclient/did-optimizer-sync.log"
@@ -153,9 +153,9 @@ install_perl_modules() {
 download_script() {
     print_info "Downloading call results sync script..."
 
-    # Verify VICIdial bin directory exists
+    # Verify VICIdial directory exists
     if [ ! -d "$INSTALL_DIR" ]; then
-        print_error "VICIdial bin directory not found: $INSTALL_DIR"
+        print_error "VICIdial directory not found: $INSTALL_DIR"
         print_info "Please ensure VICIdial is properly installed"
         return 1
     fi
