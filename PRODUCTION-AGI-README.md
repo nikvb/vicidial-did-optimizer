@@ -84,7 +84,6 @@ sudo cp /home/na/didapi/vicidial-did-optimizer-production.agi \
 
 # Make executable
 sudo chmod +x /usr/share/astguiclient/vicidial-did-optimizer.agi
-sudo chown asterisk:asterisk /usr/share/astguiclient/vicidial-did-optimizer.agi
 ```
 
 ### 2. Configure Privacy Settings

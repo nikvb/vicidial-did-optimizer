@@ -126,7 +126,6 @@ sudo chmod +x /usr/share/astguiclient/agi-bin/agi-did-optimizer*.agi
 
 # Copy configuration
 sudo cp dids.conf /etc/asterisk/
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
 ```
 
@@ -263,7 +262,6 @@ sudo nano /etc/asterisk/dids.conf
 **❌ "Permission denied"**
 ```bash
 # Solution: Fix file permissions
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
 sudo chmod +x /usr/share/astguiclient/agi-bin/agi-did-optimizer*.agi
 ```

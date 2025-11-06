@@ -16,7 +16,6 @@
 # Installation:
 # 1. Place this script in /usr/share/astguiclient/
 # 2. Create configuration file: /etc/asterisk/dids.conf
-# 3. Set proper permissions: chown asterisk:asterisk /etc/asterisk/dids.conf
 # 4. Set secure permissions: chmod 600 /etc/asterisk/dids.conf
 # 5. Make executable: chmod +x vicidial-did-optimizer.pl
 # 6. Test with: perl vicidial-did-optimizer.pl --test
@@ -686,7 +685,6 @@ sub run_tests {
     print "1. Edit configuration: vi $CONFIG_FILE\n";
     print "2. View current config: $0 --config\n";
     print "3. Test after changes: $0 --test\n";
-    print "4. Secure the file: chown asterisk:asterisk $CONFIG_FILE && chmod 600 $CONFIG_FILE\n";
 }
 
 sub print_help {
@@ -725,7 +723,6 @@ EXAMPLES:
 CONFIGURATION FILE SETUP:
     1. Copy sample config: cp dids.conf $CONFIG_FILE
     2. Edit settings: vi $CONFIG_FILE
-    3. Set secure permissions: chown asterisk:asterisk $CONFIG_FILE
     4. Restrict access: chmod 600 $CONFIG_FILE
     5. Test configuration: $0 --test
 

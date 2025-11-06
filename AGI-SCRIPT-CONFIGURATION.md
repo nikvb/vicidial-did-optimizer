@@ -518,7 +518,6 @@ echo "Calls Per Minute: $CPM"
 ```bash
 # Set restrictive permissions
 sudo chmod 640 /etc/asterisk/dids.conf
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 
 # Encrypt sensitive data (optional)
 openssl enc -aes-256-cbc -salt -in dids.conf -out dids.conf.enc

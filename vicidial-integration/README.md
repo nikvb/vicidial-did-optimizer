@@ -37,7 +37,6 @@ sudo ./install-vicidial-integration-autodetect.sh
 1. **Copy configuration file:**
 ```bash
 sudo cp dids.conf /etc/asterisk/
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
 ```
 
@@ -57,7 +56,6 @@ AGI_DIR=/var/lib/asterisk/agi-bin
 sudo cp agi-did-optimizer-autodetect.agi $AGI_DIR/agi-did-optimizer.agi
 sudo cp agi-did-optimizer-report.agi $AGI_DIR/
 sudo cp did-optimizer-quick.pl $AGI_DIR/
-sudo chown asterisk:asterisk $AGI_DIR/agi-did-optimizer*.agi
 sudo chmod +x $AGI_DIR/agi-did-optimizer*.agi
 ```
 

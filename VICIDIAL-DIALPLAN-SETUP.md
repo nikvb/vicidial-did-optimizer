@@ -164,11 +164,9 @@ sub log_message {
 sudo chmod +x /usr/share/astguiclient/vicidial-did-optimizer.agi
 
 # Set ownership
-sudo chown asterisk:asterisk /usr/share/astguiclient/vicidial-did-optimizer.agi
 
 # Create log file
 sudo touch /var/log/astguiclient/did-optimizer.log
-sudo chown asterisk:asterisk /var/log/astguiclient/did-optimizer.log
 ```
 
 ## Step 3: Configure Dialplan Context

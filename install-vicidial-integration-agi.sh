@@ -54,7 +54,6 @@ fi
 # Check if AGI directory exists
 if [ ! -d "$AGI_DIR" ]; then
     mkdir -p "$AGI_DIR"
-    chown asterisk:asterisk "$AGI_DIR"
     echo -e "${YELLOW}ℹ️  Created AGI directory: $AGI_DIR${NC}"
 fi
 
@@ -88,7 +87,6 @@ fi
 
 # Copy configuration file
 cp "$SCRIPT_DIR/dids.conf" "$ASTERISK_DIR/"
-chown asterisk:asterisk "$ASTERISK_DIR/dids.conf"
 chmod 600 "$ASTERISK_DIR/dids.conf"
 
 echo -e "${GREEN}✅ Configuration file installed: $ASTERISK_DIR/dids.conf${NC}"
@@ -104,7 +102,6 @@ fi
 
 # Copy script
 cp "$SCRIPT_DIR/vicidial-did-optimizer-config.pl" "$VICIDIAL_DIR/"
-chown asterisk:asterisk "$VICIDIAL_DIR/vicidial-did-optimizer-config.pl"
 chmod +x "$VICIDIAL_DIR/vicidial-did-optimizer-config.pl"
 
 echo -e "${GREEN}✅ DID optimizer script installed: $VICIDIAL_DIR/vicidial-did-optimizer-config.pl${NC}"
@@ -114,17 +111,14 @@ echo -e "\n${YELLOW}4. Installing AGI scripts...${NC}"
 
 # Install main AGI script
 cp "$SCRIPT_DIR/agi-did-optimizer.agi" "$AGI_DIR/"
-chown asterisk:asterisk "$AGI_DIR/agi-did-optimizer.agi"
 chmod +x "$AGI_DIR/agi-did-optimizer.agi"
 
 # Install reporting AGI script
 cp "$SCRIPT_DIR/agi-did-optimizer-report.agi" "$AGI_DIR/"
-chown asterisk:asterisk "$AGI_DIR/agi-did-optimizer-report.agi"
 chmod +x "$AGI_DIR/agi-did-optimizer-report.agi"
 
 # Install quick inline script
 cp "$SCRIPT_DIR/did-optimizer-quick.pl" "$AGI_DIR/"
-chown asterisk:asterisk "$AGI_DIR/did-optimizer-quick.pl"
 chmod +x "$AGI_DIR/did-optimizer-quick.pl"
 
 echo -e "${GREEN}✅ AGI scripts installed in: $AGI_DIR${NC}"
@@ -133,7 +127,6 @@ echo -e "${GREEN}✅ AGI scripts installed in: $AGI_DIR${NC}"
 echo -e "\n${YELLOW}5. Setting up logging...${NC}"
 
 mkdir -p "$LOG_DIR"
-chown asterisk:asterisk "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
 echo -e "${GREEN}✅ Log directory created: $LOG_DIR${NC}"

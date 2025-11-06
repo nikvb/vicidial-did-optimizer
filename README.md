@@ -159,7 +159,6 @@ The installer automatically handles this, or manually:
 ```bash
 # Copy configuration
 sudo cp dids.conf /etc/asterisk/
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
 
 # Copy integration script
@@ -291,7 +290,6 @@ sudo nano /etc/asterisk/dids.conf
 **❌ "Permission denied"**
 ```bash
 # Solution: Fix file permissions
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
 ```
 

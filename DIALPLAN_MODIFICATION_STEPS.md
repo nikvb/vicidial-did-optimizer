@@ -202,7 +202,6 @@ tail -f /var/log/astguiclient/did_optimizer.log
 
 ### "Permission denied" on script
 ```bash
-sudo chown asterisk:asterisk /usr/share/astguiclient/vicidial-did-optimizer-config.pl
 sudo chmod +x /usr/share/astguiclient/vicidial-did-optimizer-config.pl
 ```
 

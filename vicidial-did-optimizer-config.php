@@ -15,7 +15,6 @@
  * Installation:
  * 1. Place this script in your web server directory
  * 2. Create configuration file: /etc/asterisk/dids.conf
- * 3. Set proper permissions: chown asterisk:asterisk /etc/asterisk/dids.conf
  * 4. Set secure permissions: chmod 600 /etc/asterisk/dids.conf
  * 5. Test with: php vicidial-did-optimizer-config.php test
  */
@@ -638,7 +637,6 @@ class DIDOptimizerConfig {
         echo "1. Edit configuration: vi {$this->config_file}\n";
         echo "2. View current config: php {$_SERVER['PHP_SELF']} config\n";
         echo "3. Test after changes: php {$_SERVER['PHP_SELF']} test\n";
-        echo "4. Secure the file: chown asterisk:asterisk {$this->config_file} && chmod 600 {$this->config_file}\n";
     }
 }
 

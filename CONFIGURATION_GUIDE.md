@@ -76,7 +76,6 @@ cache_ttl=300
 
 **Permissions**:
 ```bash
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
 ```
 
@@ -151,7 +150,6 @@ debug=1
 
 **Step 3: Set Permissions**
 ```bash
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
 ```
 
@@ -316,7 +314,6 @@ perl process-call-results.pl
 ```bash
 sudo chmod 644 /etc/astguiclient.conf
 sudo chmod 600 /etc/asterisk/dids.conf
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 ```
 
 ### Problem: Script reads wrong database
@@ -375,7 +372,6 @@ sudo chown root:root /etc/astguiclient.conf
 
 # dids.conf - readable only by asterisk user (contains API key)
 sudo chmod 600 /etc/asterisk/dids.conf
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 ```
 
 ### API Key Security

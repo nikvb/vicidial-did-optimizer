@@ -155,7 +155,6 @@ sudo vi /etc/asterisk/dids.conf
 # Add api_base_url, api_key, fallback_did, db_* settings
 
 # Set permissions
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
 
 # Test

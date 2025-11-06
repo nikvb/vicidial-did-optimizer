@@ -77,7 +77,6 @@ fi
 
 # Copy configuration file
 cp "$SCRIPT_DIR/dids.conf" "$ASTERISK_DIR/"
-chown asterisk:asterisk "$ASTERISK_DIR/dids.conf"
 chmod 600 "$ASTERISK_DIR/dids.conf"
 
 echo -e "${GREEN}✅ Configuration file installed: $ASTERISK_DIR/dids.conf${NC}"
@@ -93,7 +92,6 @@ fi
 
 # Copy script
 cp "$SCRIPT_DIR/vicidial-did-optimizer-config.pl" "$VICIDIAL_DIR/"
-chown asterisk:asterisk "$VICIDIAL_DIR/vicidial-did-optimizer-config.pl"
 chmod +x "$VICIDIAL_DIR/vicidial-did-optimizer-config.pl"
 
 echo -e "${GREEN}✅ DID optimizer script installed: $VICIDIAL_DIR/vicidial-did-optimizer-config.pl${NC}"
@@ -102,7 +100,6 @@ echo -e "${GREEN}✅ DID optimizer script installed: $VICIDIAL_DIR/vicidial-did-
 echo -e "\n${YELLOW}4. Setting up logging...${NC}"
 
 mkdir -p "$LOG_DIR"
-chown asterisk:asterisk "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
 echo -e "${GREEN}✅ Log directory created: $LOG_DIR${NC}"

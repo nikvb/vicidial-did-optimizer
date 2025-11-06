@@ -363,7 +363,6 @@ router.get('/generate-config', async (req, res) => {
 # Make sure this file is readable only by asterisk user for security
 #
 # Recommended permissions:
-# chown asterisk:asterisk /etc/asterisk/dids.conf
 # chmod 600 /etc/asterisk/dids.conf
 
 [general]

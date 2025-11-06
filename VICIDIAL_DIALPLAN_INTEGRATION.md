@@ -213,7 +213,6 @@ echo "DID_OPTIMIZER: Selected $SELECTED_DID for $PHONE_NUMBER"
 ```bash
 # Copy configuration file
 sudo cp dids.conf /etc/asterisk/
-sudo chown asterisk:asterisk /etc/asterisk/dids.conf
 sudo chmod 600 /etc/asterisk/dids.conf
 
 # Copy integration script
@@ -222,7 +221,6 @@ sudo chmod +x /usr/share/astguiclient/vicidial-did-optimizer-config.pl
 
 # Create log directory
 sudo mkdir -p /var/log/astguiclient
-sudo chown asterisk:asterisk /var/log/astguiclient
 ```
 
 ### 2. Install Dependencies
