@@ -84,40 +84,30 @@ The install script will:
 - ✓ Create log directory
 - ✓ Verify installation
 
-### Step 6: Configure Dialplan Integration (2 minutes)
+### Step 6: Generate Modified Dialplan (2 minutes)
 
-Instead of manually editing dialplan files, use the DID Optimizer web interface to generate the modified dialplan:
+Use the DID Optimizer web interface to automatically generate your modified dialplan:
 
-1. Go to **Settings → VICIdial Integration** at https://dids.amdy.io
-2. In the **Dialplan Generator** section:
-   - Paste your existing carrier dialplan entry (from VICIdial Admin → Carriers)
-   - Click **Generate Modified Dialplan**
-   - Copy the generated dialplan with DID Optimizer integration
-3. In VICIdial Admin:
-   - Go to **Admin → Carriers**
+1. **In VICIdial Admin**, go to **Admin → Carriers**
    - Select your carrier
-   - Paste the generated dialplan into the **Dialplan Entry** field
+   - Copy the entire **Dialplan Entry** content
+
+2. **In DID Optimizer** at https://dids.amdy.io:
+   - Go to **Settings → VICIdial Integration**
+   - Scroll to **Step 2: Generate Modified Dialplan**
+   - Paste your carrier's dialplan into the text area
+   - Click **Generate Modified Dialplan**
+
+3. **Copy the Generated Dialplan**:
+   - The generator automatically inserts DID Optimizer AGI calls
+   - Click the **Copy** button to copy the modified dialplan
+
+4. **Update Your Carrier in VICIdial**:
+   - Go back to **VICIdial Admin → Carriers**
+   - Replace the **Dialplan Entry** with the generated version
    - Click **Submit**
 
-**Example:** If your current carrier dialplan is:
-```asterisk
-exten => _91NXXNXXXXXX,1,AGI(agi://127.0.0.1:4577/call_log)
-exten => _91NXXNXXXXXX,n,Dial(SIP/mycarrier/${EXTEN:1},60,tTo)
-exten => _91NXXNXXXXXX,n,Hangup
-```
-
-The generator will produce:
-```asterisk
-exten => _91NXXNXXXXXX,1,NoOp(DID Optimizer: ${EXTEN})
-exten => _91NXXNXXXXXX,n,Set(CUSTOMER_PHONE=${EXTEN:1})
-exten => _91NXXNXXXXXX,n,AGI(vicidial-did-optimizer.agi)
-exten => _91NXXNXXXXXX,n,Set(CALLERID(num)=${OPTIMIZER_DID})
-exten => _91NXXNXXXXXX,n,AGI(agi://127.0.0.1:4577/call_log)
-exten => _91NXXNXXXXXX,n,Dial(SIP/mycarrier/${EXTEN:1},60,tTo)
-exten => _91NXXNXXXXXX,n,Hangup
-```
-
-> **Note**: The generator automatically inserts the DID Optimizer AGI script before your existing call logging and dial commands, preserving all your VICIdial functionality.
+> **Important**: The generator preserves all your existing VICIdial functionality (call logging, dial commands, etc.) and intelligently inserts the DID Optimizer AGI script at the correct position.
 
 ### Step 7: Apply Changes (1 minute)
 
