@@ -721,6 +721,10 @@ app.post('/api/v1/calls/report', validateApiKey, async (req, res) => {
 
 // VICIdial Call Results Sync endpoint (from vicidial_log polling)
 app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
+  const requestStart = Date.now();
+  console.log('📞 [CALL-RESULTS] Incoming request from:', req.ip);
+  console.log('📞 [CALL-RESULTS] Tenant:', req.tenant?.name || req.tenant?._id);
+
   try {
     const {
       uniqueid,
@@ -742,6 +746,8 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
       endEpoch,
       timestamp
     } = req.body;
+
+    console.log('📞 [CALL-RESULTS] Data:', { uniqueid, campaignId, phoneNumber, disposition });
 
     // Validate required fields
     if (!uniqueid || !phoneNumber || !campaignId) {
@@ -829,6 +835,9 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
       }
     });
 
+    const elapsed = Date.now() - requestStart;
+    console.log(`✅ [CALL-RESULTS] Success in ${elapsed}ms - Record ${callRecord._id}`);
+
     res.json({
       success: true,
       message: 'Call result recorded',
@@ -840,7 +849,11 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('💥 Call results sync error:', error);
+    const elapsed = Date.now() - requestStart;
+    console.error(`💥 [CALL-RESULTS] Error after ${elapsed}ms:`, error.message);
+    console.error('💥 [CALL-RESULTS] Stack:', error.stack);
+    console.error('💥 [CALL-RESULTS] Request body:', JSON.stringify(req.body, null, 2));
+
     res.status(500).json({
       success: false,
       error: error.message

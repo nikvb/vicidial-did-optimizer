@@ -296,17 +296,29 @@ sub send_call_result_to_api {
     $ua->timeout(10);
 
     my $json = encode_json($payload);
+    my $url = "$API_URL/api/v1/call-results";
+
+    # Log the request details
+    log_message("📤 POST $url");
+    log_message("   Uniqueid: $call->{uniqueid}, Campaign: $call->{campaign_id}, Phone: $call->{phone_number}");
 
     my $response = $ua->post(
-        "$API_URL/api/v1/call-results",
+        $url,
         'Content-Type'  => 'application/json',
         'x-api-key'     => $API_KEY,
         'Content'       => $json
     );
 
+    # Log response details
+    my $status_code = $response->code;
+    log_message("📥 Response: $status_code " . $response->status_line);
+
     if ($response->is_success) {
         return decode_json($response->decoded_content);
     } else {
+        # Log response body for debugging
+        my $error_body = $response->decoded_content || 'No response body';
+        log_message("❌ Response body: $error_body");
         die "API request failed: " . $response->status_line;
     }
 }
