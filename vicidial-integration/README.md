@@ -13,10 +13,23 @@ Complete VICIdial integration using AGI-based approach with web-based setup tool
   - Comprehensive logging and error handling
   - File-based caching for performance
 
-### Installation Script
-- **`install-agi.sh`** - Automated installation script
+### Call Results Sync
+- **`process-call-results.pl`** - Syncs VICIdial call outcomes to DID Optimizer
+  - Polls `vicidial_log` table every minute
+  - Reports call results (answered, busy, no-answer, etc.)
+  - Tracks call duration and disposition
+  - Used for AI training and performance analytics
+  - Auto-configured from VICIdial database
+- **`install-call-results-sync.sh`** - One-line installer for call results sync
+  - Downloads and installs sync script
+  - Configures cron job (runs every minute)
+  - Sets up logging
+  - Verifies dependencies
+
+### Installation Scripts
+- **`install-agi.sh`** - AGI script installer (run this first)
   - Checks VICIdial environment
-  - Installs required Perl modules (LWP::UserAgent, JSON, URI::Escape, Cache::FileCache, Asterisk::AGI)
+  - Installs required Perl modules
   - Downloads and installs AGI script
   - Sets proper permissions (755 for scripts, 600 for configs)
   - Creates log directory
@@ -92,6 +105,31 @@ Complete VICIdial integration using AGI-based approach with web-based setup tool
    tail -f /var/log/astguiclient/did-optimizer.log
    ```
    - Check DID Optimizer dashboard for call records
+
+7. **Install Call Results Sync (Optional - Recommended)** (2 minutes)
+
+   **IMPORTANT: This syncs VICIdial call outcomes back to DID Optimizer for AI training and performance analytics.**
+
+   One-line installer:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/install-call-results-sync.sh | sudo bash
+   ```
+
+   **What it does**:
+   - Installs Perl dependencies (DBI, DBD::mysql, LWP::UserAgent, JSON)
+   - Downloads and installs `process-call-results.pl`
+   - Creates cron job to sync call results every minute
+   - Automatically reads config from `/etc/asterisk/dids.conf`
+   - Logs to `/var/log/did-optimizer-sync.log`
+
+   **Monitor sync**:
+   ```bash
+   # View real-time sync logs
+   tail -f /var/log/did-optimizer-sync.log
+
+   # Check recent syncs
+   grep 'Summary:' /var/log/did-optimizer-sync.log | tail -5
+   ```
 
 ### Method 2: Command Line Installation (Advanced)
 
@@ -316,6 +354,44 @@ cat /etc/astguiclient.conf | grep VARDB
 mysql -h localhost -u cron -p1234 asterisk -e "SELECT COUNT(*) FROM vicidial_list LIMIT 1"
 ```
 
+### Call Results Sync Not Working
+
+**Check if sync is installed:**
+```bash
+ls -la /usr/local/bin/did-optimizer/process-call-results.pl
+crontab -l | grep process-call-results
+```
+
+**Monitor sync activity:**
+```bash
+# View real-time logs
+tail -f /var/log/did-optimizer-sync.log
+
+# Check recent syncs
+grep 'Summary:' /var/log/did-optimizer-sync.log | tail -10
+
+# Check for errors
+grep 'ERROR\|Failed\|failed' /var/log/did-optimizer-sync.log
+```
+
+**Verify API configuration:**
+```bash
+grep 'api_key' /etc/asterisk/dids.conf
+# Should NOT show: api_key=YOUR_API_KEY_HERE
+```
+
+**Manual test:**
+```bash
+# Run sync manually to see output
+sudo perl /usr/local/bin/did-optimizer/process-call-results.pl
+```
+
+**Common issues:**
+- API key not configured in `/etc/asterisk/dids.conf`
+- VICIdial database credentials incorrect
+- Perl modules missing (DBI, DBD::mysql, LWP::UserAgent, JSON)
+- Network connectivity to DID Optimizer API
+
 ## 📝 File Locations
 
 After installation, files will be located at:
@@ -324,6 +400,12 @@ After installation, files will be located at:
 - **Configuration**: `/etc/asterisk/dids.conf`
 - **Logs**: `/var/log/astguiclient/did-optimizer.log`
 - **Cache**: `/tmp/did_optimizer/` (auto-created)
+
+**Call Results Sync (if installed):**
+- **Sync Script**: `/usr/local/bin/did-optimizer/process-call-results.pl`
+- **Sync Logs**: `/var/log/did-optimizer-sync.log`
+- **State File**: `/tmp/did-optimizer-last-check.txt`
+- **Cron Job**: Runs every minute via root crontab
 
 ## ✅ Verification Checklist
 
@@ -342,6 +424,11 @@ Installation complete when:
 - [ ] Test call completed successfully
 - [ ] Logs showing DID selection activity
 - [ ] Dashboard showing call records
+
+**Optional (but recommended):**
+- [ ] Call results sync installed (`install-call-results-sync.sh`)
+- [ ] Cron job running every minute
+- [ ] Sync logs showing successful uploads (`/var/log/did-optimizer-sync.log`)
 
 ## 🎯 Advanced Configuration
 
