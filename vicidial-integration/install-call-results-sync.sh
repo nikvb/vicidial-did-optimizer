@@ -26,12 +26,12 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-INSTALL_DIR="/usr/local/bin/did-optimizer"
-SCRIPT_NAME="process-call-results.pl"
+INSTALL_DIR="/usr/share/astguiclient/bin"
+SCRIPT_NAME="AST_DID_optimizer_sync.pl"
 SCRIPT_PATH="$INSTALL_DIR/$SCRIPT_NAME"
-LOG_FILE="/var/log/did-optimizer-sync.log"
+LOG_FILE="/var/log/astguiclient/did-optimizer-sync.log"
 LAST_CHECK_FILE="/tmp/did-optimizer-last-check.txt"
-REPO_BASE="https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main"
+REPO_BASE="https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration"
 CONFIG_FILE="/etc/asterisk/dids.conf"
 
 ################################################################################
@@ -153,17 +153,21 @@ install_perl_modules() {
 download_script() {
     print_info "Downloading call results sync script..."
 
-    # Create install directory
-    mkdir -p "$INSTALL_DIR"
+    # Verify VICIdial bin directory exists
+    if [ ! -d "$INSTALL_DIR" ]; then
+        print_error "VICIdial bin directory not found: $INSTALL_DIR"
+        print_info "Please ensure VICIdial is properly installed"
+        return 1
+    fi
 
     # Download the Perl script
     if command -v curl &> /dev/null; then
-        curl -fsSL "$REPO_BASE/process-call-results.pl" -o "$SCRIPT_PATH" || {
+        curl -fsSL "$REPO_BASE/AST_DID_optimizer_sync.pl" -o "$SCRIPT_PATH" || {
             print_error "Failed to download script"
             return 1
         }
     elif command -v wget &> /dev/null; then
-        wget -q "$REPO_BASE/process-call-results.pl" -O "$SCRIPT_PATH" || {
+        wget -q "$REPO_BASE/AST_DID_optimizer_sync.pl" -O "$SCRIPT_PATH" || {
             print_error "Failed to download script"
             return 1
         }
@@ -172,12 +176,20 @@ download_script() {
         return 1
     fi
 
-    chmod +x "$SCRIPT_PATH"
-    print_step "Script downloaded and made executable"
+    chmod 755 "$SCRIPT_PATH"
+    print_step "Script downloaded to $SCRIPT_PATH and made executable"
 }
 
 setup_logging() {
     print_info "Setting up logging..."
+
+    # Ensure astguiclient log directory exists
+    LOG_DIR=$(dirname "$LOG_FILE")
+    if [ ! -d "$LOG_DIR" ]; then
+        mkdir -p "$LOG_DIR"
+        chmod 755 "$LOG_DIR"
+        print_step "Created log directory: $LOG_DIR"
+    fi
 
     # Create log file
     touch "$LOG_FILE"

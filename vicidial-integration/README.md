@@ -14,16 +14,17 @@ Complete VICIdial integration using AGI-based approach with web-based setup tool
   - File-based caching for performance
 
 ### Call Results Sync
-- **`process-call-results.pl`** - Syncs VICIdial call outcomes to DID Optimizer
+- **`AST_DID_optimizer_sync.pl`** - Syncs VICIdial call outcomes to DID Optimizer
   - Polls `vicidial_log` table every minute
   - Reports call results (answered, busy, no-answer, etc.)
   - Tracks call duration and disposition
   - Used for AI training and performance analytics
   - Auto-configured from VICIdial database
+  - Installs to `/usr/share/astguiclient/bin/` (standard VICIdial location)
 - **`install-call-results-sync.sh`** - One-line installer for call results sync
-  - Downloads and installs sync script
+  - Downloads and installs sync script to VICIdial bin directory
   - Configures cron job (runs every minute)
-  - Sets up logging
+  - Sets up logging in `/var/log/astguiclient/`
   - Verifies dependencies
 
 ### Installation Scripts
@@ -117,18 +118,18 @@ Complete VICIdial integration using AGI-based approach with web-based setup tool
 
    **What it does**:
    - Installs Perl dependencies (DBI, DBD::mysql, LWP::UserAgent, JSON)
-   - Downloads and installs `process-call-results.pl`
+   - Downloads and installs `AST_DID_optimizer_sync.pl` to `/usr/share/astguiclient/bin/`
    - Creates cron job to sync call results every minute
    - Automatically reads config from `/etc/asterisk/dids.conf`
-   - Logs to `/var/log/did-optimizer-sync.log`
+   - Logs to `/var/log/astguiclient/did-optimizer-sync.log`
 
    **Monitor sync**:
    ```bash
    # View real-time sync logs
-   tail -f /var/log/did-optimizer-sync.log
+   tail -f /var/log/astguiclient/did-optimizer-sync.log
 
    # Check recent syncs
-   grep 'Summary:' /var/log/did-optimizer-sync.log | tail -5
+   grep 'Summary:' /var/log/astguiclient/did-optimizer-sync.log | tail -5
    ```
 
 ### Method 2: Command Line Installation (Advanced)
@@ -358,20 +359,20 @@ mysql -h localhost -u cron -p1234 asterisk -e "SELECT COUNT(*) FROM vicidial_lis
 
 **Check if sync is installed:**
 ```bash
-ls -la /usr/local/bin/did-optimizer/process-call-results.pl
-crontab -l | grep process-call-results
+ls -la /usr/share/astguiclient/bin/AST_DID_optimizer_sync.pl
+crontab -l | grep AST_DID_optimizer_sync
 ```
 
 **Monitor sync activity:**
 ```bash
 # View real-time logs
-tail -f /var/log/did-optimizer-sync.log
+tail -f /var/log/astguiclient/did-optimizer-sync.log
 
 # Check recent syncs
-grep 'Summary:' /var/log/did-optimizer-sync.log | tail -10
+grep 'Summary:' /var/log/astguiclient/did-optimizer-sync.log | tail -10
 
 # Check for errors
-grep 'ERROR\|Failed\|failed' /var/log/did-optimizer-sync.log
+grep 'ERROR\|Failed\|failed' /var/log/astguiclient/did-optimizer-sync.log
 ```
 
 **Verify API configuration:**
@@ -383,7 +384,7 @@ grep 'api_key' /etc/asterisk/dids.conf
 **Manual test:**
 ```bash
 # Run sync manually to see output
-sudo perl /usr/local/bin/did-optimizer/process-call-results.pl
+sudo perl /usr/share/astguiclient/bin/AST_DID_optimizer_sync.pl
 ```
 
 **Common issues:**
@@ -402,8 +403,8 @@ After installation, files will be located at:
 - **Cache**: `/tmp/did_optimizer/` (auto-created)
 
 **Call Results Sync (if installed):**
-- **Sync Script**: `/usr/local/bin/did-optimizer/process-call-results.pl`
-- **Sync Logs**: `/var/log/did-optimizer-sync.log`
+- **Sync Script**: `/usr/share/astguiclient/bin/AST_DID_optimizer_sync.pl`
+- **Sync Logs**: `/var/log/astguiclient/did-optimizer-sync.log`
 - **State File**: `/tmp/did-optimizer-last-check.txt`
 - **Cron Job**: Runs every minute via root crontab
 
@@ -427,8 +428,9 @@ Installation complete when:
 
 **Optional (but recommended):**
 - [ ] Call results sync installed (`install-call-results-sync.sh`)
+- [ ] Sync script located at `/usr/share/astguiclient/bin/AST_DID_optimizer_sync.pl`
 - [ ] Cron job running every minute
-- [ ] Sync logs showing successful uploads (`/var/log/did-optimizer-sync.log`)
+- [ ] Sync logs showing successful uploads (`/var/log/astguiclient/did-optimizer-sync.log`)
 
 ## 🎯 Advanced Configuration
 

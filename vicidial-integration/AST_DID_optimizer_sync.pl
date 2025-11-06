@@ -27,7 +27,7 @@ use POSIX qw(strftime);
 my $ASTGUICLIENT_CONF = '/etc/astguiclient.conf';
 my $DID_CONFIG_FILE = '/etc/asterisk/dids.conf';
 my $LAST_CHECK_FILE = '/tmp/did-optimizer-last-check.txt';
-my $LOG_FILE = '/var/log/did-optimizer-sync.log';
+my $LOG_FILE = '/var/log/astguiclient/did-optimizer-sync.log';
 my $BATCH_SIZE = 500;
 
 # Configuration hash (populated from config files)
