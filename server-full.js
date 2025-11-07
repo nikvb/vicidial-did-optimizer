@@ -549,7 +549,9 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
       console.error('❌ DID object:', JSON.stringify(did, null, 2));
     }
 
-    // Create call record for tracking
+    // Create call record for tracking (will be updated later with final disposition)
+    const uniqueid = req.headers['x-request-id'] || ''; // From AGI script
+
     const callRecord = new CallRecord({
       didId: did._id,
       tenantId: req.tenant._id,
@@ -564,12 +566,14 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
       customerAreaCode: customer_area_code,
       metadata: {
         callDirection: 'outbound',
-        recording: false
+        recording: false,
+        uniqueid: uniqueid, // Store uniqueid for matching with call results
+        source: 'did-selection'
       }
     });
     await callRecord.save();
 
-    console.log('📞 Call record created:', callRecord._id);
+    console.log('📞 Call record created:', callRecord._id, '| Uniqueid:', uniqueid, '| DID:', did.phoneNumber);
 
     console.log('✅ Rotation state updated:', {
       selectedDID: did.phoneNumber,
@@ -757,21 +761,6 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
       });
     }
 
-    // Check if this call result already exists (prevent duplicates)
-    const existingRecord = await CallRecord.findOne({
-      tenantId: req.tenant._id,
-      'metadata.uniqueid': uniqueid
-    });
-
-    if (existingRecord) {
-      return res.json({
-        success: true,
-        message: 'Call result already processed',
-        recordId: existingRecord._id,
-        duplicate: true
-      });
-    }
-
     // Determine call result status
     // Valid enum values: 'answered', 'busy', 'no_answer', 'failed', 'dropped'
     let result = 'failed'; // Default for unknown dispositions
@@ -791,23 +780,29 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
       result = 'no_answer';
     }
 
-    // Create call record
-    const callRecord = new CallRecord({
+    // Check if we have an initial CallRecord from DID selection (from AGI script)
+    let callRecord = await CallRecord.findOne({
       tenantId: req.tenant._id,
-      phoneNumber: phoneNumber,
-      callTimestamp: endEpoch ? new Date(endEpoch * 1000) : new Date(),
-      duration: duration || 0,
-      result: result,
-      disposition: disposition,
-      campaignId: campaignId,
-      metadata: {
-        callDirection: 'outbound',
-        recording: false,
-        uniqueid: uniqueid,
+      'metadata.uniqueid': uniqueid
+    });
+
+    if (callRecord) {
+      console.log(`🔄 [CALL-RESULTS] Updating existing CallRecord ${callRecord._id} with final results`);
+      console.log(`   DID: ${callRecord.didId} | Initial disposition: ${callRecord.disposition} → Final: ${disposition}`);
+
+      // Update existing record with final call results
+      callRecord.duration = duration || 0;
+      callRecord.result = result;
+      callRecord.disposition = disposition;
+      callRecord.callTimestamp = endEpoch ? new Date(endEpoch * 1000) : callRecord.callTimestamp;
+
+      // Merge metadata
+      callRecord.metadata = {
+        ...callRecord.metadata,
         leadId: leadId,
         listId: listId,
         phoneCode: phoneCode,
-        agentId: agentId,
+        agentId: agentId || callRecord.metadata?.agentId,
         userGroup: userGroup,
         termReason: termReason,
         comments: comments,
@@ -816,15 +811,52 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
         callDate: callDate,
         startEpoch: startEpoch,
         endEpoch: endEpoch,
-        source: 'vicidial-sync'
-      }
-    });
+        source: 'vicidial-sync-updated'
+      };
 
-    await callRecord.save();
+      await callRecord.save();
+      console.log(`✅ [CALL-RESULTS] Updated CallRecord with DID ${callRecord.didId}`);
+    } else {
+      console.log(`ℹ️  [CALL-RESULTS] No initial CallRecord found - creating new one (AGI may not have been used)`);
 
-    // Update DID statistics if we can find which DID was used
-    // Note: VICIdial doesn't store outbound DID in vicidial_log
-    // You may need to join with other tables or track separately
+      // Create new call record (happens when call wasn't made through our DID optimizer)
+      callRecord = new CallRecord({
+        tenantId: req.tenant._id,
+        phoneNumber: phoneNumber,
+        callTimestamp: endEpoch ? new Date(endEpoch * 1000) : new Date(),
+        duration: duration || 0,
+        result: result,
+        disposition: disposition,
+        campaignId: campaignId,
+        metadata: {
+          callDirection: 'outbound',
+          recording: false,
+          uniqueid: uniqueid,
+          leadId: leadId,
+          listId: listId,
+          phoneCode: phoneCode,
+          agentId: agentId,
+          userGroup: userGroup,
+          termReason: termReason,
+          comments: comments,
+          altDial: altDial,
+          calledCount: calledCount,
+          callDate: callDate,
+          startEpoch: startEpoch,
+          endEpoch: endEpoch,
+          source: 'vicidial-sync'
+        }
+      });
+
+      await callRecord.save();
+    }
+
+    // Update DID statistics if DID was tracked
+    if (callRecord.didId) {
+      console.log(`📊 [CALL-RESULTS] Updating DID statistics for ${callRecord.didId}`);
+      // DID stats are already updated in /api/v1/dids/next endpoint
+      // Could add additional outcome-based stats here if needed
+    }
 
     // Create audit log
     await AuditLog.create({
