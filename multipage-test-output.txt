@@ -1,0 +1,35 @@
+🔐 Step 1: Logging in...
+⏳ Waiting for dashboard...
+📋 Step 2: Navigating to DID Management...
+
+=== TEST 1: Basic Cross-Page Selection ===
+📝 Step 3: Selecting 5 DIDs on Page 1...
+  ✓ Selected DID 1
+  ✓ Selected DID 2
+  ✓ Selected DID 3
+  ✓ Selected DID 4
+  ✓ Selected DID 5
+✓ Page 1 selection count: DID Optimizer ProClient Dashboardtttest1 testCLIENT📊Dashboard📞DID Management📈Analytics⚙️Settings💳Billing🚪LogoutDID ManagementWelcome back, test1!CLIENTDID ManagementManage your phone numbers with real-time search and updatesAI AssistantExportBulk UploadAdd DIDRefresh5 DIDs selectedMark ActiveMark InactiveDeletePhone Number▲Status▲Reputation▲Location▲Total Calls▲Last Used▲Campaign+12067586737active100%Bainbridge IslandWashington196YesterdayDEFAULT+12096999876active100%AtwaterCalifornia198YesterdayDEFAULT+12188008459active100%AndoverMinnesota201YesterdayDEFAULT+12316000347active100%MuskegonMichigan194YesterdayDEFAULT+13164000084active100%WichitaKansas201YesterdayDEFAULT+13193368552active100%BurlingtonIowa201YesterdayDEFAULT+13393000128active100%ArlingtonMassachusetts202YesterdayDEFAULT+14065000060active50%BillingsMontana204YesterdayDEFAULT+16035000564active50%East ConcordNew Hampshire197YesterdayDEFAULT+16056000763active100%AberdeenSouth Dakota203YesterdayDEFAULTDIDs per page:51025501002505001-10 of 499Showing 1 to 10 of 499 DIDsAuto-refreshing every 30 seconds
+
+📄 Step 4: Navigating to Page 2...
+  ✓ Navigated to Page 2 using next button
+
+📊 Step 5: Checking if selections from Page 1 persist...
+❌ FAIL: Selections from Page 1 were LOST when navigating to Page 2
+
+📝 Step 6: Selecting 2 more DIDs on Page 2...
+  ✓ Selected DID 1 on Page 2
+  ✓ Selected DID 2 on Page 2
+✓ Total selections after Page 2: DID Optimizer ProClient Dashboardtttest1 testCLIENT📊Dashboard📞DID Management📈Analytics⚙️Settings💳Billing🚪LogoutDID ManagementWelcome back, test1!CLIENTDID ManagementManage your phone numbers with real-time search and updatesAI AssistantExportBulk UploadAdd DIDRefresh2 DIDs selectedMark ActiveMark InactiveDeletePhone Number▲Status▲Reputation▲Location▲Total Calls▲Last Used▲Campaign+12135444103active35%Los AngelesCalifornia0NeverN/A+12135444485active40%Los AngelesCalifornia0NeverN/A+12243426330active35%AlgonquinIllinois0NeverN/A+12243426660inactive100%AlgonquinIllinois0NeverN/A+12293486405active35%AlbanyGeorgia0NeverN/A+12392596041active50%Bonita SpringsFlorida0NeverN/A+13024888019active40%DoverDelaware0NeverN/A+13193368515active35%BurlingtonIowa0NeverN/A+14065000103active35%BillingsMontana0NeverN/ADIDs per page:5102550100250500491-499 of 499Showing 491 to 499 of 499 DIDsAuto-refreshing every 30 seconds
+
+📄 Step 7: Navigating back to Page 1...
+  ✓ Navigated back to Page 1
+
+✓ Step 8: Verifying Page 1 checkboxes...
+  Found 0 checked boxes on Page 1
+❌ FAIL: Expected 5 checked boxes, found 0
+
+❌ Test execution failed: locator.textContent: Timeout 30000ms exceeded.
+Call log:
+[2m  - waiting for locator('div:has-text("selected")').filter({ hasText: /\d+.*DID/ }).first()[22m
+

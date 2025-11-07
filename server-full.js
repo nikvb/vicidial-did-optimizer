@@ -773,17 +773,22 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
     }
 
     // Determine call result status
-    let result = 'completed';
+    // Valid enum values: 'answered', 'busy', 'no_answer', 'failed', 'dropped'
+    let result = 'failed'; // Default for unknown dispositions
+
+    // VICIdial disposition mapping
     if (disposition === 'SALE' || disposition === 'A') {
       result = 'answered';
-    } else if (disposition === 'DNC' || disposition === 'B') {
-      result = 'dnc';
+    } else if (disposition === 'DNC' || disposition === 'B' || disposition === 'CB') {
+      result = 'no_answer'; // DNC/Callback treated as no answer
     } else if (disposition === 'NA' || disposition === 'NO') {
       result = 'no_answer';
     } else if (disposition === 'BUSY') {
       result = 'busy';
     } else if (disposition === 'DROP' || disposition === 'AMD') {
       result = 'dropped';
+    } else if (disposition === 'N' || disposition === 'NI') {
+      result = 'no_answer';
     }
 
     // Create call record

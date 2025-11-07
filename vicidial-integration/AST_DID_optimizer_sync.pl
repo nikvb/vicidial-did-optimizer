@@ -223,6 +223,7 @@ sub fetch_new_call_results {
     # CRITICAL: Use PRIMARY KEY (uniqueid) instead of sorting by end_epoch
     # This query is INSTANT (uses primary key index) vs 20+ seconds with ORDER BY end_epoch
     # Pattern confirmed fast by user: "SELECT * FROM vicidial_log ORDER BY uniqueid DESC LIMIT 600"
+    # Added call_date >= CURDATE() to limit to today's calls only
     my $sql;
     if ($last_uniqueid) {
         # Continue from last processed uniqueid (uses PRIMARY KEY)
@@ -248,6 +249,7 @@ SELECT
     called_count
 FROM vicidial_log
 WHERE uniqueid > ?
+    AND call_date >= CURDATE()
     AND status != ''
     AND status IS NOT NULL
     AND length_in_sec > 0
@@ -255,7 +257,7 @@ ORDER BY uniqueid ASC
 LIMIT ?
 SQL
     } else {
-        # First run - get oldest records (no WHERE needed)
+        # First run - get today's oldest records
         $sql = <<'SQL';
 SELECT
     uniqueid,
@@ -277,7 +279,8 @@ SELECT
     alt_dial,
     called_count
 FROM vicidial_log
-WHERE status != ''
+WHERE call_date >= CURDATE()
+    AND status != ''
     AND status IS NOT NULL
     AND length_in_sec > 0
 ORDER BY uniqueid ASC
