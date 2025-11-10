@@ -144,38 +144,59 @@ if [ ! -d "$ASTERISK_DIR" ]; then
     exit 1
 fi
 
-# Check required files
-REQUIRED_FILES=(
-    "dids.conf"
-    "vicidial-did-optimizer-config.pl"
-    "vicidial-dialplan-agi.conf"
-    "agi-did-optimizer-autodetect.agi"
-    "agi-did-optimizer-report.agi"
-    "did-optimizer-quick.pl"
-)
+# GitHub raw URL base
+GITHUB_BASE="https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration"
 
-# Check for auto-detect version first, fallback to standard
-if [ -f "$SCRIPT_DIR/agi-did-optimizer-autodetect.agi" ]; then
-    AGI_MAIN_SCRIPT="agi-did-optimizer-autodetect.agi"
-else
-    AGI_MAIN_SCRIPT="agi-did-optimizer.agi"
+# Function to download file from GitHub
+download_from_github() {
+    local file=$1
+    local subdir=$2
+    local url="${GITHUB_BASE}/${subdir}/${file}"
+
+    echo -e "${YELLOW}   Downloading $file from GitHub...${NC}"
+    if curl -fsSL "$url" -o "$SCRIPT_DIR/$file"; then
+        echo -e "${GREEN}   ✓ Downloaded $file${NC}"
+        return 0
+    else
+        echo -e "${RED}   ✗ Failed to download $file${NC}"
+        return 1
+    fi
+}
+
+# Check and download required files
+echo -e "${YELLOW}Checking/downloading required files...${NC}"
+
+# Config files
+if [ ! -f "$SCRIPT_DIR/dids.conf" ]; then
+    download_from_github "dids.conf" "config" || exit 1
 fi
 
-for file in "${REQUIRED_FILES[@]}"; do
-    if [ "$file" = "agi-did-optimizer-autodetect.agi" ] && [ ! -f "$SCRIPT_DIR/$file" ]; then
-        # Check for standard version as fallback
-        if [ -f "$SCRIPT_DIR/agi-did-optimizer.agi" ]; then
-            continue
-        fi
-    fi
+if [ ! -f "$SCRIPT_DIR/vicidial-dialplan-agi.conf" ]; then
+    download_from_github "vicidial-dialplan-agi.conf" "config" || exit 1
+fi
 
-    if [ ! -f "$SCRIPT_DIR/$file" ]; then
-        echo -e "${RED}❌ Required file not found: $file${NC}"
-        exit 1
-    fi
-done
+# AGI scripts
+if [ ! -f "$SCRIPT_DIR/agi-did-optimizer-autodetect.agi" ]; then
+    download_from_github "agi-did-optimizer-autodetect.agi" "agi" || exit 1
+fi
 
-echo -e "${GREEN}✅ Prerequisites check passed${NC}"
+if [ ! -f "$SCRIPT_DIR/agi-did-optimizer-report.agi" ]; then
+    download_from_github "agi-did-optimizer-report.agi" "agi" || exit 1
+fi
+
+if [ ! -f "$SCRIPT_DIR/agi-did-optimizer.agi" ]; then
+    download_from_github "agi-did-optimizer.agi" "agi" || exit 1
+fi
+
+# Perl scripts
+if [ ! -f "$SCRIPT_DIR/vicidial-did-optimizer-config.pl" ]; then
+    download_from_github "vicidial-did-optimizer-config.pl" "scripts" || exit 1
+fi
+
+# Set main AGI script
+AGI_MAIN_SCRIPT="agi-did-optimizer-autodetect.agi"
+
+echo -e "${GREEN}✅ All required files available${NC}"
 
 # Step 4: Create/Update configuration file
 echo -e "\n${YELLOW}4. Installing configuration file...${NC}"
