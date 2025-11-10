@@ -1,94 +1,132 @@
 # CentOS 7 Installation Guide - VICIdial DID Optimizer
 
-Complete installation guide for CentOS 7 systems.
+Complete installation guide for CentOS 7 systems using **100% CPAN-based installation** (no yum/dnf required for Perl modules).
+
+## Why CPAN-Only Installation?
+
+**CentOS 7 reached End of Life on June 30, 2024.**
+
+Benefits of our CPAN-only approach:
+- ✅ No dependency on EOL CentOS 7 repositories
+- ✅ Latest stable Perl modules (not 5+ year old yum packages)
+- ✅ Works even when vault.centos.org is slow/unreachable
+- ✅ Simpler installation process
+- ✅ No repository configuration needed
+
+**Example Version Comparison:**
+| Module | CentOS 7 yum | CPAN |
+|--------|--------------|------|
+| LWP::UserAgent | 6.06 (2014) | 6.77 (2024) |
+| IO::Socket::SSL | 1.94 (2015) | 2.089 (2024) |
+| DBD::mysql | 4.023 (2013) | 5.008 (2024) |
 
 ## Prerequisites
 
-### 1. System Requirements
-- CentOS 7.x
+### System Requirements
+- CentOS 7.x or RHEL 7.x
 - Root or sudo access
 - Active internet connection
 - VICIdial already installed
 - Asterisk already installed
 
-### 2. EPEL Repository (Required)
+### Required Build Tools
 
-Most Perl modules require the EPEL repository:
-
-```bash
-# Install EPEL repository
-sudo yum install -y epel-release
-
-# Update package cache
-sudo yum update
-```
-
-## Required Packages for CentOS 7
-
-### Core System Packages
+**IMPORTANT:** The following build tools must be installed via yum (one-time setup):
 
 ```bash
-# Install core Perl and development tools
-sudo yum install -y \
-    perl \
-    perl-core \
-    perl-CPAN \
-    perl-devel \
-    gcc \
-    make \
-    openssl \
-    openssl-devel
+# Install build essentials (required for compiling Perl modules)
+sudo yum install -y gcc make perl openssl openssl-devel
 ```
 
-### Perl Modules via YUM
+**Why these are needed:**
+- `gcc` - Compiles XS (C-based) Perl modules
+- `make` - Builds module makefiles
+- `perl` - Perl interpreter (usually pre-installed)
+- `openssl` + `openssl-devel` - SSL/TLS support for HTTPS
+
+**That's it!** Everything else is installed via CPAN.
+
+## Quick Installation (Recommended)
+
+### One-Line Installer
+
+Download and run the automated CPAN-based installer:
 
 ```bash
-# Install Perl modules available in CentOS/EPEL repos
-sudo yum install -y \
-    perl-libwww-perl \
-    perl-JSON \
-    perl-DBI \
-    perl-DBD-MySQL \
-    perl-IO-Socket-SSL \
-    perl-Net-SSLeay \
-    perl-LWP-Protocol-https \
-    perl-URI
+curl -fsSL https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/scripts/install-centos7.sh | sudo bash
 ```
 
-### Perl Modules via CPAN
+This script will:
+1. ✅ Check for build tools (gcc, make, perl, openssl)
+2. ✅ Auto-configure CPAN non-interactively
+3. ✅ Install all Perl modules via CPAN
+4. ✅ Verify installation
+5. ✅ Test HTTPS connectivity
 
-Some modules may need to be installed via CPAN on CentOS 7:
+**Installation time:** 5-10 minutes (depending on internet speed)
+
+### Manual Installation
+
+If you prefer manual control:
+
+#### 1. Install Build Tools
 
 ```bash
-# Configure CPAN (first time only)
-sudo cpan
-
-# At CPAN prompt, type:
-o conf init
-
-# Install required modules
-sudo cpan -T Mozilla::CA
-sudo cpan -T URI::Escape
+sudo yum install -y gcc make perl openssl openssl-devel
 ```
 
-**Note:** The `-T` flag skips tests for faster installation.
-
-## Complete One-Line Installation
-
-For a quick installation of all dependencies:
+#### 2. Download Installer
 
 ```bash
-# Install all packages in one command
-sudo yum install -y epel-release && \
-sudo yum install -y perl perl-core perl-CPAN perl-devel gcc make openssl openssl-devel \
-    perl-libwww-perl perl-JSON perl-DBI perl-DBD-MySQL \
-    perl-IO-Socket-SSL perl-Net-SSLeay perl-LWP-Protocol-https perl-URI && \
-sudo cpan -T Mozilla::CA
+cd /tmp
+wget https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/scripts/install-centos7.sh
+chmod +x install-centos7.sh
 ```
+
+#### 3. Run Installer
+
+```bash
+sudo ./install-centos7.sh
+```
+
+The installer will guide you through the process with colored output and progress indicators.
+
+## What Gets Installed via CPAN
+
+All Perl modules are installed directly from CPAN (latest stable versions):
+
+### Core Modules
+- **LWP::UserAgent** - HTTP/HTTPS client for API requests
+- **LWP::Protocol::https** - HTTPS protocol support
+- **IO::Socket::SSL** - SSL socket layer
+- **Net::SSLeay** - OpenSSL bindings
+- **Mozilla::CA** - Mozilla's CA certificate bundle
+
+### Data Handling
+- **JSON** - JSON encoding/decoding for API responses
+- **URI::Escape** - URL encoding/decoding
+
+### Database
+- **DBI** - Database independent interface
+- **DBD::mysql** - MySQL/MariaDB driver for VICIdial database
+
+### Installation Flags
+
+Modules are installed with `-T` flag (skip tests):
+```bash
+cpan -T Module::Name
+```
+
+**Why skip tests?**
+- Tests can take 10-30 minutes per module
+- Tests often fail on production environments (lack of test dependencies)
+- Installation without tests is safe for production use
 
 ## Verify Installation
 
 ### Test Perl Modules
+
+The installer automatically tests all modules, but you can verify manually:
 
 ```bash
 # Test each module
@@ -105,7 +143,6 @@ perl -MMozilla::CA -e 'print "Mozilla::CA: OK\n"'
 ### Test HTTPS Connectivity
 
 ```bash
-# Test HTTPS connection
 perl -MLWP::UserAgent -e '
     my $ua = LWP::UserAgent->new(ssl_opts => { verify_hostname => 1 });
     my $response = $ua->get("https://www.google.com");
@@ -113,84 +150,80 @@ perl -MLWP::UserAgent -e '
 '
 ```
 
-## Run Installation Script
+**Expected output:** `HTTPS Test: PASSED`
 
-Once all prerequisites are installed, run the auto-detect installer:
+## Next Steps
+
+After prerequisites are installed, run the main VICIdial integration installer:
 
 ```bash
-cd /home/na/didapi
+curl -fsSL https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/scripts/install-vicidial-integration-autodetect.sh | sudo bash
+```
+
+Or download and run manually:
+
+```bash
+cd /tmp
+wget https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/scripts/install-vicidial-integration-autodetect.sh
+chmod +x install-vicidial-integration-autodetect.sh
 sudo ./install-vicidial-integration-autodetect.sh
-```
-
-The script will:
-- Automatically detect CentOS 7
-- Use `yum` as the package manager
-- Install any missing Perl modules
-- Configure VICIdial integration
-- Set up AGI scripts
-
-## Manual Testing After Installation
-
-### 1. Test Configuration File
-
-```bash
-# Check configuration was created
-cat /etc/asterisk/dids.conf
-
-# Edit configuration
-sudo nano /etc/asterisk/dids.conf
-
-# Set your API key and URL
-api_base_url=https://dids.amdy.io
-api_key=YOUR_API_KEY_HERE
-```
-
-### 2. Test Perl Script
-
-```bash
-# Test the main Perl script
-sudo -u asterisk /usr/share/astguiclient/vicidial-did-optimizer-config.pl --config
-```
-
-### 3. Test API Connection
-
-Use the comprehensive test script:
-
-```bash
-cd /home/na/didapi
-./test-vicidial-integration.pl
-```
-
-Or the quick test:
-
-```bash
-./quick-test.sh TEST001 4155551234
-```
-
-### 4. Test AGI Script
-
-```bash
-# Test AGI script execution
-sudo -u asterisk /var/lib/asterisk/agi-bin/agi-did-optimizer.agi TEST001 1001 4155551234
 ```
 
 ## Troubleshooting
 
-### Issue: "Can't locate LWP/Protocol/https.pm"
+### Issue: "gcc: command not found" or "make: command not found"
+
+**Cause:** Build tools not installed
 
 **Solution:**
 ```bash
-sudo yum install -y perl-LWP-Protocol-https perl-IO-Socket-SSL perl-Net-SSLeay
+sudo yum install -y gcc make
 ```
 
-### Issue: "Can't locate Mozilla/CA.pm"
+### Issue: "Can't locate openssl/ssl.h" during module compilation
+
+**Cause:** OpenSSL development headers missing
 
 **Solution:**
 ```bash
-sudo cpan -T Mozilla::CA
+sudo yum install -y openssl-devel
+```
+
+### Issue: CPAN asks interactive questions
+
+**Cause:** CPAN not configured yet
+
+**Solution:** The installer auto-configures CPAN. To do manually:
+```bash
+sudo perl -MCPAN -e 'my $c = "CPAN::HandleConfig"; $c->load(doit => 1, autoconfig => 1);'
+```
+
+### Issue: Module installation fails with errors
+
+**Solution:** Force installation (ignores test failures):
+```bash
+sudo cpan -f Module::Name
+```
+
+### Issue: "Can't connect to cpan.org"
+
+**Cause:** Firewall blocking HTTPS
+
+**Solution:**
+```bash
+# Check firewall
+sudo firewall-cmd --state
+
+# If active, ensure HTTPS is allowed (usually is by default)
+sudo firewall-cmd --list-all | grep https
+
+# Test connectivity
+curl -I https://cpan.org
 ```
 
 ### Issue: "SSL connect attempt failed"
+
+**Cause:** CA certificates outdated
 
 **Solution:**
 ```bash
@@ -198,112 +231,156 @@ sudo cpan -T Mozilla::CA
 sudo yum install -y ca-certificates
 sudo update-ca-trust
 
-# Reinstall SSL modules
-sudo yum reinstall perl-IO-Socket-SSL perl-Net-SSLeay
+# Reinstall SSL modules via CPAN
+sudo cpan -f IO::Socket::SSL Net::SSLeay Mozilla::CA
 ```
 
-### Issue: CPAN configuration prompts
+### Issue: CPAN builds are very slow
 
-**Solution:**
+**Cause:** Running tests (can take 30+ minutes)
+
+**Solution:** Always use `-T` flag:
 ```bash
-# Use automatic configuration
-(echo y; echo sudo; echo local::lib) | cpan
-
-# Or configure CPAN non-interactively
-sudo perl -MCPAN -e 'my $c = "CPAN::HandleConfig"; $c->load(doit => 1, autoconfig => 1);'
+cpan -T Module::Name  # Skip tests (recommended)
 ```
 
-### Issue: Module installation fails with test errors
+## Advanced Configuration
 
-**Solution:**
+### Custom CPAN Mirror
+
+If CPAN mirrors are slow, specify a faster mirror:
+
 ```bash
-# Force install without tests
-sudo cpan -f Module::Name
+# Edit CPAN configuration
+sudo cpan
+> o conf urllist push http://cpan.mirrors.uk2.net/
+> o conf commit
+> exit
+```
+
+### Offline Installation
+
+For systems without internet access:
+
+1. Download modules on internet-connected machine:
+```bash
+cpanm --mirror-only --mirror http://www.cpan.org/ \
+  --save-dists /path/to/tarballs \
+  LWP::UserAgent JSON DBI DBD::mysql
+```
+
+2. Transfer tarballs to offline machine
+
+3. Install from local directory:
+```bash
+cpan -T /path/to/tarballs/*.tar.gz
+```
+
+### View Installation Logs
+
+```bash
+# View CPAN build log
+cat ~/.cpan/build.log
+
+# View last 50 lines
+tail -50 ~/.cpan/build.log
+
+# Search for errors
+grep -i error ~/.cpan/build.log
 ```
 
 ## Security Considerations
 
 ### Firewall Configuration
 
-If you have firewall enabled, ensure API endpoint is accessible:
-
 ```bash
 # Check firewall status
 sudo firewall-cmd --state
 
-# Allow HTTPS outbound (usually already allowed)
+# Ensure HTTPS outbound is allowed (usually default)
 sudo firewall-cmd --permanent --add-service=https
 sudo firewall-cmd --reload
 ```
 
 ### SELinux Considerations
 
-CentOS 7 has SELinux enabled by default. You may need to adjust policies:
+CentOS 7 has SELinux enabled by default:
 
 ```bash
 # Check SELinux status
 getenforce
 
-# If enforcing and having issues, check logs
+# If enforcing and having AGI execution issues
 sudo grep denied /var/log/audit/audit.log
 
-# Temporary disable for testing (not recommended for production)
+# Temporary disable for testing (NOT for production)
 sudo setenforce 0
 
 # Re-enable
 sudo setenforce 1
 ```
 
-## Package List Summary
+## Performance Notes
 
-### Required Packages (via yum):
-- `epel-release` - Extra Packages for Enterprise Linux
-- `perl` - Perl interpreter
-- `perl-core` - Core Perl modules
-- `perl-CPAN` - CPAN module installer
-- `perl-devel` - Perl development files
-- `gcc` - C compiler (for building modules)
-- `make` - Build tool
-- `openssl` - SSL/TLS toolkit
-- `openssl-devel` - OpenSSL development files
-- `perl-libwww-perl` - LWP (web user agent)
-- `perl-JSON` - JSON encoder/decoder
-- `perl-DBI` - Database independent interface
-- `perl-DBD-MySQL` - MySQL driver for DBI
-- `perl-IO-Socket-SSL` - SSL socket support
-- `perl-Net-SSLeay` - OpenSSL bindings
-- `perl-LWP-Protocol-https` - HTTPS protocol support
-- `perl-URI` - URI manipulation
+### CPAN Cache Location
 
-### Optional Packages (via CPAN):
-- `Mozilla::CA` - Mozilla's CA certificate bundle
-- `URI::Escape` - URL encoding/decoding
+CPAN builds cache in `/root/.cpan/` (if running as root):
 
-## Verification Checklist
+```bash
+# View cache size
+du -sh ~/.cpan/
 
-- [ ] EPEL repository installed
-- [ ] All Perl packages installed via yum
-- [ ] CPAN modules installed (Mozilla::CA)
-- [ ] HTTPS support verified (`perl -MLWP::Protocol::https -e 1`)
-- [ ] SSL support verified (`perl -MIO::Socket::SSL -e 1`)
-- [ ] Configuration file created (`/etc/asterisk/dids.conf`)
-- [ ] API key configured
-- [ ] Test script passes (`./test-vicidial-integration.pl`)
-- [ ] AGI scripts executable
-- [ ] Asterisk dialplan reloaded
+# Clean old builds (safe to delete)
+rm -rf ~/.cpan/build/*
+```
+
+### Module Load Time
+
+First time loading a module may be slow. This is normal:
+- Perl compiles modules on first use
+- Subsequent loads are instant
+
+## Installation Verification Checklist
+
+After installation completes:
+
+- [ ] gcc and make installed (`gcc --version && make --version`)
+- [ ] Perl installed (`perl -v`)
+- [ ] OpenSSL installed (`openssl version`)
+- [ ] CPAN configured (`perl -MCPAN -e 1`)
+- [ ] All Perl modules installed (see "Test Perl Modules" section)
+- [ ] HTTPS test passed
+- [ ] Ready to run main VICIdial integration installer
+
+## Comparison: Old (yum) vs New (CPAN) Approach
+
+| Aspect | Old (yum-based) | New (CPAN-only) |
+|--------|-----------------|-----------------|
+| **Repository dependency** | Requires EPEL + vault.centos.org | None |
+| **Module versions** | 5-10 years old | Latest stable |
+| **Installation steps** | 5+ commands | 1 command |
+| **Failure points** | Repository unreachable, EOL issues | Rare |
+| **Internet needed** | Yes (for repos) | Yes (for CPAN) |
+| **Build tools** | Installed via yum | Installed via yum (one-time) |
+| **Maintenance** | Requires repo updates | Self-contained |
 
 ## Support
 
-If you encounter issues specific to CentOS 7:
+If you encounter issues:
 
-1. Check `/var/log/astguiclient/did_optimizer.log`
-2. Run comprehensive test: `./test-vicidial-integration.pl --verbose`
-3. Verify Perl modules: `perl -V`
-4. Check SELinux logs: `sudo grep denied /var/log/audit/audit.log`
-5. Review system logs: `sudo journalctl -xe`
+1. **Check installer output** - It shows detailed progress and errors
+2. **View CPAN logs** - `cat ~/.cpan/build.log`
+3. **Test modules individually** - See "Test Perl Modules" section
+4. **Check build tools** - `gcc --version && make --version`
+5. **Verify OpenSSL** - `openssl version && ls /usr/include/openssl/ssl.h`
 
 ## References
 
-- CentOS 7 Perl Packages: https://centos.pkgs.org/7/centos-x86_64/
-- EPEL Repository: https://fedoraproject.org/wiki/EPEL
+- CPAN: https://www.cpan.org/
+- Perl Documentation: https://perldoc.perl.org/
 - VICIdial Documentation: http://www.vicidial.org/docs/
+- GitHub Repository: https://github.com/nikvb/vicidial-did-optimizer
+
+---
+
+**Note:** This installation method is specifically designed for CentOS 7's EOL status. For CentOS 8+ or other modern distributions, the main installer will automatically use dnf/yum where appropriate.
