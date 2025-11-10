@@ -35,39 +35,71 @@ if [ ! -f /etc/redhat-release ]; then
 fi
 
 OS_VERSION=$(cat /etc/redhat-release)
-echo -e "${BLUE}Detected OS: $OS_VERSION${NC}\n"
+echo -e "${BLUE}Detected OS: $OS_VERSION${NC}"
+echo -e "${BLUE}Note: This installer does NOT use yum/dnf - all Perl modules installed via CPAN${NC}\n"
 
-# Step 1: Install EPEL Repository
-echo -e "${YELLOW}Step 1: Installing EPEL Repository...${NC}"
-if rpm -q epel-release >/dev/null 2>&1; then
-    echo -e "${GREEN}✅ EPEL already installed${NC}"
+# Step 1: Verify Prerequisites
+echo -e "${YELLOW}Step 1: Checking Prerequisites...${NC}"
+
+# Check for Perl
+if command -v perl >/dev/null 2>&1; then
+    PERL_VERSION=$(perl -e 'print $^V')
+    echo -e "${GREEN}  ✓ Perl ${PERL_VERSION}${NC}"
 else
-    yum install -y epel-release
-    echo -e "${GREEN}✅ EPEL installed${NC}"
+    echo -e "${RED}  ✗ Perl not found${NC}"
+    echo -e "${YELLOW}Please install Perl first (usually pre-installed on CentOS)${NC}"
+    exit 1
 fi
 
-# Update package cache
-echo -e "${YELLOW}Updating package cache...${NC}"
-yum makecache fast
-echo ""
+# Check for gcc
+if command -v gcc >/dev/null 2>&1; then
+    GCC_VERSION=$(gcc --version | head -n1 | awk '{print $NF}')
+    echo -e "${GREEN}  ✓ gcc ${GCC_VERSION}${NC}"
+else
+    echo -e "${YELLOW}  ⚠ gcc not found (required for compiling Perl modules)${NC}"
+    echo -e "${YELLOW}  Install with: yum groupinstall 'Development Tools'${NC}"
+    echo -e "${YELLOW}  Or manually install: yum install gcc${NC}"
+    read -p "Continue anyway? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
 
-# Step 2: Install Core Perl and Development Tools
-echo -e "${YELLOW}Step 2: Installing Core Perl and Development Tools...${NC}"
-yum install -y \
-    perl \
-    perl-core \
-    perl-CPAN \
-    perl-devel \
-    gcc \
-    make \
-    openssl \
-    openssl-devel \
-    ca-certificates
+# Check for make
+if command -v make >/dev/null 2>&1; then
+    MAKE_VERSION=$(make --version | head -n1 | awk '{print $NF}')
+    echo -e "${GREEN}  ✓ make ${MAKE_VERSION}${NC}"
+else
+    echo -e "${YELLOW}  ⚠ make not found (required for compiling Perl modules)${NC}"
+    echo -e "${YELLOW}  Install with: yum install make${NC}"
+    read -p "Continue anyway? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
 
-echo -e "${GREEN}✅ Core tools installed${NC}\n"
+# Check for OpenSSL
+if command -v openssl >/dev/null 2>&1; then
+    OPENSSL_VERSION=$(openssl version | awk '{print $2}')
+    echo -e "${GREEN}  ✓ openssl ${OPENSSL_VERSION}${NC}"
+else
+    echo -e "${YELLOW}  ⚠ openssl not found (required for HTTPS support)${NC}"
+fi
 
-# Step 3: Configure CPAN (Non-Interactive)
-echo -e "${YELLOW}Step 3: Configuring CPAN...${NC}"
+# Check for OpenSSL development headers
+if [ -f /usr/include/openssl/ssl.h ] || [ -f /usr/local/include/openssl/ssl.h ]; then
+    echo -e "${GREEN}  ✓ openssl-devel headers found${NC}"
+else
+    echo -e "${YELLOW}  ⚠ openssl-devel headers not found (may be needed for SSL modules)${NC}"
+    echo -e "${YELLOW}  Install with: yum install openssl-devel${NC}"
+fi
+
+echo -e "${GREEN}✅ Prerequisites check complete${NC}\n"
+
+# Step 2: Configure CPAN (Non-Interactive)
+echo -e "${YELLOW}Step 2: Configuring CPAN...${NC}"
 echo -e "${BLUE}Using CPAN for latest stable Perl modules (newer than CentOS 7 repos)${NC}\n"
 
 # Auto-configure CPAN if not already configured
@@ -91,8 +123,8 @@ cpan -T CPAN 2>&1 | tail -3
 
 echo ""
 
-# Step 4: Install Perl Modules via CPAN
-echo -e "${YELLOW}Step 4: Installing Perl Modules via CPAN...${NC}"
+# Step 3: Install Perl Modules via CPAN
+echo -e "${YELLOW}Step 3: Installing Perl Modules via CPAN...${NC}"
 
 # List of required modules
 PERL_MODULES=(
@@ -117,13 +149,13 @@ done
 
 echo -e "\n${GREEN}✅ All Perl modules installed via CPAN${NC}\n"
 
-# Step 5: Update CA Certificates
-echo -e "${YELLOW}Step 5: Updating CA Certificates...${NC}"
+# Step 4: Update CA Certificates
+echo -e "${YELLOW}Step 4: Updating CA Certificates...${NC}"
 update-ca-trust
 echo -e "${GREEN}✅ CA certificates updated${NC}\n"
 
-# Step 6: Verify Installation
-echo -e "${YELLOW}Step 6: Verifying Perl Modules...${NC}"
+# Step 5: Verify Installation
+echo -e "${YELLOW}Step 5: Verifying Perl Modules...${NC}"
 
 REQUIRED_MODULES=(
     "LWP::UserAgent"
@@ -156,8 +188,8 @@ fi
 
 echo ""
 
-# Step 7: Test HTTPS Connectivity
-echo -e "${YELLOW}Step 7: Testing HTTPS Support...${NC}"
+# Step 6: Test HTTPS Connectivity
+echo -e "${YELLOW}Step 6: Testing HTTPS Support...${NC}"
 HTTPS_TEST=$(perl -MLWP::UserAgent -e '
     my $ua = LWP::UserAgent->new(ssl_opts => { verify_hostname => 1 });
     my $response = $ua->get("https://www.google.com");
@@ -191,15 +223,18 @@ else
     echo -e "${RED}⚠️  Some modules failed to install${NC}\n"
 
     echo -e "${YELLOW}Troubleshooting:${NC}"
-    echo -e "1. Check EPEL repository:"
-    echo -e "   ${BLUE}yum repolist | grep epel${NC}\n"
+    echo -e "1. Ensure build tools are installed:"
+    echo -e "   ${BLUE}gcc --version && make --version${NC}\n"
 
-    echo -e "2. Manually install missing modules:"
+    echo -e "2. Check OpenSSL development headers:"
+    echo -e "   ${BLUE}ls -la /usr/include/openssl/ssl.h${NC}\n"
+
+    echo -e "3. Manually install missing modules:"
     echo -e "   ${BLUE}sudo cpan -f Module::Name${NC}\n"
 
-    echo -e "3. Check firewall/proxy settings if HTTPS test failed\n"
+    echo -e "4. Check firewall/proxy settings if HTTPS test failed\n"
 
-    echo -e "4. View detailed logs:"
+    echo -e "5. View detailed CPAN logs:"
     echo -e "   ${BLUE}cat ~/.cpan/build.log${NC}\n"
 
     exit 1
