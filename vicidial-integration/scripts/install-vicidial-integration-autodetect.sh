@@ -201,13 +201,55 @@ echo -e "${GREEN}✅ All required files available${NC}"
 # Step 4: Create/Update configuration file
 echo -e "\n${YELLOW}4. Installing configuration file...${NC}"
 
-# Backup existing config if it exists
+# Check if config already exists
+SKIP_CONFIG=0
 if [ -f "$ASTERISK_DIR/dids.conf" ]; then
-    cp "$ASTERISK_DIR/dids.conf" "$ASTERISK_DIR/dids.conf.backup.$(date +%Y%m%d_%H%M%S)"
-    echo -e "${YELLOW}⚠️  Backed up existing dids.conf${NC}"
+    echo -e "${YELLOW}⚠️  Configuration file already exists: $ASTERISK_DIR/dids.conf${NC}"
+    echo -e "${BLUE}What would you like to do?${NC}"
+    echo -e "  ${GREEN}1)${NC} Keep existing configuration (recommended)"
+    echo -e "  ${YELLOW}2)${NC} Overwrite with new template (backup will be created)"
+    echo -e "  ${RED}3)${NC} View current configuration"
+    echo -n "Enter choice [1-3] (default: 1): "
+
+    read -r CHOICE
+    CHOICE=${CHOICE:-1}
+
+    case $CHOICE in
+        1)
+            echo -e "${GREEN}✅ Keeping existing configuration${NC}"
+            SKIP_CONFIG=1
+            ;;
+        2)
+            BACKUP_FILE="$ASTERISK_DIR/dids.conf.backup.$(date +%Y%m%d_%H%M%S)"
+            cp "$ASTERISK_DIR/dids.conf" "$BACKUP_FILE"
+            echo -e "${YELLOW}✅ Backed up to: $BACKUP_FILE${NC}"
+            SKIP_CONFIG=0
+            ;;
+        3)
+            echo -e "\n${BLUE}===== Current Configuration =====${NC}"
+            cat "$ASTERISK_DIR/dids.conf"
+            echo -e "${BLUE}=================================${NC}\n"
+            echo -n "Overwrite this configuration? [y/N]: "
+            read -r CONFIRM
+            if [[ $CONFIRM =~ ^[Yy]$ ]]; then
+                BACKUP_FILE="$ASTERISK_DIR/dids.conf.backup.$(date +%Y%m%d_%H%M%S)"
+                cp "$ASTERISK_DIR/dids.conf" "$BACKUP_FILE"
+                echo -e "${YELLOW}✅ Backed up to: $BACKUP_FILE${NC}"
+                SKIP_CONFIG=0
+            else
+                echo -e "${GREEN}✅ Keeping existing configuration${NC}"
+                SKIP_CONFIG=1
+            fi
+            ;;
+        *)
+            echo -e "${GREEN}✅ Keeping existing configuration (invalid choice)${NC}"
+            SKIP_CONFIG=1
+            ;;
+    esac
 fi
 
 # Create configuration with auto-detected settings (but commented out)
+if [ $SKIP_CONFIG -eq 0 ]; then
 cat > "$ASTERISK_DIR/dids.conf" << EOF
 # DID Optimizer Pro Configuration
 # Location: /etc/asterisk/dids.conf
@@ -266,10 +308,12 @@ connection_timeout=30
 read_timeout=60
 EOF
 
-chmod 600 "$ASTERISK_DIR/dids.conf"
-
-echo -e "${GREEN}✅ Configuration file installed: $ASTERISK_DIR/dids.conf${NC}"
-echo -e "${YELLOW}   Database settings will be auto-detected from VICIdial${NC}"
+    chmod 600 "$ASTERISK_DIR/dids.conf"
+    echo -e "${GREEN}✅ Configuration file installed: $ASTERISK_DIR/dids.conf${NC}"
+    echo -e "${YELLOW}   Database settings will be auto-detected from VICIdial${NC}"
+else
+    echo -e "${GREEN}✅ Configuration file preserved: $ASTERISK_DIR/dids.conf${NC}"
+fi
 
 # Step 5: Install DID optimizer script
 echo -e "\n${YELLOW}5. Installing DID optimizer script...${NC}"
