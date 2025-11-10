@@ -29,8 +29,8 @@ const tenantSchema = new mongoose.Schema({
   subscription: {
     plan: {
       type: String,
-      enum: ['starter', 'professional', 'enterprise'],
-      default: 'starter'
+      enum: ['basic', 'professional', 'enterprise'],
+      default: 'basic'
     },
     status: {
       type: String,
@@ -53,6 +53,32 @@ const tenantSchema = new mongoose.Schema({
     paypalSubscriptionId: {
       type: String,
       default: null
+    },
+    perDidPricing: {
+      enabled: {
+        type: Boolean,
+        default: true
+      },
+      customRate: {
+        type: Number,
+        default: null // For enterprise custom pricing
+      }
+    },
+    gracePeriod: {
+      enabled: {
+        type: Boolean,
+        default: true
+      },
+      daysAllowed: {
+        type: Number,
+        default: 7
+      },
+      currentFailedPayments: {
+        type: Number,
+        default: 0
+      },
+      suspendedAt: Date,
+      suspensionReason: String
     }
   },
   limits: {
@@ -60,7 +86,7 @@ const tenantSchema = new mongoose.Schema({
       type: Number,
       default: function() {
         const limits = {
-          starter: 5,
+          basic: 5,
           professional: 25,
           enterprise: 100
         };
@@ -71,18 +97,18 @@ const tenantSchema = new mongoose.Schema({
       type: Number,
       default: function() {
         const limits = {
-          starter: 50,
-          professional: 500,
+          basic: 250,
+          professional: 1000,
           enterprise: 999999
         };
-        return limits[this.subscription.plan] || 50;
+        return limits[this.subscription.plan] || 250;
       }
     },
     maxConcurrentCalls: {
       type: Number,
       default: function() {
         const limits = {
-          starter: 10,
+          basic: 10,
           professional: 100,
           enterprise: 999999
         };
@@ -93,7 +119,7 @@ const tenantSchema = new mongoose.Schema({
       type: Number,
       default: function() {
         const limits = {
-          starter: 10000,
+          basic: 10000,
           professional: 100000,
           enterprise: 999999
         };
@@ -166,11 +192,56 @@ const tenantSchema = new mongoose.Schema({
       country: String
     },
     taxId: String,
-    paymentMethod: {
-      type: String,
-      enum: ['paypal', 'stripe', 'manual'],
-      default: 'paypal'
-    }
+    emailForInvoices: String,
+    autoPayEnabled: {
+      type: Boolean,
+      default: true
+    },
+    lastInvoiceDate: Date,
+    totalPaid: {
+      type: Number,
+      default: 0
+    },
+    totalOutstanding: {
+      type: Number,
+      default: 0
+    },
+    paymentMethods: [{
+      type: {
+        type: String,
+        enum: ['paypal_account', 'credit_card', 'debit_card'],
+        required: true
+      },
+      isPrimary: {
+        type: Boolean,
+        default: false
+      },
+      vaultId: {
+        type: String, // PayPal vault token
+        required: true
+      },
+      last4: String, // Last 4 digits of card
+      cardType: String, // visa, mastercard, amex, discover
+      expiryMonth: Number,
+      expiryYear: Number,
+      billingAddress: {
+        name: String,
+        street: String,
+        city: String,
+        state: String,
+        zipCode: String,
+        country: String
+      },
+      isActive: {
+        type: Boolean,
+        default: true
+      },
+      addedAt: {
+        type: Date,
+        default: Date.now
+      },
+      lastUsedAt: Date
+    }]
   },
   usage: {
     currentPeriodStart: {
@@ -287,11 +358,11 @@ tenantSchema.statics.findByDomain = function(domain) {
 tenantSchema.pre('save', function(next) {
   if (this.isModified('subscription.plan')) {
     const limits = {
-      starter: { maxUsers: 5, maxDIDs: 50, maxConcurrentCalls: 10, apiCallsPerMonth: 10000 },
-      professional: { maxUsers: 25, maxDIDs: 500, maxConcurrentCalls: 100, apiCallsPerMonth: 100000 },
+      basic: { maxUsers: 5, maxDIDs: 250, maxConcurrentCalls: 10, apiCallsPerMonth: 10000 },
+      professional: { maxUsers: 25, maxDIDs: 1000, maxConcurrentCalls: 100, apiCallsPerMonth: 100000 },
       enterprise: { maxUsers: 100, maxDIDs: 999999, maxConcurrentCalls: 999999, apiCallsPerMonth: 999999 }
     };
-    
+
     const planLimits = limits[this.subscription.plan];
     if (planLimits) {
       Object.assign(this.limits, planLimits);
@@ -299,6 +370,21 @@ tenantSchema.pre('save', function(next) {
   }
   next();
 });
+
+// Instance method to get primary payment method
+tenantSchema.methods.getPrimaryPaymentMethod = function() {
+  return this.billing.paymentMethods.find(pm => pm.isPrimary && pm.isActive);
+};
+
+// Instance method to add payment method
+tenantSchema.methods.addPaymentMethod = function(paymentMethodData) {
+  // If this is the first payment method, make it primary
+  if (this.billing.paymentMethods.length === 0) {
+    paymentMethodData.isPrimary = true;
+  }
+  this.billing.paymentMethods.push(paymentMethodData);
+  return this.save();
+};
 
 const Tenant = mongoose.model('Tenant', tenantSchema);
 

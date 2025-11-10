@@ -296,28 +296,129 @@ chmod 755 "$LOG_DIR"
 
 echo -e "${GREEN}✅ Log directory created: $LOG_DIR${NC}"
 
+# Function to detect OS and package manager
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+        OS_VERSION=$VERSION_ID
+    elif [ -f /etc/redhat-release ]; then
+        OS="rhel"
+        OS_VERSION=$(cat /etc/redhat-release | sed 's/[^0-9.]*\([0-9.]*\).*/\1/' | head -1)
+    else
+        OS="unknown"
+        OS_VERSION="unknown"
+    fi
+
+    # Detect package manager
+    if command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"
+    elif command -v apt-get >/dev/null 2>&1; then
+        PKG_MANAGER="apt-get"
+    else
+        PKG_MANAGER="unknown"
+    fi
+
+    echo -e "${BLUE}Detected OS: $OS $OS_VERSION${NC}"
+    echo -e "${BLUE}Package Manager: $PKG_MANAGER${NC}"
+}
+
 # Step 8: Install Perl dependencies
 echo -e "\n${YELLOW}8. Installing Perl dependencies...${NC}"
 
-# Check if cpan is available
-if command -v cpan >/dev/null 2>&1; then
-    # Install required Perl modules
-    cpan -T LWP::UserAgent JSON DBI DBD::mysql 2>/dev/null || {
-        echo -e "${YELLOW}⚠️  CPAN installation may have failed. You may need to install manually:${NC}"
-        echo -e "  sudo apt-get install libwww-perl libjson-perl libdbi-perl libdbd-mysql-perl"
-    }
+# Detect OS and package manager
+detect_os
+
+# Install based on package manager
+if [ "$PKG_MANAGER" = "yum" ] || [ "$PKG_MANAGER" = "dnf" ]; then
+    # CentOS/RHEL/Fedora
+    echo -e "${YELLOW}Installing packages for CentOS/RHEL...${NC}"
+
+    # Install EPEL repository if not already installed (needed for many Perl modules)
+    if ! rpm -q epel-release >/dev/null 2>&1; then
+        echo -e "${YELLOW}Installing EPEL repository...${NC}"
+        if [ "$OS_VERSION" = "7" ]; then
+            yum install -y epel-release
+        else
+            $PKG_MANAGER install -y epel-release
+        fi
+    fi
+
+    # Install Perl and core dependencies
+    $PKG_MANAGER install -y perl perl-core perl-CPAN perl-devel \
+        perl-libwww-perl perl-JSON perl-DBI perl-DBD-MySQL \
+        perl-IO-Socket-SSL perl-Net-SSLeay perl-LWP-Protocol-https \
+        perl-URI openssl openssl-devel
+
+    # Some modules may need to be installed via CPAN on CentOS 7
+    if [ "$OS_VERSION" = "7" ]; then
+        echo -e "${YELLOW}Installing additional modules via CPAN for CentOS 7...${NC}"
+        cpan -T Mozilla::CA 2>/dev/null || echo -e "${YELLOW}⚠️  Mozilla::CA may need manual installation${NC}"
+    fi
+
+elif [ "$PKG_MANAGER" = "apt-get" ]; then
+    # Debian/Ubuntu
+    echo -e "${YELLOW}Installing packages for Debian/Ubuntu...${NC}"
+    apt-get update
+    apt-get install -y perl libwww-perl libjson-perl libdbi-perl libdbd-mysql-perl \
+        libio-socket-ssl-perl libnet-ssleay-perl libmozilla-ca-perl \
+        liblwp-protocol-https-perl liburi-perl openssl libssl-dev
+
 else
-    # Try apt-get for Debian/Ubuntu systems
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update
-        apt-get install -y libwww-perl libjson-perl libdbi-perl libdbd-mysql-perl
+    # Fallback to CPAN
+    echo -e "${YELLOW}Unknown package manager, trying CPAN...${NC}"
+    if command -v cpan >/dev/null 2>&1; then
+        cpan -T LWP::UserAgent LWP::Protocol::https IO::Socket::SSL Net::SSLeay \
+            Mozilla::CA JSON DBI DBD::mysql URI::Escape
     else
-        echo -e "${YELLOW}⚠️  Please install Perl dependencies manually:${NC}"
-        echo -e "  LWP::UserAgent JSON DBI DBD::mysql"
+        echo -e "${RED}❌ No package manager detected and CPAN not available${NC}"
+        echo -e "${YELLOW}Please install Perl modules manually${NC}"
+        exit 1
     fi
 fi
 
-echo -e "${GREEN}✅ Perl dependencies installed${NC}"
+# Verify HTTPS support
+echo -e "\n${YELLOW}Verifying HTTPS support...${NC}"
+perl -MLWP::Protocol::https -e 'print "HTTPS support: OK\n"' 2>/dev/null && {
+    echo -e "${GREEN}✅ HTTPS/SSL support verified${NC}"
+} || {
+    echo -e "${RED}⚠️  HTTPS support not fully installed${NC}"
+    if [ "$PKG_MANAGER" = "yum" ] || [ "$PKG_MANAGER" = "dnf" ]; then
+        echo -e "${YELLOW}   Try: sudo $PKG_MANAGER install perl-LWP-Protocol-https perl-IO-Socket-SSL${NC}"
+    else
+        echo -e "${YELLOW}   Try: sudo apt-get install liblwp-protocol-https-perl${NC}"
+    fi
+}
+
+# Verify all required modules
+echo -e "\n${YELLOW}Verifying Perl modules...${NC}"
+REQUIRED_MODULES=("LWP::UserAgent" "LWP::Protocol::https" "IO::Socket::SSL" "JSON" "DBI" "DBD::mysql" "URI::Escape")
+MISSING_MODULES=0
+
+for module in "${REQUIRED_MODULES[@]}"; do
+    if perl -M"$module" -e 1 2>/dev/null; then
+        echo -e "  ${GREEN}✅ $module${NC}"
+    else
+        echo -e "  ${RED}❌ $module${NC}"
+        MISSING_MODULES=$((MISSING_MODULES + 1))
+    fi
+done
+
+if [ $MISSING_MODULES -gt 0 ]; then
+    echo -e "\n${RED}⚠️  Some modules are missing. Trying CPAN installation...${NC}"
+    if command -v cpan >/dev/null 2>&1; then
+        for module in "${REQUIRED_MODULES[@]}"; do
+            if ! perl -M"$module" -e 1 2>/dev/null; then
+                echo -e "${YELLOW}Installing $module via CPAN...${NC}"
+                cpan -T "$module" 2>/dev/null || echo -e "${RED}Failed to install $module${NC}"
+            fi
+        done
+    fi
+fi
+
+echo -e "\n${GREEN}✅ Perl dependencies installation complete${NC}"
 
 # Step 9: Backup and modify extensions.conf
 echo -e "\n${YELLOW}9. Configuring Asterisk dialplan...${NC}"

@@ -45,16 +45,20 @@ import DID from './models/DID.js';
 import CallRecord from './models/CallRecord.js';
 import AuditLog from './models/AuditLog.js';
 import AreaCodeLocation from './models/AreaCodeLocation.js';
+import Invoice from './models/Invoice.js';
 
 // Import routes AFTER models are registered
 // import authRoutes from './routes/auth.js';
 // import userRoutes from './routes/users.js';
 import didRoutes from './temp_clone/routes/dids.js';
 // import analyticsRoutes from './routes/analytics.js';
-// import billingRoutes from './routes/billing.js';
+import billingRoutes from './routes/billing.js';
 import tenantRoutes from './temp_clone/routes/tenants.js';
 import vicidialRoutes from './routes/vicidial.js';
 // import dashboardRoutes from './routes/dashboard.js';
+
+// Import billing jobs
+import { startAllBillingJobs } from './services/billing/monthlyBilling.js';
 
 // API key validation middleware using the same DB connection
 const validateApiKey = async (req, res, next) => {
@@ -233,6 +237,12 @@ const limiter = rateLimit({
 });
 
 app.use('/api/', limiter);
+
+// DEBUG: Log ALL API requests
+app.use('/api', (req, res, next) => {
+  console.log('🌐 API REQUEST:', req.method, req.url, 'from', req.ip);
+  next();
+});
 
 // VICIdial API endpoint (before session middleware)
 
@@ -899,11 +909,28 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
 });
 
 // API Routes
+console.log('🔧 Registering API routes...');
+console.log('📊 billingRoutes type:', typeof billingRoutes);
+console.log('📊 billingRoutes is Router:', billingRoutes && billingRoutes.stack ? 'YES' : 'NO');
+if (billingRoutes && billingRoutes.stack) {
+  console.log('📊 billingRoutes has', billingRoutes.stack.length, 'routes');
+}
+
 // app.use('/api/v1/auth', authRoutes);
 // app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/dids', didRoutes);
 // app.use('/api/v1/analytics', analyticsRoutes);
-// app.use('/api/v1/billing', billingRoutes);
+
+// DEBUG: Log all requests to /api/v1/billing
+app.use('/api/v1/billing', (req, res, next) => {
+  console.log('🔍 BILLING REQUEST INTERCEPTED:', req.method, req.path, req.url);
+  console.log('🔍 Full URL:', req.originalUrl);
+  next();
+});
+
+console.log('🔧 Mounting billing routes at /api/v1/billing...');
+app.use('/api/v1/billing', billingRoutes);
+console.log('✅ Billing routes mounted!');
 app.use('/api/v1/tenants', tenantRoutes);
 app.use('/api/v1/settings/vicidial', vicidialRoutes);
 // app.use('/api/v1/dashboard', dashboardRoutes);
@@ -3508,6 +3535,9 @@ Available Routes:
   /settings   - Settings (requires auth)
 ================================
   `);
+
+  // Start billing jobs
+  startAllBillingJobs();
 });
 
 // Graceful shutdown
