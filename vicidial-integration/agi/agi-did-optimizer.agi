@@ -1,0 +1,201 @@
+#!/usr/bin/perl
+
+##############################################################################
+# VICIdial DID Optimizer - AGI Script
+#
+# This AGI script is called from Asterisk dialplan to get the optimal DID
+# for outbound calls based on geographic proximity and usage limits.
+#
+# Usage: AGI(agi-did-optimizer.agi,CAMPAIGN_ID,AGENT_ID,CUSTOMER_PHONE)
+#
+# Returns: Sets OPTIMIZED_DID variable with selected phone number
+##############################################################################
+
+use strict;
+use warnings;
+use LWP::UserAgent;
+use JSON;
+use DBI;
+
+# AGI Environment variables
+my %agi_env;
+while (my $line = <STDIN>) {
+    chomp $line;
+    last if $line eq '';
+    if ($line =~ /^agi_(\w+):\s*(.*)$/) {
+        $agi_env{$1} = $2;
+    }
+}
+
+# Get command line arguments
+my ($campaign_id, $agent_id, $customer_phone) = @ARGV;
+
+# Read configuration
+my $config_file = '/etc/asterisk/dids.conf';
+my %config = read_config($config_file);
+
+# Log function
+sub log_message {
+    my $message = shift;
+    my $log_file = $config{'log_file'} || '/var/log/astguiclient/did_optimizer.log';
+
+    open my $fh, '>>', $log_file or return;
+    my $timestamp = localtime();
+    print $fh "[$timestamp] [AGI] $message\n";
+    close $fh;
+}
+
+# Configuration reader
+sub read_config {
+    my $file = shift;
+    my %cfg;
+
+    open my $fh, '<', $file or do {
+        log_message("ERROR: Cannot read config file: $file");
+        return %cfg;
+    };
+
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^\s*[#;]/ || $line =~ /^\s*$/;
+        next if $line =~ /^\s*\[/;
+
+        if ($line =~ /^\s*(\w+)\s*=\s*(.*)$/) {
+            $cfg{$1} = $2;
+        }
+    }
+    close $fh;
+    return %cfg;
+}
+
+# Get customer location from VICIdial database
+sub get_customer_location {
+    my $phone = shift;
+
+    my $dsn = "DBI:mysql:database=$config{db_name};host=$config{db_host}";
+    my $dbh = DBI->connect($dsn, $config{db_user}, $config{db_pass}, {
+        RaiseError => 0,
+        PrintError => 0
+    });
+
+    unless ($dbh) {
+        log_message("ERROR: Database connection failed: " . DBI->errstr);
+        return ('', '');
+    }
+
+    my $sql = "SELECT state, postal_code FROM vicidial_list WHERE phone_number = ? LIMIT 1";
+    my $sth = $dbh->prepare($sql);
+    $sth->execute($phone);
+
+    my ($state, $zip) = $sth->fetchrow_array();
+    $sth->finish();
+    $dbh->disconnect();
+
+    return ($state || '', $zip || '');
+}
+
+# Call DID Optimizer API
+sub get_optimized_did {
+    my ($campaign, $agent, $phone, $state, $zip) = @_;
+
+    my $api_url = $config{api_base_url} || 'http://localhost:3001';
+    my $api_key = $config{api_key} || '';
+    my $fallback_did = $config{fallback_did} || '+18005551234';
+
+    unless ($api_key) {
+        log_message("ERROR: API key not configured");
+        return $fallback_did;
+    }
+
+    my $ua = LWP::UserAgent->new(
+        timeout => $config{api_timeout} || 10,
+        agent => 'VICIdial-DID-Optimizer-AGI/1.0'
+    );
+
+    my $url = "$api_url/api/v1/dids/next";
+    my $params = {
+        campaign_id => $campaign,
+        agent_id => $agent,
+        customer_phone => $phone,
+        customer_state => $state,
+        customer_zip => $zip
+    };
+
+    # Build query string
+    my @params = map { "$_=" . ($params->{$_} // '') } keys %$params;
+    $url .= '?' . join('&', @params);
+
+    my $request = HTTP::Request->new(GET => $url);
+    $request->header('x-api-key' => $api_key);
+    $request->header('Content-Type' => 'application/json');
+
+    log_message("Calling API: $url");
+
+    my $response = $ua->request($request);
+
+    if ($response->is_success) {
+        my $data = eval { decode_json($response->content) };
+        if ($@ || !$data) {
+            log_message("ERROR: Invalid JSON response from API");
+            return $fallback_did;
+        }
+
+        my $selected_did = $data->{selected_did} || $data->{did} || $fallback_did;
+        log_message("SUCCESS: Selected DID $selected_did for campaign $campaign");
+        return $selected_did;
+    } else {
+        log_message("ERROR: API call failed: " . $response->status_line);
+        return $fallback_did;
+    }
+}
+
+# AGI Response functions
+sub agi_verbose {
+    my ($message, $level) = @_;
+    $level ||= 1;
+    print "VERBOSE \"$message\" $level\n";
+}
+
+sub agi_set_variable {
+    my ($variable, $value) = @_;
+    print "SET VARIABLE $variable \"$value\"\n";
+}
+
+# Main execution
+eval {
+    log_message("DID Optimizer AGI started: campaign=$campaign_id, agent=$agent_id, phone=$customer_phone");
+
+    # Input validation
+    unless ($campaign_id && $agent_id && $customer_phone) {
+        log_message("ERROR: Missing required parameters");
+        agi_set_variable('OPTIMIZED_DID', $config{fallback_did} || '+18005551234');
+        agi_verbose("DID Optimizer: Using fallback DID due to missing parameters");
+        exit 0;
+    }
+
+    # Get customer location
+    my ($customer_state, $customer_zip) = get_customer_location($customer_phone);
+    log_message("Customer location: state=$customer_state, zip=$customer_zip");
+
+    # Get optimized DID
+    my $selected_did = get_optimized_did($campaign_id, $agent_id, $customer_phone, $customer_state, $customer_zip);
+
+    # Set Asterisk variables
+    agi_set_variable('OPTIMIZED_DID', $selected_did);
+    agi_set_variable('DID_OPTIMIZER_STATUS', 'SUCCESS');
+    agi_set_variable('CUSTOMER_STATE', $customer_state);
+    agi_set_variable('CUSTOMER_ZIP', $customer_zip);
+
+    agi_verbose("DID Optimizer: Selected $selected_did for campaign $campaign_id");
+
+    log_message("DID Optimizer AGI completed successfully: selected_did=$selected_did");
+};
+
+if ($@) {
+    log_message("ERROR: AGI script failed: $@");
+    agi_set_variable('OPTIMIZED_DID', $config{fallback_did} || '+18005551234');
+    agi_set_variable('DID_OPTIMIZER_STATUS', 'ERROR');
+    agi_verbose("DID Optimizer: Error occurred, using fallback DID");
+}
+
+exit 0;

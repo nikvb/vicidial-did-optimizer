@@ -1,6 +1,8 @@
-# VICIdial DID Optimizer - Integration Files
+# VICIdial DID Optimizer - Integration Package
 
-Complete VICIdial integration using AGI-based approach with web-based setup tools.
+**Public Integration Package** for connecting VICIdial call centers with DID Optimizer Pro service.
+
+This is the **standalone public integration package**. The main DID Optimizer application is proprietary software.
 
 ## 📁 Files Included
 
