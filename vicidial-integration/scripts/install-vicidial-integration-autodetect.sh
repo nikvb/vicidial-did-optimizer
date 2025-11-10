@@ -303,9 +303,12 @@ chmod +x "$AGI_DIR/agi-did-optimizer.agi"
 cp "$SCRIPT_DIR/agi-did-optimizer-report.agi" "$AGI_DIR/"
 chmod +x "$AGI_DIR/agi-did-optimizer-report.agi"
 
-# Install quick inline script
-cp "$SCRIPT_DIR/did-optimizer-quick.pl" "$AGI_DIR/"
-chmod +x "$AGI_DIR/did-optimizer-quick.pl"
+# Install quick inline script (optional - if available)
+if [ -f "$SCRIPT_DIR/did-optimizer-quick.pl" ]; then
+    cp "$SCRIPT_DIR/did-optimizer-quick.pl" "$AGI_DIR/"
+    chmod +x "$AGI_DIR/did-optimizer-quick.pl"
+    echo -e "${GREEN}✅ Quick inline script installed${NC}"
+fi
 
 echo -e "${GREEN}✅ AGI scripts installed in: $AGI_DIR${NC}"
 
