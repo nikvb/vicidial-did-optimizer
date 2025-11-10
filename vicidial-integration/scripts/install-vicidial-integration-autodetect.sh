@@ -404,7 +404,7 @@ if [ "$PKG_MANAGER" = "yum" ] || [ "$PKG_MANAGER" = "dnf" ]; then
     # CentOS/RHEL/Fedora
     echo -e "${YELLOW}Installing packages for CentOS/RHEL...${NC}"
 
-    # Install EPEL repository if not already installed (needed for many Perl modules)
+    # Install EPEL repository if not already installed (needed for build tools)
     if ! rpm -q epel-release >/dev/null 2>&1; then
         echo -e "${YELLOW}Installing EPEL repository...${NC}"
         if [ "$OS_VERSION" = "7" ]; then
@@ -414,16 +414,32 @@ if [ "$PKG_MANAGER" = "yum" ] || [ "$PKG_MANAGER" = "dnf" ]; then
         fi
     fi
 
-    # Install Perl and core dependencies
+    # Install core Perl and build tools (required for CPAN)
+    echo -e "${YELLOW}Installing Perl core and build tools...${NC}"
     $PKG_MANAGER install -y perl perl-core perl-CPAN perl-devel \
-        perl-libwww-perl perl-JSON perl-DBI perl-DBD-MySQL \
-        perl-IO-Socket-SSL perl-Net-SSLeay perl-LWP-Protocol-https \
-        perl-URI openssl openssl-devel
+        gcc make openssl openssl-devel ca-certificates
 
-    # Some modules may need to be installed via CPAN on CentOS 7
-    if [ "$OS_VERSION" = "7" ]; then
-        echo -e "${YELLOW}Installing additional modules via CPAN for CentOS 7...${NC}"
-        cpan -T Mozilla::CA 2>/dev/null || echo -e "${YELLOW}⚠️  Mozilla::CA may need manual installation${NC}"
+    # For CentOS 7, use CPAN for all Perl modules (newer versions than yum)
+    if [ "$OS_VERSION" = "7" ] || [ "$OS_VERSION" = "7."* ]; then
+        echo -e "${BLUE}Using CPAN for Perl modules (CentOS 7 yum packages are outdated)${NC}"
+
+        # Configure CPAN non-interactively
+        if [ ! -f ~/.cpan/CPAN/MyConfig.pm ] && [ ! -f /root/.cpan/CPAN/MyConfig.pm ]; then
+            echo -e "${YELLOW}Configuring CPAN...${NC}"
+            perl -MCPAN -e 'my $c = "CPAN::HandleConfig"; $c->load(doit => 1, autoconfig => 1);' 2>/dev/null
+        fi
+
+        # Install all modules via CPAN
+        echo -e "${YELLOW}Installing Perl modules via CPAN...${NC}"
+        CPAN_MODULES="LWP::UserAgent LWP::Protocol::https IO::Socket::SSL Net::SSLeay Mozilla::CA JSON DBI DBD::mysql URI::Escape"
+        for mod in $CPAN_MODULES; do
+            cpan -T "$mod" 2>&1 | tail -1
+        done
+    else
+        # For newer versions (CentOS 8+), can use dnf packages
+        $PKG_MANAGER install -y perl-libwww-perl perl-JSON perl-DBI perl-DBD-MySQL \
+            perl-IO-Socket-SSL perl-Net-SSLeay perl-LWP-Protocol-https perl-URI
+        cpan -T Mozilla::CA 2>/dev/null || true
     fi
 
 elif [ "$PKG_MANAGER" = "apt-get" ]; then

@@ -66,40 +66,56 @@ yum install -y \
 
 echo -e "${GREEN}✅ Core tools installed${NC}\n"
 
-# Step 3: Install Perl Modules from YUM/EPEL
-echo -e "${YELLOW}Step 3: Installing Perl Modules from YUM/EPEL...${NC}"
-yum install -y \
-    perl-libwww-perl \
-    perl-JSON \
-    perl-DBI \
-    perl-DBD-MySQL \
-    perl-IO-Socket-SSL \
-    perl-Net-SSLeay \
-    perl-LWP-Protocol-https \
-    perl-URI
+# Step 3: Configure CPAN (Non-Interactive)
+echo -e "${YELLOW}Step 3: Configuring CPAN...${NC}"
+echo -e "${BLUE}Using CPAN for latest stable Perl modules (newer than CentOS 7 repos)${NC}\n"
 
-echo -e "${GREEN}✅ YUM Perl modules installed${NC}\n"
-
-# Step 4: Install Additional Modules via CPAN
-echo -e "${YELLOW}Step 4: Installing Additional Modules via CPAN...${NC}"
-
-# Check if CPAN is configured
+# Auto-configure CPAN if not already configured
 if [ ! -f ~/.cpan/CPAN/MyConfig.pm ] && [ ! -f /root/.cpan/CPAN/MyConfig.pm ]; then
-    echo -e "${YELLOW}Configuring CPAN (first time setup)...${NC}"
-    (echo y; echo sudo; echo local::lib) | cpan >/dev/null 2>&1 || {
-        # Alternative auto-config
-        perl -MCPAN -e 'my $c = "CPAN::HandleConfig"; $c->load(doit => 1, autoconfig => 1);' 2>/dev/null
+    echo -e "${YELLOW}Setting up CPAN for first time use...${NC}"
+
+    # Non-interactive CPAN configuration
+    perl -MCPAN -e 'my $c = "CPAN::HandleConfig"; $c->load(doit => 1, autoconfig => 1);' 2>/dev/null || {
+        # Fallback method
+        (echo y; echo sudo; echo local::lib) | cpan >/dev/null 2>&1
     }
+
+    echo -e "${GREEN}✅ CPAN configured${NC}"
+else
+    echo -e "${GREEN}✅ CPAN already configured${NC}"
 fi
 
-# Install modules via CPAN (skip tests for speed)
-echo -e "${YELLOW}Installing Mozilla::CA...${NC}"
-cpan -T Mozilla::CA 2>&1 | grep -i "installed\|up to date" || echo -e "${YELLOW}⚠️  Check manually if needed${NC}"
+# Upgrade CPAN itself to latest version
+echo -e "${YELLOW}Upgrading CPAN to latest version...${NC}"
+cpan -T CPAN 2>&1 | tail -3
 
-echo -e "${YELLOW}Installing URI::Escape (if not already present)...${NC}"
-cpan -T URI::Escape 2>&1 | grep -i "installed\|up to date" || echo -e "${YELLOW}⚠️  May already be included in perl-URI${NC}"
+echo ""
 
-echo -e "${GREEN}✅ CPAN modules installed${NC}\n"
+# Step 4: Install Perl Modules via CPAN
+echo -e "${YELLOW}Step 4: Installing Perl Modules via CPAN...${NC}"
+
+# List of required modules
+PERL_MODULES=(
+    "LWP::UserAgent"
+    "LWP::Protocol::https"
+    "IO::Socket::SSL"
+    "Net::SSLeay"
+    "Mozilla::CA"
+    "JSON"
+    "DBI"
+    "DBD::mysql"
+    "URI::Escape"
+)
+
+# Install each module via CPAN
+for module in "${PERL_MODULES[@]}"; do
+    echo -e "${YELLOW}Installing $module...${NC}"
+    # -T = skip tests for faster installation (tests can take very long)
+    # Output last 2 lines to show result
+    cpan -T "$module" 2>&1 | tail -2
+done
+
+echo -e "\n${GREEN}✅ All Perl modules installed via CPAN${NC}\n"
 
 # Step 5: Update CA Certificates
 echo -e "${YELLOW}Step 5: Updating CA Certificates...${NC}"
