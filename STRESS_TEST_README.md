@@ -4,7 +4,25 @@ Comprehensive multi-threaded stress testing tools for the `/api/v1/dids/next` en
 
 ## Available Tools
 
-### 1. stress-test-dids-next.js (Multi-threaded)
+### 1. stress-test-dids.pl ⭐ RECOMMENDED FOR VICIDIAL
+**VICIdial-native Perl stress tester using the same modules as VICIdial AGI scripts.**
+
+**Features:**
+- ✅ Uses LWP::UserAgent (same as VICIdial)
+- ✅ Can load config from `/etc/asterisk/dids.conf`
+- ✅ True concurrent testing using fork()
+- ✅ No external dependencies beyond VICIdial requirements
+- ✅ Detailed percentile latency analysis (P50, P90, P95, P99)
+- ✅ JSON report generation
+- ✅ **Runs directly on VICIdial servers**
+
+**Why use this?**
+- Tests from actual VICIdial environment
+- Uses same HTTP client as production AGI scripts
+- No Node.js required
+- Most realistic performance testing
+
+### 2. stress-test-dids-next.js (Multi-threaded)
 Full-featured stress testing with worker threads for maximum concurrency and accurate load simulation.
 
 **Features:**
@@ -17,12 +35,12 @@ Full-featured stress testing with worker threads for maximum concurrency and acc
 - ✅ Comprehensive error reporting
 - ✅ JSON report generation
 
-### 2. stress-test-simple.js (Concurrent Promises)
+### 3. stress-test-simple.js (Concurrent Promises)
 Lightweight alternative using concurrent async requests without worker threads.
 
 **Features:**
 - ✅ Simpler architecture (no worker threads)
-- ✅ Lower overhead
+- ✅ Fixed connection pooling for high concurrency
 - ✅ Progress tracking
 - ✅ Percentile latency analysis
 - ✅ JSON report generation
@@ -30,7 +48,21 @@ Lightweight alternative using concurrent async requests without worker threads.
 
 ## Installation
 
-No additional dependencies required! Both tools use only Node.js built-in modules.
+### Perl Tool (Recommended for VICIdial)
+No installation needed! All required Perl modules are already installed with VICIdial:
+```bash
+chmod +x stress-test-dids.pl
+```
+
+**Required modules** (already in VICIdial):
+- LWP::UserAgent
+- JSON
+- Time::HiRes
+- Getopt::Long
+- POSIX
+
+### Node.js Tools
+No additional dependencies required! Uses only Node.js built-in modules.
 
 ```bash
 chmod +x stress-test-dids-next.js
@@ -39,7 +71,28 @@ chmod +x stress-test-simple.js
 
 ## Usage Examples
 
-### Quick Start (Simple Tool)
+### Quick Start (Perl - VICIdial Native) ⭐
+
+```bash
+# Basic test: 10 concurrent requests, 100 total
+perl stress-test-dids.pl --concurrent 10 --requests 100
+
+# Load config from VICIdial dids.conf
+perl stress-test-dids.pl --config /etc/asterisk/dids.conf --concurrent 20 --requests 500
+
+# Custom API URL and key
+perl stress-test-dids.pl \
+  --concurrent 50 \
+  --requests 1000 \
+  --api-url http://your-server:5000/api/v1/dids/next \
+  --api-key your_api_key_here
+
+# On VICIdial server (using installed config)
+cd /usr/local/src/did-optimizer
+perl stress-test-dids.pl --config /etc/asterisk/dids.conf --concurrent 10 --requests 100
+```
+
+### Quick Start (JavaScript - Simple Tool)
 
 ```bash
 # Basic test: 50 concurrent requests, 1000 total
