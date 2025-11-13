@@ -169,6 +169,14 @@ didSchema.index({ tenantId: 1, 'location.areaCode': 1 });
 didSchema.index({ tenantId: 1, 'usage.lastUsed': 1 });
 didSchema.index({ 'location.latitude': 1, 'location.longitude': 1 });
 
+// Critical indexes for DID rotation and selection (for /api/v1/dids/next endpoint)
+// This compound index supports the most common query: active DIDs with good reputation sorted by lastUsed
+didSchema.index({ tenantId: 1, status: 1, 'reputation.score': 1, 'usage.lastUsed': 1 });
+// Fallback index for queries without lastUsed sorting
+didSchema.index({ tenantId: 1, status: 1, 'reputation.score': 1 });
+// Index for daily usage filtering
+didSchema.index({ 'usage.dailyUsage.date': 1 });
+
 // Method to get today's usage count
 didSchema.methods.getTodayUsage = function() {
   const today = new Date();
