@@ -15,6 +15,21 @@ import { URL } from 'url';
 import { performance } from 'perf_hooks';
 import fs from 'fs';
 
+// Create HTTP agents with unlimited sockets for high concurrency
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: Infinity,
+  maxFreeSockets: 256,
+  timeout: 30000
+});
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: Infinity,
+  maxFreeSockets: 256,
+  timeout: 30000
+});
+
 const config = {
   apiUrl: process.env.API_URL || 'http://localhost:5000/api/v1/dids/next',
   apiKey: process.env.API_KEY || 'did_259b3759b3041137f2379fe1aff4aefeba4aa8b8bea355c4f0e33fbe714d46f7',
@@ -67,16 +82,19 @@ async function makeRequest() {
   url.searchParams.append('customer_phone', customerPhone);
   url.searchParams.append('customer_state', customerState);
 
+  const isHttps = url.protocol === 'https:';
+
   const options = {
     method: 'GET',
     headers: {
       'x-api-key': config.apiKey,
       'User-Agent': 'DID-Stress-Test-Simple/1.0'
     },
-    timeout: config.timeout
+    timeout: config.timeout,
+    agent: isHttps ? httpsAgent : httpAgent
   };
 
-  const protocol = url.protocol === 'https:' ? https : http;
+  const protocol = isHttps ? https : http;
   const startTime = performance.now();
 
   return new Promise((resolve) => {
