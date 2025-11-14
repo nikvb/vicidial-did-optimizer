@@ -31,9 +31,8 @@ const frontendBuildPath = path.join(__dirname, 'frontend');
 // Initialize Resend
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// Import middleware - commented out until middleware files are created
-// import { errorHandler } from './middleware/errorHandler.js';
-// import { notFound } from './middleware/notFound.js';
+// Import middleware
+import { errorHandler, notFound } from './middleware/errorHandler.js';
 
 // Import passport configuration AFTER dotenv
 // import './config/passport.js'; // Commented out - passport config included inline
@@ -248,7 +247,7 @@ app.use('/api', (req, res, next) => {
 
 // VICIdial API endpoint - bypasses session auth
 app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
-  console.log('🎯 VICIdial DID Next endpoint called');
+  console.log('🎯 VICIdial DID Next endpoint called (OPTIMIZED)');
   console.log('📊 Query params:', req.query);
   console.log('🏢 Tenant:', req.tenant?.name, 'ID:', req.tenant?._id);
 
@@ -262,196 +261,239 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
       customer_phone
     } = req.query;
 
-    // Find an available DID for this tenant
-    console.log('🔍 Searching for DIDs with query:');
-    console.log('   Tenant ID:', req.tenant._id);
-    console.log('   Status: active');
+    const tenantId = req.tenant._id;
+    const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
 
-    // Enhanced Round-Robin Rotation Algorithm
-    // Reload tenant to get latest rotation state
-    const freshTenant = await Tenant.findById(req.tenant._id);
-    console.log('🔍 Fresh tenant rotation state from DB:', freshTenant.rotationState);
+    // Calculate today's date boundaries for daily usage filtering
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
 
-    let rotationState = freshTenant.rotationState || {
-      currentIndex: 0,
-      lastReset: new Date(),
-      usedDidsInCycle: []
-    };
+    // Try to get rotation state from cache first
+    let rotationState = getCachedRotationState(tenantId);
 
-    // Initialize usedDidsInCycle as a Set for processing
+    if (!rotationState) {
+      // Load from DB if not in cache
+      const freshTenant = await Tenant.findById(tenantId).select('rotationState').lean();
+      rotationState = freshTenant.rotationState || {
+        currentIndex: 0,
+        lastReset: new Date(),
+        usedDidsInCycle: []
+      };
+      setCachedRotationState(tenantId, rotationState);
+    }
+
+    console.log('🔍 Rotation state loaded:', {
+      cached: rotationState !== null,
+      currentIndex: rotationState.currentIndex,
+      usedInCycle: rotationState.usedDidsInCycle?.length || 0
+    });
+
     const usedDidsSet = new Set(rotationState.usedDidsInCycle || []);
 
-    // Reset cycle if all DIDs have been used or it's been more than 24 hours
-    const activeDids = await DID.countDocuments({ tenantId: req.tenant._id, status: 'active' });
-    const goodReputationDids = await DID.countDocuments({
-      tenantId: req.tenant._id,
-      status: 'active',
-      'reputation.score': { $gte: 50 }
+    // **OPTIMIZED AGGREGATION PIPELINE**
+    const pipeline = [
+      // Match tenant's active DIDs
+      {
+        $match: {
+          tenantId: tenantId,
+          status: 'active'
+        }
+      },
+      // Add computed field for today's usage
+      {
+        $addFields: {
+          todayUsage: {
+            $let: {
+              vars: {
+                todayEntry: {
+                  $arrayElemAt: [
+                    {
+                      $filter: {
+                        input: { $ifNull: ['$usage.dailyUsage', []] },
+                        as: 'day',
+                        cond: {
+                          $and: [
+                            { $gte: ['$$day.date', today] },
+                            { $lt: ['$$day.date', tomorrow] }
+                          ]
+                        }
+                      }
+                    },
+                    0
+                  ]
+                }
+              },
+              in: { $ifNull: ['$$todayEntry.count', 0] }
+            }
+          },
+          effectiveCapacity: { $ifNull: ['$capacity', defaultCapacity] }
+        }
+      },
+      // Add flags for filtering
+      {
+        $addFields: {
+          hasCapacity: { $lt: ['$todayUsage', '$effectiveCapacity'] },
+          hasGoodReputation: { $gte: [{ $ifNull: ['$reputation.score', 50] }, 50] },
+          isUnusedInCycle: { $not: { $in: ['$_id', Array.from(usedDidsSet)] } }
+        }
+      },
+      // Facet to get both counts and candidate DIDs
+      {
+        $facet: {
+          // Get statistics
+          stats: [
+            {
+              $group: {
+                _id: null,
+                total: { $sum: 1 },
+                active: { $sum: 1 },
+                goodReputation: {
+                  $sum: { $cond: ['$hasGoodReputation', 1, 0] }
+                },
+                hasCapacity: {
+                  $sum: { $cond: ['$hasCapacity', 1, 0] }
+                }
+              }
+            }
+          ],
+          // Strategy 1: Unused DIDs in cycle with good reputation and capacity
+          strategy1: [
+            {
+              $match: {
+                isUnusedInCycle: true,
+                hasGoodReputation: true,
+                hasCapacity: true
+              }
+            },
+            { $sort: { 'usage.lastUsed': 1, createdAt: 1 } },
+            { $limit: 1 },
+            {
+              $project: {
+                _id: 1,
+                phoneNumber: 1,
+                location: 1,
+                'usage.lastUsed': 1,
+                'reputation.score': 1,
+                todayUsage: 1,
+                effectiveCapacity: 1
+              }
+            }
+          ],
+          // Strategy 2: Any DID with good reputation and capacity
+          strategy2: [
+            {
+              $match: {
+                hasGoodReputation: true,
+                hasCapacity: true
+              }
+            },
+            { $sort: { 'usage.lastUsed': 1, _id: 1 } },
+            { $limit: 1 },
+            {
+              $project: {
+                _id: 1,
+                phoneNumber: 1,
+                location: 1,
+                'usage.lastUsed': 1,
+                'reputation.score': 1,
+                todayUsage: 1,
+                effectiveCapacity: 1
+              }
+            }
+          ],
+          // Strategy 3: Any DID with good reputation (ignoring capacity)
+          strategy3: [
+            {
+              $match: {
+                hasGoodReputation: true
+              }
+            },
+            { $sort: { 'reputation.score': -1, 'usage.lastUsed': 1 } },
+            { $limit: 1 },
+            {
+              $project: {
+                _id: 1,
+                phoneNumber: 1,
+                location: 1,
+                'usage.lastUsed': 1,
+                'reputation.score': 1,
+                todayUsage: 1,
+                effectiveCapacity: 1
+              }
+            }
+          ],
+          // Strategy 4: Any active DID (last resort)
+          strategy4: [
+            { $sort: { 'reputation.score': -1, todayUsage: 1 } },
+            { $limit: 1 },
+            {
+              $project: {
+                _id: 1,
+                phoneNumber: 1,
+                location: 1,
+                'usage.lastUsed': 1,
+                'reputation.score': 1,
+                todayUsage: 1,
+                effectiveCapacity: 1
+              }
+            }
+          ]
+        }
+      }
+    ];
+
+    console.log('🔍 Running optimized aggregation pipeline...');
+    const startTime = Date.now();
+    const [result] = await DID.aggregate(pipeline);
+    const queryTime = Date.now() - startTime;
+    console.log(`⚡ Aggregation completed in ${queryTime}ms`);
+
+    // Extract results
+    const stats = result.stats[0] || { total: 0, active: 0, goodReputation: 0, hasCapacity: 0 };
+    let selectedDid = result.strategy1[0] || result.strategy2[0] || result.strategy3[0] || result.strategy4[0];
+    let strategy = selectedDid ?
+      (result.strategy1[0] ? 'Strategy 1: Unused in cycle' :
+       result.strategy2[0] ? 'Strategy 2: Good reputation' :
+       result.strategy3[0] ? 'Strategy 3: Any good reputation' :
+       'Strategy 4: Last resort') :
+      'No DID found';
+
+    console.log('📊 DID Statistics:', {
+      total: stats.total,
+      active: stats.active,
+      goodReputation: stats.goodReputation,
+      hasCapacity: stats.hasCapacity,
+      strategy: strategy
     });
-    const shouldResetCycle = usedDidsSet.size >= goodReputationDids ||
+
+    // Check if we need to reset cycle
+    const shouldResetCycle = usedDidsSet.size >= stats.goodReputation ||
                             (new Date() - new Date(rotationState.lastReset)) > 24 * 60 * 60 * 1000;
 
-    if (shouldResetCycle) {
+    if (shouldResetCycle && result.strategy2[0]) {
       console.log('🔄 Resetting rotation cycle - starting fresh round');
       usedDidsSet.clear();
       rotationState.currentIndex = 0;
       rotationState.lastReset = new Date();
+      selectedDid = result.strategy2[0]; // Use strategy 2 after reset
     }
 
-    console.log('🎯 Rotation State:', {
-      currentIndex: rotationState.currentIndex,
-      usedInCycle: usedDidsSet.size,
-      totalActive: activeDids,
-      goodReputation: goodReputationDids
-    });
+    // Handle no DID found case
+    if (!selectedDid) {
+      console.error('❌ CRITICAL: No DIDs available at all. Using fallback.');
 
-    // Helper function to check if DID has reached daily limit
-    const filterByDailyLimit = async (dids) => {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
-
-      return dids.filter(did => {
-        if (!did.usage || !did.usage.dailyUsage) return true; // No usage data, allow
-
-        const todayUsage = did.usage.dailyUsage.find(day => {
-          const dayDate = new Date(day.date);
-          dayDate.setHours(0, 0, 0, 0);
-          return dayDate.getTime() === today.getTime();
-        });
-
-        const usageCount = todayUsage ? todayUsage.count : 0;
-        const capacity = did.capacity || defaultCapacity;
-        const hasCapacity = usageCount < capacity;
-
-        if (!hasCapacity) {
-          console.log(`⚠️ DID ${did.phoneNumber} has reached daily limit: ${usageCount}/${capacity}`);
-        }
-
-        return hasCapacity;
-      });
-    };
-
-    // Strategy 1: Round-robin through unused DIDs in current cycle with good reputation
-    let query = {
-      tenantId: req.tenant._id,
-      status: 'active',
-      'reputation.score': { $gte: 50 } // Only use DIDs with good reputation (50+ score)
-    };
-
-    // Exclude DIDs already used in this cycle
-    if (usedDidsSet.size > 0) {
-      query._id = { $nin: Array.from(usedDidsSet) };
-    }
-
-    console.log('🔄 Step 1: Round-robin through unused DIDs in cycle with good reputation');
-
-    // Fetch multiple DIDs and filter by daily limit
-    let candidateDids = await DID.find(query)
-      .sort({ lastUsed: 1, createdAt: 1 })
-      .limit(20); // Get 20 candidates to filter
-
-    let availableDids = await filterByDailyLimit(candidateDids);
-    let did = availableDids[rotationState.currentIndex % Math.max(1, availableDids.length)] || null;
-
-    if (!did && usedDidsSet.size > 0) {
-      // Strategy 2: If no unused DIDs in cycle, pick least recently used with good reputation
-      console.log('🔄 Step 2: All DIDs used in cycle, picking least recently used with good reputation');
-      query = {
-        tenantId: req.tenant._id,
-        status: 'active',
-        'reputation.score': { $gte: 50 } // Only use DIDs with good reputation (50+ score)
-      };
-
-      candidateDids = await DID.find(query).sort({ lastUsed: 1, _id: 1 }).limit(20);
-      availableDids = await filterByDailyLimit(candidateDids);
-      did = availableDids[0] || null;
-
-      // Reset the cycle
-      usedDidsSet.clear();
-      rotationState.currentIndex = 0;
-    }
-
-    if (!did) {
-      // Strategy 3: Try good reputation DIDs first, then any active DID as last resort
-      console.log('🔄 Step 3: Fallback - trying good reputation DIDs first');
-
-      candidateDids = await DID.find({
-        tenantId: req.tenant._id,
-        status: 'active',
-        'reputation.score': { $gte: 50 }
-      }).sort({ 'reputation.score': -1, lastUsed: 1 }).limit(20);
-
-      availableDids = await filterByDailyLimit(candidateDids);
-      did = availableDids[0] || null;
-
-      if (!did) {
-        console.log('⚠️ Step 4: Last resort - using any active DID (even with bad reputation)');
-
-        candidateDids = await DID.find({
-          tenantId: req.tenant._id,
-          status: 'active'
-        }).sort({ 'reputation.score': -1, lastUsed: 1 }).limit(20);
-
-        availableDids = await filterByDailyLimit(candidateDids);
-        did = availableDids[0] || null;
-      }
-    }
-
-    // Check total DIDs for this tenant
-    const totalDids = await DID.countDocuments({ tenantId: req.tenant._id });
-
-    console.log('📊 DID Statistics:');
-    console.log('   Total DIDs for tenant:', totalDids);
-    console.log('   Active DIDs for tenant:', activeDids);
-    console.log('   Good reputation DIDs (≥50):', goodReputationDids);
-    console.log('   Bad reputation DIDs (<50):', activeDids - goodReputationDids);
-
-    if (did) {
-      const currentUsage = did.getTodayUsage();
-      const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
-      const capacity = did.capacity || defaultCapacity;
-      console.log('🎯 DID Query Result:', `Found: ${did.phoneNumber} (Last used: ${did.usage?.lastUsed || 'Never'}, Reputation: ${did.reputation?.score || 'Unknown'}, Today's usage: ${currentUsage}/${capacity})`);
-    } else {
-      console.log('🎯 DID Query Result: No DID found');
-    }
-
-    if (!did) {
-      console.warn('⚠️ WARNING: All DIDs may have reached their daily capacity limits. Selecting DID with lowest over-capacity usage.');
-
-      // Strategy 5: All DIDs exhausted - pick DID with lowest usage over capacity
-      const allActiveDids = await DID.find({
-        tenantId: req.tenant._id,
-        status: 'active'
-      }).sort({ 'reputation.score': -1 });
-
-      if (allActiveDids.length > 0) {
-        // Find DID with lowest today's usage
-        let minUsage = Infinity;
-        let selectedDid = null;
-
-        for (const candidateDid of allActiveDids) {
-          const todayUsage = candidateDid.getTodayUsage();
-          if (todayUsage < minUsage) {
-            minUsage = todayUsage;
-            selectedDid = candidateDid;
-          }
-        }
-
-        did = selectedDid;
-        const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
-        console.log(`📢 OVER CAPACITY: Using ${did.phoneNumber} with ${minUsage} calls today (capacity: ${did.capacity || defaultCapacity})`);
-
-        // Send email notification about capacity exhaustion
+      // Try to send capacity exhaustion email (non-blocking)
+      setImmediate(async () => {
         try {
           const adminUsers = await User.find({
-            tenantId: req.tenant._id,
+            tenantId: tenantId,
             role: 'ADMIN'
-          });
+          }).select('email').lean();
 
           const adminEmails = adminUsers.map(u => u.email).filter(Boolean);
-
-          if (adminEmails.length > 0) {
+          if (adminEmails.length > 0 && resend) {
             await resend.emails.send({
               from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
               to: adminEmails,
@@ -462,151 +504,123 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
                 <p><strong>Campaign:</strong> ${campaign_id || 'Unknown'}</p>
                 <p><strong>Agent:</strong> ${agent_id || 'Unknown'}</p>
                 <p><strong>Time:</strong> ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })}</p>
-                <p><strong>Action Taken:</strong> Selected DID ${did.phoneNumber} with lowest over-capacity usage (${minUsage} calls today).</p>
                 <hr style="margin: 20px 0; border: none; border-top: 1px solid #e5e7eb;">
                 <p style="color: #6b7280; font-size: 14px;">
                   Consider increasing your DID pool capacity or adding more DIDs to handle the call volume.
-                  <br><br>
-                  Log in to your <a href="${process.env.FRONTEND_URL || 'https://dids.amdy.io'}/settings/rotation-rules">DID Optimizer dashboard</a> to manage capacity settings.
                 </p>
               `
             });
-            console.log('📧 Capacity exhaustion email sent to admins:', adminEmails.join(', '));
           }
         } catch (emailError) {
           console.error('❌ Failed to send capacity exhaustion email:', emailError);
         }
-      }
+      });
 
-      if (!did) {
-        console.error('❌ CRITICAL: No DIDs available at all. Using fallback.');
-        return res.json({
-          success: true,
-          did: {
-            number: process.env.FALLBACK_DID || '+18005551234',
-            is_fallback: true
-          }
-        });
-      }
+      return res.json({
+        success: true,
+        did: {
+          number: process.env.FALLBACK_DID || '+18005551234',
+          is_fallback: true
+        }
+      });
     }
 
     // Update rotation state
-    usedDidsSet.add(did._id.toString());
-    rotationState.currentIndex = (rotationState.currentIndex + 1) % activeDids;
+    usedDidsSet.add(selectedDid._id.toString());
+    rotationState.currentIndex = (rotationState.currentIndex + 1) % stats.active;
+    rotationState.usedDidsInCycle = Array.from(usedDidsSet);
 
-    // Save rotation state to tenant
-    const newRotationState = {
-      currentIndex: rotationState.currentIndex,
-      lastReset: rotationState.lastReset,
-      usedDidsInCycle: Array.from(usedDidsSet) // Convert Set to Array for MongoDB
-    };
-    console.log('💾 Saving rotation state to DB:', newRotationState);
+    // Cache the updated rotation state
+    setCachedRotationState(tenantId, rotationState);
 
-    freshTenant.rotationState = newRotationState;
-    await freshTenant.save();
+    console.log('🎯 Selected DID:', {
+      number: selectedDid.phoneNumber,
+      strategy: strategy,
+      todayUsage: selectedDid.todayUsage,
+      capacity: selectedDid.effectiveCapacity,
+      reputation: selectedDid.reputation?.score || 'Unknown'
+    });
 
-    console.log('✅ Rotation state saved to DB successfully');
-
-    // Update last used timestamp and usage tracking
+    // **OPTIMIZED: Batch all writes together**
     const now = new Date();
+    const uniqueid = req.headers['x-request-id'] || '';
 
-    // Initialize usage object if it doesn't exist
-    if (!did.usage) {
-      did.usage = {
-        totalCalls: 0,
-        dailyUsage: [],
-        lastUsed: null,
-        lastCampaign: null,
-        lastAgent: null
-      };
-    }
+    await Promise.all([
+      // Update DID usage with atomic operations
+      DID.findByIdAndUpdate(
+        selectedDid._id,
+        {
+          $set: {
+            'usage.lastUsed': now,
+            'usage.lastCampaign': campaign_id,
+            'usage.lastAgent': agent_id
+          },
+          $inc: { 'usage.totalCalls': 1 },
+          $push: {
+            'usage.dailyUsage': {
+              $each: [{ date: today, count: 1 }],
+              $position: 0,
+              $slice: 30 // Keep only last 30 days
+            }
+          }
+        },
+        { new: false }
+      ).lean(),
 
-    did.usage.lastUsed = now;
-    did.usage.totalCalls = (did.usage.totalCalls || 0) + 1;
-    did.usage.lastCampaign = campaign_id;
-    did.usage.lastAgent = agent_id;
+      // Save rotation state to tenant
+      Tenant.findByIdAndUpdate(
+        tenantId,
+        { $set: { rotationState: rotationState } },
+        { new: false }
+      ).lean(),
 
-    // Increment today's usage count for daily limit tracking
-    did.incrementTodayUsage();
+      // Create call record
+      CallRecord.create({
+        didId: selectedDid._id,
+        tenantId: tenantId,
+        phoneNumber: customer_phone || 'unknown',
+        callTimestamp: now,
+        duration: 0,
+        result: 'answered',
+        disposition: 'initiated',
+        campaignId: campaign_id,
+        agentId: agent_id,
+        customerState: customer_state,
+        customerAreaCode: customer_area_code,
+        metadata: {
+          callDirection: 'outbound',
+          recording: false,
+          uniqueid: uniqueid,
+          source: 'did-selection'
+        }
+      })
+    ]);
 
-    const todayUsage = did.getTodayUsage();
-    const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
-    const dailyCapacity = did.capacity || defaultCapacity;
-
-    console.log('📝 Updating DID usage:', {
-      did: did.phoneNumber,
-      didId: did._id,
-      oldLastUsed: did.usage.lastUsed,
-      newLastUsed: now,
-      totalCalls: did.usage.totalCalls,
-      todayUsage: todayUsage,
-      dailyCapacity: dailyCapacity,
-      percentageUsed: `${Math.round((todayUsage / dailyCapacity) * 100)}%`,
-      campaign: campaign_id,
-      agent: agent_id
-    });
-
-    try {
-      const savedDid = await did.save();
-      console.log('✅ DID usage updated successfully:', {
-        id: savedDid._id,
-        phone: savedDid.phoneNumber,
-        lastUsed: savedDid.usage?.lastUsed,
-        totalCalls: savedDid.usage?.totalCalls
-      });
-    } catch (saveError) {
-      console.error('❌ ERROR saving DID usage:', saveError);
-      console.error('❌ DID object:', JSON.stringify(did, null, 2));
-    }
-
-    // Create call record for tracking (will be updated later with final disposition)
-    const uniqueid = req.headers['x-request-id'] || ''; // From AGI script
-
-    const callRecord = new CallRecord({
-      didId: did._id,
-      tenantId: req.tenant._id,
-      phoneNumber: customer_phone || 'unknown',
-      callTimestamp: new Date(),
-      duration: 0, // Will be updated when call completes
-      result: 'answered', // Default - will be updated when call completes
-      disposition: 'initiated', // Initial state
-      campaignId: campaign_id,
-      agentId: agent_id,
-      customerState: customer_state,
-      customerAreaCode: customer_area_code,
-      metadata: {
-        callDirection: 'outbound',
-        recording: false,
-        uniqueid: uniqueid, // Store uniqueid for matching with call results
-        source: 'did-selection'
-      }
-    });
-    await callRecord.save();
-
-    console.log('📞 Call record created:', callRecord._id, '| Uniqueid:', uniqueid, '| DID:', did.phoneNumber);
-
-    console.log('✅ Rotation state updated:', {
-      selectedDID: did.phoneNumber,
+    console.log('✅ All updates completed:', {
+      selectedDID: selectedDid.phoneNumber,
       newIndex: rotationState.currentIndex,
       usedInCycle: usedDidsSet.size,
-      totalActive: activeDids
+      totalActive: stats.active,
+      queryTime: `${queryTime}ms`
     });
 
     res.json({
       success: true,
       did: {
-        number: did.phoneNumber,
-        description: did.description,
-        carrier: did.carrier,
-        location: did.location,
+        number: selectedDid.phoneNumber,
+        location: selectedDid.location,
         is_fallback: false
       },
       metadata: {
         campaign_id,
         agent_id,
-        timestamp: new Date().toISOString()
+        timestamp: now.toISOString(),
+        performance: {
+          queryTime: `${queryTime}ms`
+        }
       }
     });
+
   } catch (error) {
     console.error('💥 VICIdial API error:', error);
     res.status(500).json({
@@ -2180,6 +2194,7 @@ app.get('/api/v1/tenants/api-keys', async (req, res) => {
 });
 
 app.post('/api/v1/tenants/api-keys', async (req, res) => {
+  console.log('🔵 API Key creation endpoint hit:', req.body);
   try {
     // Get user from session or token
     let userId = null;
@@ -2237,8 +2252,11 @@ app.post('/api/v1/tenants/api-keys', async (req, res) => {
     // Check if API key name already exists
     const existingKey = tenant.apiKeys.find(key => key.name === name && key.isActive);
     if (existingKey) {
-      return res.status(409).json({
+      console.log('🔴 API Key conflict detected:', name);
+      // Return 200 with success:false to avoid Cloudflare error page interception
+      return res.status(200).json({
         success: false,
+        error: 'conflict',
         message: 'API key with this name already exists'
       });
     }
@@ -2273,7 +2291,8 @@ app.post('/api/v1/tenants/api-keys', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('API Key creation error:', error);
+    console.error('🔴 API Key creation error:', error);
+    console.error('🔴 Error stack:', error.stack);
     res.status(500).json({
       success: false,
       message: 'Failed to create API key'
@@ -3511,9 +3530,8 @@ function extractActionsFromResponse(aiResponse) {
 }
 
 // Error handling middleware (must be last)
-// Middleware - commented out until middleware files are created
-// app.use(notFound);
-// app.use(errorHandler);
+app.use(notFound);
+app.use(errorHandler);
 
 const server = app.listen(PORT, () => {
   console.log(`

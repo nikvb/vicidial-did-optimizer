@@ -1,0 +1,31 @@
+{
+   "results" : {
+      "actual_rps" : "81.44",
+      "total" : 100,
+      "success_rate" : "100.00%",
+      "successful" : 100,
+      "failed" : 0,
+      "status_codes" : {
+         "200" : 100
+      },
+      "errors" : {},
+      "duration" : "1.23s",
+      "response_times" : {
+         "min" : 80.966,
+         "p50" : 108.986,
+         "p90" : 122.073,
+         "max" : 125.344,
+         "p99" : 125.344,
+         "avg" : 107.41326,
+         "p95" : 123.301
+      }
+   },
+   "config" : {
+      "api_url" : "http://localhost:5000/api/v1/dids/next",
+      "total_requests" : "100",
+      "concurrent" : "10",
+      "api_key" : "did_259b3759b3041137...",
+      "timeout" : "30"
+   },
+   "timestamp" : "2025-11-14T17:11:25Z"
+}
