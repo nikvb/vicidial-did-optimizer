@@ -251,6 +251,9 @@ if __name__ == "__main__":
         args.push(`--proxy=${proxy.proxyUrl}`);
       }
 
+      let resolved = false;
+      let timeoutId = null;
+
       const python = spawn('python3', args, {
         env: {
           ...process.env,
@@ -261,6 +264,13 @@ if __name__ == "__main__":
       let stdout = '';
       let stderr = '';
 
+      // Handle EPIPE errors on stdin (when Python process dies)
+      python.stdin.on('error', (err) => {
+        if (err.code === 'EPIPE') {
+          console.warn('⚠️ EPIPE on stdin - Python process closed unexpectedly');
+        }
+      });
+
       python.stdout.on('data', (data) => {
         stdout += data.toString();
       });
@@ -269,13 +279,70 @@ if __name__ == "__main__":
         stderr += data.toString();
       });
 
-      python.on('close', (code) => {
-        if (code !== 0) {
-          console.error(`Python script error (${code}):`, stderr);
+      // Handle process error (e.g., spawn failed)
+      python.on('error', (error) => {
+        if (resolved) return;
+        resolved = true;
+        if (timeoutId) clearTimeout(timeoutId);
+        if (proxyId) {
+          webshareProxyService.markProxyError(proxyId);
+        }
+
+        // Check if it's an EPIPE error
+        if (error.code === 'EPIPE') {
+          resolve({
+            success: false,
+            error: 'EPIPE - Python process closed unexpectedly',
+            method: 'epipe_error'
+          });
+        } else {
+          reject(new Error(`Failed to spawn Python process: ${error.message}`));
+        }
+      });
+
+      python.on('close', (code, signal) => {
+        if (resolved) return;
+        resolved = true;
+        if (timeoutId) clearTimeout(timeoutId);
+
+        // Handle unexpected termination (e.g., killed by signal)
+        if (signal) {
+          console.warn(`Python process killed by signal: ${signal}`);
           if (proxyId) {
             webshareProxyService.markProxyError(proxyId);
           }
-          reject(new Error(`Crawl4AI script failed with code ${code}: ${stderr}`));
+          resolve({
+            success: false,
+            error: `Process killed by signal: ${signal}`,
+            method: 'signal_killed'
+          });
+          return;
+        }
+
+        // Check stderr for EPIPE or pipe errors
+        if (stderr.includes('EPIPE') || stderr.includes('Broken pipe') || stderr.includes('BrokenPipeError')) {
+          console.warn('⚠️ Python script had EPIPE error');
+          if (proxyId) {
+            webshareProxyService.markProxyError(proxyId);
+          }
+          resolve({
+            success: false,
+            error: 'EPIPE error in Python script',
+            method: 'epipe_error'
+          });
+          return;
+        }
+
+        if (code !== 0 && code !== null) {
+          console.error(`Python script error (${code}):`, stderr.substring(0, 500));
+          if (proxyId) {
+            webshareProxyService.markProxyError(proxyId);
+          }
+          resolve({
+            success: false,
+            error: `Script failed with code ${code}: ${stderr.substring(0, 200)}`,
+            method: 'script_error'
+          });
           return;
         }
 
@@ -285,7 +352,16 @@ if __name__ == "__main__":
           const jsonLine = lines.find(line => line.startsWith('{') && line.includes('"success"'));
 
           if (!jsonLine) {
-            throw new Error('No JSON found in output');
+            console.error('No JSON in output. stdout:', stdout.substring(0, 500));
+            if (proxyId) {
+              webshareProxyService.markProxyError(proxyId);
+            }
+            resolve({
+              success: false,
+              error: 'No JSON found in output',
+              method: 'parse_error'
+            });
+            return;
           }
 
           const result = JSON.parse(jsonLine);
@@ -296,29 +372,38 @@ if __name__ == "__main__":
           }
           resolve(result);
         } catch (error) {
-          console.error('Failed to parse Python output:', stdout);
+          console.error('Failed to parse Python output:', stdout.substring(0, 500));
           if (proxyId) {
             webshareProxyService.markProxyError(proxyId);
           }
-          reject(new Error(`Failed to parse Crawl4AI output: ${error.message}`));
+          resolve({
+            success: false,
+            error: `Parse error: ${error.message}`,
+            method: 'parse_error'
+          });
         }
       });
 
-      python.on('error', (error) => {
-        if (proxyId) {
-          webshareProxyService.markProxyError(proxyId);
-        }
-        reject(new Error(`Failed to spawn Python process: ${error.message}`));
-      });
+      // Set timeout for long-running scrapes (extended to 60 seconds)
+      timeoutId = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
 
-      // Set timeout for long-running scrapes
-      setTimeout(() => {
-        python.kill('SIGTERM');
+        try {
+          python.kill('SIGTERM');
+        } catch (e) {
+          // Ignore kill errors
+        }
+
         if (proxyId) {
           webshareProxyService.markProxyError(proxyId);
         }
-        reject(new Error('Crawl4AI request timeout'));
-      }, 30000); // 30 second timeout
+        resolve({
+          success: false,
+          error: 'Crawl4AI request timeout (60s)',
+          method: 'timeout'
+        });
+      }, 60000); // 60 second timeout (increased from 30)
     });
   }
 

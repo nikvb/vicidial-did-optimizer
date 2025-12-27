@@ -75,7 +75,8 @@ def save_screenshot(crawl_result, phone_number):
         return None
 
 async def capture_screenshot_playwright(url, clean_number, proxy_url=None):
-    """Capture screenshot using Playwright"""
+    """Capture screenshot using Playwright with robust error handling"""
+    browser = None
     try:
         async with async_playwright() as p:
             browser_args = {"headless": True}
@@ -87,7 +88,18 @@ async def capture_screenshot_playwright(url, clean_number, proxy_url=None):
 
             browser = await p.chromium.launch(**browser_args)
             page = await browser.new_page()
-            await page.goto(url, wait_until="networkidle", timeout=30000)
+
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=30000)
+            except Exception as nav_error:
+                print(f"⚠️ Navigation error (retrying with domcontentloaded): {nav_error}", file=sys.stderr)
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as retry_error:
+                    print(f"❌ Navigation retry failed: {retry_error}", file=sys.stderr)
+                    if browser:
+                        await browser.close()
+                    return None
 
             # Try to click "Accept All" or similar cookie consent buttons
             try:
@@ -128,92 +140,185 @@ async def capture_screenshot_playwright(url, clean_number, proxy_url=None):
 
             await page.screenshot(path=filepath, full_page=True)
             await browser.close()
+            browser = None  # Mark as closed
 
             print(f"✅ Screenshot saved: {filename}", file=sys.stderr)
             return filename
-    except Exception as e:
-        print(f"❌ Screenshot capture failed: {e}", file=sys.stderr)
+    except BrokenPipeError as e:
+        print(f"❌ BrokenPipeError in screenshot capture: {e}", file=sys.stderr)
         return None
+    except ConnectionResetError as e:
+        print(f"❌ ConnectionResetError in screenshot capture: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        error_msg = str(e).lower()
+        if 'epipe' in error_msg or 'broken pipe' in error_msg or 'connection reset' in error_msg:
+            print(f"❌ Pipe error in screenshot capture: {e}", file=sys.stderr)
+        else:
+            print(f"❌ Screenshot capture failed: {e}", file=sys.stderr)
+        return None
+    finally:
+        # Ensure browser is always closed
+        if browser:
+            try:
+                await browser.close()
+            except:
+                pass  # Ignore errors during cleanup
 
-async def scrape_robokiller_data(phone_number, proxy_url=None):
-    """Scrape RoboKiller reputation data for a phone number using enhanced OpenRouter prompt"""
-    clean_number = re.sub(r'\D', '', phone_number)
-    url = f"https://lookup.robokiller.com/search?q={clean_number}"
+async def scrape_with_single_browser(url, clean_number, proxy_url=None):
+    """Use a single Playwright browser for both screenshot and HTML extraction"""
+    browser = None
+    try:
+        async with async_playwright() as p:
+            browser_args = {"headless": True}
+            if proxy_url:
+                print(f"🌐 Using proxy: {proxy_url}", file=sys.stderr)
+                browser_args["proxy"] = {"server": proxy_url}
 
-    # Capture screenshot WITHOUT proxy (faster and more reliable)
-    # Data extraction will still use proxy to avoid rate limits
-    screenshot_filename = await capture_screenshot_playwright(url, clean_number, None)
-
-    # Configure crawler with proxy if provided
-    crawler_config = {
-        "verbose": False,  # Disable verbose to avoid stdout pollution
-        "headless": True
-    }
-
-    if proxy_url:
-        print(f"🌐 Using proxy for crawling: {proxy_url}", file=sys.stderr)
-        crawler_config["proxy"] = proxy_url
-
-    async with AsyncWebCrawler(**crawler_config) as crawler:
-        try:
-            # Crawl the page first with screenshot enabled
-            result = await crawler.arun(
-                url=url,
-                bypass_cache=True,
+            browser = await p.chromium.launch(**browser_args)
+            page = await browser.new_page(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
 
-            if result.success:
+            # Navigate to page
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=30000)
+            except Exception as nav_error:
+                print(f"⚠️ Navigation error (retrying): {nav_error}", file=sys.stderr)
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as retry_error:
+                    raise Exception(f"Navigation failed: {retry_error}")
 
-                # Extract visible text content like the working test script
-                html_cleaned = re.sub(r'<script[^>]*>.*?</script>', '', result.html, flags=re.DOTALL | re.IGNORECASE)
-                html_cleaned = re.sub(r'<style[^>]*>.*?</style>', '', html_cleaned, flags=re.DOTALL | re.IGNORECASE)
-                text_content = re.sub(r'<[^>]+>', ' ', html_cleaned)
-                text_content = re.sub(r'\s+', ' ', text_content).strip()
-
-                # Use enhanced vLLM extraction with visible text
-                if text_content:
+            # Handle cookie consent
+            try:
+                consent_selectors = [
+                    'button:has-text("Accept All")',
+                    'button:has-text("Accept all")',
+                    '[aria-label*="Accept"]',
+                    '.accept-all',
+                    '#accept-all',
+                ]
+                for selector in consent_selectors:
                     try:
-                        llm_result = extract_with_enhanced_openrouter_text(text_content, clean_number)
-                        if llm_result:
-                            return {
-                                "success": True,
-                                "data": llm_result,
-                                "method": "vllm_extraction",
-                                "screenshot": screenshot_filename
-                            }
-                    except Exception as e:
-                        print(f"vLLM extraction error: {e}", file=sys.stderr)
-                        # Fall back to regex if vLLM fails
-                        pass
+                        button = await page.wait_for_selector(selector, timeout=1500)
+                        if button:
+                            await button.click()
+                            await page.wait_for_timeout(500)
+                            break
+                    except:
+                        continue
+            except:
+                pass
 
-                # Fallback to regex extraction due to rate limit
-                # Save screenshot for debugging/verification (if not already saved)
-                if 'screenshot_filename' not in locals():
-                    screenshot_filename = save_screenshot(result, clean_number)
+            # Get HTML content
+            html_content = await page.content()
 
-                html_content = result.html.lower()
-                data = extract_with_enhanced_logic(html_content)
-                return {
-                    "success": True,
-                    "data": data,
-                    "method": "enhanced_regex_extraction",
-                    "screenshot": screenshot_filename
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": f"Failed to crawl {url}: {result.error_message}",
-                    "method": "crawl_failed"
-                }
+            # Take screenshot
+            screenshot_filename = None
+            try:
+                screenshot_dir = '/home/na/didapi/public/screenshots'
+                os.makedirs(screenshot_dir, exist_ok=True)
+                from datetime import datetime
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                screenshot_filename = f'robokiller_{clean_number}_{timestamp}.png'
+                filepath = os.path.join(screenshot_dir, screenshot_filename)
+                await page.screenshot(path=filepath, full_page=True)
+                print(f"✅ Screenshot saved: {screenshot_filename}", file=sys.stderr)
+            except Exception as ss_error:
+                print(f"⚠️ Screenshot failed: {ss_error}", file=sys.stderr)
+                screenshot_filename = None
 
-        except Exception as e:
-            # If Crawl4AI completely fails, return error
+            await browser.close()
+            browser = None
+
             return {
-                "success": False,
-                "error": f"Crawl4AI failed: {str(e)}",
-                "method": "crawl4ai_failed"
+                "success": True,
+                "html": html_content,
+                "screenshot": screenshot_filename
             }
+
+    except BrokenPipeError as e:
+        return {"success": False, "error": f"BrokenPipeError: {e}", "html": None, "screenshot": None}
+    except ConnectionResetError as e:
+        return {"success": False, "error": f"ConnectionResetError: {e}", "html": None, "screenshot": None}
+    except Exception as e:
+        error_msg = str(e).lower()
+        if 'epipe' in error_msg or 'broken pipe' in error_msg:
+            return {"success": False, "error": f"Pipe error: {e}", "html": None, "screenshot": None}
+        return {"success": False, "error": str(e), "html": None, "screenshot": None}
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except:
+                pass
+
+
+async def scrape_robokiller_data(phone_number, proxy_url=None):
+    """Scrape RoboKiller reputation data using a single browser instance"""
+    clean_number = re.sub(r'\D', '', phone_number)
+    url = f"https://lookup.robokiller.com/search?q={clean_number}"
+
+    # Use single browser for both screenshot and HTML extraction
+    browser_result = await scrape_with_single_browser(url, clean_number, proxy_url)
+
+    if not browser_result["success"]:
+        return {
+            "success": False,
+            "error": browser_result.get("error", "Browser scraping failed"),
+            "method": "browser_failed"
+        }
+
+    html_content = browser_result["html"]
+    screenshot_filename = browser_result["screenshot"]
+
+    if not html_content:
+        return {
+            "success": False,
+            "error": "No HTML content retrieved",
+            "method": "no_content"
+        }
+
+    try:
+        # Extract visible text content
+        html_cleaned = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+        html_cleaned = re.sub(r'<style[^>]*>.*?</style>', '', html_cleaned, flags=re.DOTALL | re.IGNORECASE)
+        text_content = re.sub(r'<[^>]+>', ' ', html_cleaned)
+        text_content = re.sub(r'\s+', ' ', text_content).strip()
+
+        # Use enhanced vLLM extraction with visible text
+        if text_content:
+            try:
+                llm_result = extract_with_enhanced_openrouter_text(text_content, clean_number)
+                if llm_result:
+                    return {
+                        "success": True,
+                        "data": llm_result,
+                        "method": "vllm_extraction",
+                        "screenshot": screenshot_filename
+                    }
+            except Exception as e:
+                print(f"vLLM extraction error: {e}", file=sys.stderr)
+                # Fall back to regex if vLLM fails
+                pass
+
+        # Fallback to regex extraction
+        html_lower = html_content.lower()
+        data = extract_with_enhanced_logic(html_lower)
+        return {
+            "success": True,
+            "data": data,
+            "method": "enhanced_regex_extraction",
+            "screenshot": screenshot_filename
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Extraction failed: {str(e)}",
+            "method": "extraction_failed"
+        }
 
 
 def parse_reasoning_content(reasoning_text):
@@ -656,6 +761,7 @@ def extract_with_enhanced_logic(html_content):
 async def main():
     if len(sys.argv) < 2:
         print(json.dumps({"success": False, "error": "Phone number required"}))
+        sys.stdout.flush()
         return
 
     phone_number = sys.argv[1]
@@ -667,8 +773,35 @@ async def main():
             proxy_url = arg.split('=', 1)[1]
             break
 
-    result = await scrape_robokiller_data(phone_number, proxy_url)
-    print(json.dumps(result))
+    try:
+        result = await scrape_robokiller_data(phone_number, proxy_url)
+        print(json.dumps(result))
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Handle EPIPE gracefully - output was already sent or pipe closed
+        print(json.dumps({"success": False, "error": "BrokenPipeError in main", "method": "pipe_error"}), file=sys.stderr)
+        sys.stderr.flush()
+    except Exception as e:
+        error_result = {
+            "success": False,
+            "error": f"Unhandled exception: {str(e)}",
+            "method": "unhandled_exception"
+        }
+        print(json.dumps(error_result))
+        sys.stdout.flush()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Handle broken pipe errors at the top level
+    import signal
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    try:
+        asyncio.run(main())
+    except BrokenPipeError:
+        # Silently exit on broken pipe
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:
+        print(json.dumps({"success": False, "error": f"Fatal error: {str(e)}", "method": "fatal_error"}))
+        sys.exit(1)

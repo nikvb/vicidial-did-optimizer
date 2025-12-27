@@ -4,23 +4,19 @@
 # Runs daily to update phone number reputation from RoboKiller
 
 LOG_FILE="/var/log/did-reputation-$(date +%Y%m%d).log"
-SCRIPT_DIR="/home/na/didapi/temp_clone"
+SCRIPT_DIR="/home/na/didapi"
 
 echo "========================================" >> $LOG_FILE
 echo "DID Reputation Update Started: $(date)" >> $LOG_FILE
 echo "========================================" >> $LOG_FILE
 
-# Set environment variables for debug output
-export NODE_ENV=production
-export DEBUG=*
-export CRAWL4AI_VERBOSE=true
-
 # Change to script directory
 cd $SCRIPT_DIR
 
-# Run the bulk update with debug output
-echo "Running bulk reputation update..." >> $LOG_FILE
-node bulk_update_reputation_fast.js >> $LOG_FILE 2>&1
+# Run the fast Python-based bulk update with proxy rotation
+# ~60 requests/sec, updates DIDs not checked in 48 hours
+echo "Running fast Python reputation update..." >> $LOG_FILE
+python3 scripts/bulk_update_reputation.py --concurrency 50 >> $LOG_FILE 2>&1
 
 # Check exit status
 if [ $? -eq 0 ]; then
