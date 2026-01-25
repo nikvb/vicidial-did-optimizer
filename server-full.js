@@ -1,6 +1,9 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+import pg from 'pg';
+const { Pool } = pg;
+
 // ===== LOGGING CONFIGURATION =====
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'; // debug, info, warn, error
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -137,6 +140,27 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/did-optim
     console.error('❌ MongoDB connection error:', err);
     console.log('⚠️ Running without database connection...');
   });
+
+// TimescaleDB connection pool for analytics
+const timescalePool = new Pool({
+  connectionString: process.env.TIMESCALE_URI || 'postgresql://postgres@localhost:5432/did_analytics',
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+
+timescalePool.on('connect', () => {
+  console.log('✅ TimescaleDB pool connected');
+});
+
+timescalePool.on('error', (err) => {
+  console.error('❌ TimescaleDB pool error:', err.message);
+});
+
+// Test TimescaleDB connection
+timescalePool.query('SELECT NOW()')
+  .then(() => console.log('✅ TimescaleDB connection verified'))
+  .catch(err => console.warn('⚠️ TimescaleDB not available:', err.message));
 
 // Helper function to get location data from area code
 async function getLocationByAreaCode(areaCode) {
@@ -3235,9 +3259,11 @@ app.get('/api/v1/analytics/costs', async (req, res) => {
   }
 });
 
-// Capacity Analytics Endpoint
+// Capacity Analytics Endpoint - Using TimescaleDB for call data
 app.get('/api/v1/analytics/capacity', async (req, res) => {
   try {
+    const startTime = Date.now();
+
     // Get user from token
     const token = req.headers.authorization?.replace('Bearer ', '');
     let userTenantId = null;
@@ -3285,18 +3311,18 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
     const lastBusinessDayEnd = new Date(lastBusinessDayStart);
     lastBusinessDayEnd.setHours(23, 59, 59, 999);
 
-    console.log('📊 Capacity analytics - Last business day:', lastBusinessDayStart.toISOString().split('T')[0]);
+    console.log('📊 Capacity analytics (TimescaleDB) - Last business day:', lastBusinessDayStart.toISOString().split('T')[0]);
 
-    // Build query filter
+    // Build MongoDB query filter for DIDs
     const filter = { status: 'active' };
     if (!isAdmin && userTenantId) {
       filter.tenantId = userTenantId;
     }
 
-    // Get total DIDs
+    // Get total DIDs from MongoDB
     const totalDIDs = await DID.countDocuments(filter);
 
-    // Get DIDs with usage in last 7 days
+    // Get DIDs with usage in last 7 days from MongoDB
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const activeDIDs = await DID.countDocuments({
       ...filter,
@@ -3326,30 +3352,51 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
 
     console.log(`📊 Calculating capacity for last 7 business days (${oldestBusinessDay.toISOString().split('T')[0]} to ${today.toISOString().split('T')[0]})`);
 
-    // Get all DIDs for this tenant
+    // Get all DIDs for this tenant from MongoDB
     const allDIDs = await DID.find(filter).lean();
 
-    // Get calls for each DID in the last 7 business days
-    const didCallCounts = await CallRecord.aggregate([
-      {
-        $match: {
-          ...(!isAdmin && userTenantId ? { tenantId: userTenantId } : {}),
-          callTimestamp: { $gte: oldestBusinessDay, $lt: today },
-          selectedDID: { $exists: true, $ne: null }
-        }
-      },
-      {
-        $group: {
-          _id: '$selectedDID',
-          totalCalls: { $sum: 1 }
-        }
-      }
-    ]);
+    // ========== TIMESCALEDB QUERIES ==========
+    // Get calls per DID from TimescaleDB using call_stats_daily continuous aggregate
+    const tenantFilter = !isAdmin && userTenantId ? userTenantId.toString() : null;
+
+    // Query 1: Get call counts per DID from TimescaleDB
+    const didCallsQuery = `
+      SELECT did_id, SUM(call_count) as total_calls
+      FROM call_stats_daily
+      WHERE bucket >= $1 AND bucket < $2
+        ${tenantFilter ? 'AND tenant_id = $3' : ''}
+        AND did_id IS NOT NULL
+      GROUP BY did_id
+    `;
+    const didCallsParams = tenantFilter
+      ? [oldestBusinessDay.toISOString(), today.toISOString(), tenantFilter]
+      : [oldestBusinessDay.toISOString(), today.toISOString()];
+
+    let didCallCounts = [];
+    try {
+      const didCallsResult = await timescalePool.query(didCallsQuery, didCallsParams);
+      didCallCounts = didCallsResult.rows;
+      console.log(`📊 TimescaleDB: Found ${didCallCounts.length} DIDs with calls`);
+    } catch (tsError) {
+      console.warn('⚠️ TimescaleDB query failed, falling back to MongoDB:', tsError.message);
+      // Fallback to MongoDB if TimescaleDB fails
+      const mongoResult = await CallRecord.aggregate([
+        {
+          $match: {
+            ...(!isAdmin && userTenantId ? { tenantId: userTenantId } : {}),
+            callTimestamp: { $gte: oldestBusinessDay, $lt: today },
+            selectedDID: { $exists: true, $ne: null }
+          }
+        },
+        { $group: { _id: '$selectedDID', total_calls: { $sum: 1 } } }
+      ]);
+      didCallCounts = mongoResult.map(r => ({ did_id: r._id, total_calls: r.total_calls }));
+    }
 
     // Create a map of DID to call count
     const didCallMap = new Map();
     didCallCounts.forEach(item => {
-      didCallMap.set(item._id, item.totalCalls);
+      didCallMap.set(item.did_id, parseInt(item.total_calls));
     });
 
     // Calculate capacity stats with average daily usage
@@ -3363,58 +3410,56 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
         phoneNumber: did.phoneNumber,
         capacity,
         totalCalls: totalCallsLast7Days,
-        avgCallsPerDay: Math.round(avgCallsPerDay * 10) / 10, // Round to 1 decimal
+        avgCallsPerDay: Math.round(avgCallsPerDay * 10) / 10,
         lastUsed: did.usage?.lastUsed,
         location: did.location,
-        utilizationRate: Math.round(utilizationRate * 10) / 10 // Round to 1 decimal
+        utilizationRate: Math.round(utilizationRate * 10) / 10
       };
     }).sort((a, b) => b.utilizationRate - a.utilizationRate);
 
     // Find over-capacity DIDs (>80% utilization)
     const overCapacityDIDs = capacityStats.filter(d => d.utilizationRate > 80);
 
-    // Area code analysis with 7-day average
-    const areaCodeCallCounts = await CallRecord.aggregate([
-      {
-        $match: {
-          ...(!isAdmin && userTenantId ? { tenantId: userTenantId } : {}),
-          callTimestamp: { $gte: oldestBusinessDay, $lt: today },
-          selectedDID: { $exists: true, $ne: null }
-        }
-      },
-      {
-        $lookup: {
-          from: 'dids',
-          localField: 'selectedDID',
-          foreignField: 'phoneNumber',
-          as: 'didInfo'
-        }
-      },
-      {
-        $unwind: {
-          path: '$didInfo',
-          preserveNullAndEmptyArrays: false
-        }
-      },
-      {
-        $match: {
-          'didInfo.location.areaCode': { $exists: true }
-        }
-      },
-      {
-        $group: {
-          _id: '$didInfo.location.areaCode',
-          totalCalls: { $sum: 1 }
-        }
-      }
-    ]);
+    // Query 2: Get destination area codes from TimescaleDB (for last business day)
+    const destAreaCodesQuery = `
+      SELECT
+        CASE
+          WHEN phone_number LIKE '+1%' THEN SUBSTRING(phone_number FROM 3 FOR 3)
+          WHEN phone_number LIKE '1%' AND LENGTH(phone_number) >= 11 THEN SUBSTRING(phone_number FROM 2 FOR 3)
+          WHEN LENGTH(phone_number) >= 10 THEN SUBSTRING(phone_number FROM 1 FOR 3)
+          ELSE NULL
+        END as dest_area_code,
+        COUNT(*) as call_count
+      FROM call_records
+      WHERE call_timestamp >= $1 AND call_timestamp <= $2
+        ${tenantFilter ? 'AND tenant_id = $3' : ''}
+        AND phone_number IS NOT NULL
+        AND phone_number != ''
+      GROUP BY dest_area_code
+      HAVING CASE
+          WHEN phone_number LIKE '+1%' THEN SUBSTRING(phone_number FROM 3 FOR 3)
+          WHEN phone_number LIKE '1%' AND LENGTH(phone_number) >= 11 THEN SUBSTRING(phone_number FROM 2 FOR 3)
+          WHEN LENGTH(phone_number) >= 10 THEN SUBSTRING(phone_number FROM 1 FOR 3)
+          ELSE NULL
+        END ~ '^[0-9]{3}$'
+      ORDER BY call_count DESC
+      LIMIT 50
+    `;
+    const destAreaCodesParams = tenantFilter
+      ? [lastBusinessDayStart.toISOString(), lastBusinessDayEnd.toISOString(), tenantFilter]
+      : [lastBusinessDayStart.toISOString(), lastBusinessDayEnd.toISOString()];
 
-    const areaCodeCallMap = new Map();
-    areaCodeCallCounts.forEach(item => {
-      areaCodeCallMap.set(item._id, item.totalCalls);
-    });
+    let destinationAreaCodes = [];
+    try {
+      const destResult = await timescalePool.query(destAreaCodesQuery, destAreaCodesParams);
+      destinationAreaCodes = destResult.rows.filter(r => r.dest_area_code);
+      console.log(`📊 TimescaleDB: Found ${destinationAreaCodes.length} destination area codes`);
+    } catch (tsError) {
+      console.warn('⚠️ TimescaleDB destination query failed:', tsError.message);
+      // Keep empty array, will skip destination recommendations
+    }
 
-    // Calculate area code stats
+    // Calculate area code stats from MongoDB DID data + TimescaleDB call counts
     const areaCodeStats = await DID.aggregate([
       { $match: { ...filter, 'location.areaCode': { $exists: true } } },
       {
@@ -3423,19 +3468,27 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
           state: { $first: '$location.state' },
           city: { $first: '$location.city' },
           didCount: { $sum: 1 },
-          totalCapacity: { $sum: '$capacity' }
+          totalCapacity: { $sum: '$capacity' },
+          phoneNumbers: { $push: '$phoneNumber' }
         }
       }
     ]);
 
-    // Add call data and calculate average utilization
+    // Add call data from TimescaleDB and calculate average utilization
     const areaCodeStatsWithCalls = areaCodeStats.map(ac => {
-      const totalCalls = areaCodeCallMap.get(ac._id) || 0;
+      // Sum calls for all DIDs in this area code
+      const totalCalls = ac.phoneNumbers.reduce((sum, phone) => {
+        return sum + (didCallMap.get(phone) || 0);
+      }, 0);
       const avgCallsPerDay = totalCalls / 7;
       const avgUtilization = ac.totalCapacity > 0 ? (avgCallsPerDay / (ac.totalCapacity / ac.didCount)) * 100 : 0;
 
       return {
-        ...ac,
+        _id: ac._id,
+        state: ac.state,
+        city: ac.city,
+        didCount: ac.didCount,
+        totalCapacity: ac.totalCapacity,
         totalCalls,
         avgUtilization: Math.round(avgUtilization * 10) / 10
       };
@@ -3449,84 +3502,29 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
 
     console.log(`📊 Capacity Summary: Total Capacity=${totalCapacity}, Avg Daily Usage=${Math.round(avgDailyUsage)}, Utilization=${overallUtilization.toFixed(1)}%`);
 
-    // Analyze DESTINATION area codes (where customers are located)
-    // Use phoneNumber field which contains destination numbers (format: 12015551234 or +12015551234)
-    // Filter by last business day only for recommendations
-    const destinationAreaCodes = await CallRecord.aggregate([
-      {
-        $match: {
-          ...(!isAdmin && userTenantId ? { tenantId: userTenantId } : {}),
-          phoneNumber: { $exists: true, $ne: null, $ne: '' },
-          callTimestamp: { $gte: lastBusinessDayStart, $lte: lastBusinessDayEnd }
-        }
-      },
-      {
-        $addFields: {
-          // Handle both formats: "12015551234" and "+12015551234"
-          cleanPhone: {
-            $cond: {
-              if: { $regexMatch: { input: { $toString: '$phoneNumber' }, regex: /^\+1/ } },
-              then: { $substr: [{ $toString: '$phoneNumber' }, 2, 10] }, // Remove +1
-              else: {
-                $cond: {
-                  if: { $regexMatch: { input: { $toString: '$phoneNumber' }, regex: /^1/ } },
-                  then: { $substr: [{ $toString: '$phoneNumber' }, 1, 10] }, // Remove leading 1
-                  else: { $toString: '$phoneNumber' }
-                }
-              }
-            }
-          }
-        }
-      },
-      {
-        $addFields: {
-          destAreaCode: {
-            $cond: {
-              if: { $gte: [{ $strLenCP: '$cleanPhone' }, 10] },
-              then: { $substr: ['$cleanPhone', 0, 3] },
-              else: null
-            }
-          }
-        }
-      },
-      {
-        $match: {
-          destAreaCode: { $ne: null, $regex: /^[0-9]{3}$/ }
-        }
-      },
-      {
-        $group: {
-          _id: '$destAreaCode',
-          callCount: { $sum: 1 }
-        }
-      },
-      { $sort: { callCount: -1 } },
-      { $limit: 50 } // Increased from 20 to show more area codes including Canada
-    ]);
-
     // Check which destination area codes we DON'T have DIDs for
     const existingDIDAreaCodes = new Set(areaCodeStats.map(ac => ac._id));
     const destinationStats = await Promise.all(
       destinationAreaCodes.map(async (dest) => {
         // Look up location info from AreaCodeLocation collection (includes US + Canada)
         const locationData = await AreaCodeLocation.findOne({
-          areaCode: dest._id
+          areaCode: dest.dest_area_code
         }).lean();
 
-        const hasDIDs = existingDIDAreaCodes.has(dest._id);
+        const hasDIDs = existingDIDAreaCodes.has(dest.dest_area_code);
         const currentDIDCount = hasDIDs ?
-          areaCodeStats.find(ac => ac._id === dest._id)?.didCount || 0 : 0;
+          areaCodeStats.find(ac => ac._id === dest.dest_area_code)?.didCount || 0 : 0;
 
         return {
-          areaCode: dest._id,
-          callCount: dest.callCount,
+          areaCode: dest.dest_area_code,
+          callCount: parseInt(dest.call_count),
           hasDIDs: hasDIDs,
           currentDIDCount: currentDIDCount,
           location: locationData ? {
             state: locationData.state,
             city: locationData.city,
             country: locationData.country,
-            areaCode: dest._id
+            areaCode: dest.dest_area_code
           } : null,
           needsMore: !hasDIDs || currentDIDCount < 5 // Suggest if no DIDs or very few
         };
@@ -3537,13 +3535,12 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
     const recommendations = [];
 
     // Calculate average DID capacity for recommendations
-    const avgDIDCapacity = totalDIDs > 0 ? totalCapacity / totalDIDs : 100; // Default to 100 if no data
-    const targetCallsPerDID = avgDIDCapacity * 0.7; // Target 70% utilization to avoid overload
+    const avgDIDCapacity = totalDIDs > 0 ? totalCapacity / totalDIDs : 100;
+    const targetCallsPerDID = avgDIDCapacity * 0.7; // Target 70% utilization
 
     console.log(`📊 Recommendation parameters: Avg DID capacity: ${Math.round(avgDIDCapacity)}, Target calls/DID: ${Math.round(targetCallsPerDID)}`);
 
     // PRIORITY 1: Destination area codes where we need local presence
-    // Calculate based on YESTERDAY'S call volume and DID capacity
     const destinationRecommendations = destinationStats
       .filter(dest => dest.needsMore && dest.callCount > 0)
       .map(dest => ({
@@ -3552,7 +3549,7 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
         state: dest.location?.state || 'Unknown',
         city: dest.location?.city || 'Unknown',
         currentDIDs: dest.currentDIDCount,
-        totalCalls: dest.callCount, // Yesterday's calls only
+        totalCalls: dest.callCount,
         suggestedDIDs: dest.hasDIDs ?
           Math.max(1, Math.ceil((dest.callCount / targetCallsPerDID) - dest.currentDIDCount)) :
           Math.max(1, Math.ceil(dest.callCount / targetCallsPerDID)),
@@ -3565,7 +3562,7 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
     recommendations.push(...destinationRecommendations);
 
     // PRIORITY 2: High traffic, low DID count area codes (existing DIDs overloaded)
-    const highTrafficLowDIDs = areaCodeStats.filter(ac => {
+    const highTrafficLowDIDs = areaCodeStatsWithCalls.filter(ac => {
       const callsPerDID = (ac.totalCalls || 0) / ac.didCount;
       return callsPerDID > 50 && ac.didCount < 10;
     }).map(ac => ({
@@ -3585,7 +3582,7 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
 
     // Overall capacity warning
     if (overallUtilization > 70) {
-      const additionalDIDsNeeded = Math.ceil((totalUsage - totalCapacity * 0.7) / 100);
+      const additionalDIDsNeeded = Math.ceil((avgDailyUsage - totalCapacity * 0.7) / 100);
       recommendations.push({
         type: 'system',
         severity: overallUtilization > 100 ? 'critical' : 'warning',
@@ -3603,6 +3600,9 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
       totalCalls: d.totalCalls || 0,
       capacity: d.capacity || 0
     }));
+
+    const queryTime = Date.now() - startTime;
+    console.log(`📊 Capacity analytics completed in ${queryTime}ms (TimescaleDB)`);
 
     res.json({
       success: true,
@@ -3635,6 +3635,10 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
           needsMore: dest.needsMore
         })),
         recommendations
+      },
+      metadata: {
+        queryTime: `${queryTime}ms`,
+        source: 'timescaledb'
       }
     });
   } catch (error) {
@@ -4439,10 +4443,16 @@ Available Routes:
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   console.log('\n⏹️ SIGINT received: closing HTTP server');
-  server.close(() => {
+  server.close(async () => {
     console.log('✅ HTTP server closed');
+    try {
+      await timescalePool.end();
+      console.log('✅ TimescaleDB pool closed');
+    } catch (err) {
+      console.warn('⚠️ TimescaleDB pool close error:', err.message);
+    }
     mongoose.connection.close(false, () => {
       console.log('✅ MongoDB connection closed');
       process.exit(0);
