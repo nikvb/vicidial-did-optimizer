@@ -36,9 +36,14 @@ export const PRICING_PLANS = {
  * Calculate monthly charges for a tenant
  */
 export async function calculateMonthlyCharges(tenant) {
+  console.log('🔵 calculateMonthlyCharges called for tenant:', tenant.name);
+  console.log('🔵 Subscription plan:', tenant.subscription?.plan);
+  console.log('🔵 Has perDidPricing:', !!tenant.subscription?.perDidPricing);
+
   const plan = PRICING_PLANS[tenant.subscription.plan];
 
   if (!plan || plan.price === 'custom') {
+    console.error('🔴 Invalid plan:', tenant.subscription.plan);
     throw new Error('Cannot calculate charges for custom plan');
   }
 
@@ -52,15 +57,22 @@ export async function calculateMonthlyCharges(tenant) {
   const baseFee = plan.price;
 
   // Calculate per-DID charges
-  const includedDids = tenant.subscription.perDidPricing.customRate !== null
+  console.log('🔵 Accessing perDidPricing...');
+
+  // Ensure perDidPricing exists with safe defaults
+  const perDidPricing = tenant.subscription.perDidPricing || { enabled: true, customRate: null };
+
+  const includedDids = perDidPricing.customRate !== null
     ? plan.includedDids // Use standard for enterprise with custom rate
     : plan.includedDids;
 
   const extraDids = Math.max(0, didCount - includedDids);
 
-  const perDidRate = tenant.subscription.perDidPricing.customRate !== null
-    ? tenant.subscription.perDidPricing.customRate
+  const perDidRate = perDidPricing.customRate !== null
+    ? perDidPricing.customRate
     : plan.perDidCost;
+
+  console.log('🔵 Charges calculated:', { baseFee, didCount, includedDids, extraDids, perDidRate });
 
   const totalDidFee = extraDids * perDidRate;
 

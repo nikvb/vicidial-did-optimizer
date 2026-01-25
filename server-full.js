@@ -1,6 +1,20 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+// ===== LOGGING CONFIGURATION =====
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info'; // debug, info, warn, error
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+const CURRENT_LEVEL = LOG_LEVELS[LOG_LEVEL] || LOG_LEVELS.info;
+
+const logger = {
+  debug: (...args) => CURRENT_LEVEL <= LOG_LEVELS.debug && console.log(...args),
+  info: (...args) => CURRENT_LEVEL <= LOG_LEVELS.info && console.log(...args),
+  warn: (...args) => CURRENT_LEVEL <= LOG_LEVELS.warn && console.warn(...args),
+  error: (...args) => CURRENT_LEVEL <= LOG_LEVELS.error && console.error(...args),
+};
+
+console.log(`🔧 Log level: ${LOG_LEVEL.toUpperCase()} (showing: ${Object.keys(LOG_LEVELS).filter(l => LOG_LEVELS[l] >= CURRENT_LEVEL).join(', ')})`);
+
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -232,7 +246,18 @@ app.use(passport.session());
 const limiter = rateLimit({
   windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
   max: Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
-  message: 'Too many requests from this IP, please try again later.'
+  message: 'Too many requests from this IP, please try again later.',
+  // Skip rate limiting for VICIdial server and localhost
+  skip: (req) => {
+    const ip = req.ip || req.connection.remoteAddress;
+    const whitelistedIPs = [
+      '204.12.211.2',  // VICIdial server
+      '::1',           // localhost IPv6
+      '127.0.0.1',     // localhost IPv4
+      '::ffff:127.0.0.1' // localhost IPv4 mapped to IPv6
+    ];
+    return whitelistedIPs.some(whitelistedIP => ip.includes(whitelistedIP));
+  }
 });
 
 app.use('/api/', limiter);
@@ -247,9 +272,12 @@ app.use('/api', (req, res, next) => {
 
 // VICIdial API endpoint - bypasses session auth
 app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
-  console.log('🎯 VICIdial DID Next endpoint called (OPTIMIZED)');
-  console.log('📊 Query params:', req.query);
-  console.log('🏢 Tenant:', req.tenant?.name, 'ID:', req.tenant?._id);
+  const requestStartTime = Date.now();
+  logger.info('🎯 VICIdial DID Next endpoint called');
+  logger.debug('📊 Query params:', req.query);
+  logger.debug('🏢 Tenant:', req.tenant?.name, 'ID:', req.tenant?._id);
+
+  const timings = {};
 
   try {
     const {
@@ -261,368 +289,367 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
       customer_phone
     } = req.query;
 
-    const tenantId = req.tenant._id;
-    const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
+    // Find an available DID for this tenant
+    logger.debug('🔍 Searching for DIDs with query:');
+    logger.debug('   Tenant ID:', req.tenant._id);
+    logger.debug('   Status: active');
 
-    // Calculate today's date boundaries for daily usage filtering
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
+    // Enhanced Round-Robin Rotation Algorithm
+    // Reload tenant to get latest rotation state
+    const tenantQueryStart = Date.now();
+    const freshTenant = await Tenant.findById(req.tenant._id);
+    timings.tenantQuery = Date.now() - tenantQueryStart;
+    logger.debug(`⏱️ Tenant query: ${timings.tenantQuery}ms`);
+    logger.debug('🔍 Fresh tenant rotation state from DB:', freshTenant.rotationState);
 
-    // Try to get rotation state from cache first
-    let rotationState = getCachedRotationState(tenantId);
+    let rotationState = freshTenant.rotationState || {
+      currentIndex: 0,
+      lastReset: new Date(),
+      usedDidsInCycle: []
+    };
 
-    if (!rotationState) {
-      // Load from DB if not in cache
-      const freshTenant = await Tenant.findById(tenantId).select('rotationState').lean();
-      rotationState = freshTenant.rotationState || {
-        currentIndex: 0,
-        lastReset: new Date(),
-        usedDidsInCycle: []
-      };
-      setCachedRotationState(tenantId, rotationState);
-    }
-
-    console.log('🔍 Rotation state loaded:', {
-      cached: rotationState !== null,
-      currentIndex: rotationState.currentIndex,
-      usedInCycle: rotationState.usedDidsInCycle?.length || 0
-    });
-
+    // Initialize usedDidsInCycle as a Set for processing
     const usedDidsSet = new Set(rotationState.usedDidsInCycle || []);
 
-    // **OPTIMIZED AGGREGATION PIPELINE**
-    const pipeline = [
-      // Match tenant's active DIDs
-      {
-        $match: {
-          tenantId: tenantId,
-          status: 'active'
-        }
-      },
-      // Add computed field for today's usage
-      {
-        $addFields: {
-          todayUsage: {
-            $let: {
-              vars: {
-                todayEntry: {
-                  $arrayElemAt: [
-                    {
-                      $filter: {
-                        input: { $ifNull: ['$usage.dailyUsage', []] },
-                        as: 'day',
-                        cond: {
-                          $and: [
-                            { $gte: ['$$day.date', today] },
-                            { $lt: ['$$day.date', tomorrow] }
-                          ]
-                        }
-                      }
-                    },
-                    0
-                  ]
-                }
-              },
-              in: { $ifNull: ['$$todayEntry.count', 0] }
-            }
-          },
-          effectiveCapacity: { $ifNull: ['$capacity', defaultCapacity] }
-        }
-      },
-      // Add flags for filtering
-      {
-        $addFields: {
-          hasCapacity: { $lt: ['$todayUsage', '$effectiveCapacity'] },
-          hasGoodReputation: { $gte: [{ $ifNull: ['$reputation.score', 50] }, 50] },
-          isUnusedInCycle: { $not: { $in: ['$_id', Array.from(usedDidsSet)] } }
-        }
-      },
-      // Facet to get both counts and candidate DIDs
-      {
-        $facet: {
-          // Get statistics
-          stats: [
-            {
-              $group: {
-                _id: null,
-                total: { $sum: 1 },
-                active: { $sum: 1 },
-                goodReputation: {
-                  $sum: { $cond: ['$hasGoodReputation', 1, 0] }
-                },
-                hasCapacity: {
-                  $sum: { $cond: ['$hasCapacity', 1, 0] }
-                }
-              }
-            }
-          ],
-          // Strategy 1: Unused DIDs in cycle with good reputation and capacity
-          strategy1: [
-            {
-              $match: {
-                isUnusedInCycle: true,
-                hasGoodReputation: true,
-                hasCapacity: true
-              }
-            },
-            { $sort: { 'usage.lastUsed': 1, createdAt: 1 } },
-            { $limit: 1 },
-            {
-              $project: {
-                _id: 1,
-                phoneNumber: 1,
-                location: 1,
-                'usage.lastUsed': 1,
-                'reputation.score': 1,
-                todayUsage: 1,
-                effectiveCapacity: 1
-              }
-            }
-          ],
-          // Strategy 2: Any DID with good reputation and capacity
-          strategy2: [
-            {
-              $match: {
-                hasGoodReputation: true,
-                hasCapacity: true
-              }
-            },
-            { $sort: { 'usage.lastUsed': 1, _id: 1 } },
-            { $limit: 1 },
-            {
-              $project: {
-                _id: 1,
-                phoneNumber: 1,
-                location: 1,
-                'usage.lastUsed': 1,
-                'reputation.score': 1,
-                todayUsage: 1,
-                effectiveCapacity: 1
-              }
-            }
-          ],
-          // Strategy 3: Any DID with good reputation (ignoring capacity)
-          strategy3: [
-            {
-              $match: {
-                hasGoodReputation: true
-              }
-            },
-            { $sort: { 'reputation.score': -1, 'usage.lastUsed': 1 } },
-            { $limit: 1 },
-            {
-              $project: {
-                _id: 1,
-                phoneNumber: 1,
-                location: 1,
-                'usage.lastUsed': 1,
-                'reputation.score': 1,
-                todayUsage: 1,
-                effectiveCapacity: 1
-              }
-            }
-          ],
-          // Strategy 4: Any active DID (last resort)
-          strategy4: [
-            { $sort: { 'reputation.score': -1, todayUsage: 1 } },
-            { $limit: 1 },
-            {
-              $project: {
-                _id: 1,
-                phoneNumber: 1,
-                location: 1,
-                'usage.lastUsed': 1,
-                'reputation.score': 1,
-                todayUsage: 1,
-                effectiveCapacity: 1
-              }
-            }
-          ]
-        }
-      }
-    ];
-
-    console.log('🔍 Running optimized aggregation pipeline...');
-    const startTime = Date.now();
-    const [result] = await DID.aggregate(pipeline);
-    const queryTime = Date.now() - startTime;
-    console.log(`⚡ Aggregation completed in ${queryTime}ms`);
-
-    // Extract results
-    const stats = result.stats[0] || { total: 0, active: 0, goodReputation: 0, hasCapacity: 0 };
-    let selectedDid = result.strategy1[0] || result.strategy2[0] || result.strategy3[0] || result.strategy4[0];
-    let strategy = selectedDid ?
-      (result.strategy1[0] ? 'Strategy 1: Unused in cycle' :
-       result.strategy2[0] ? 'Strategy 2: Good reputation' :
-       result.strategy3[0] ? 'Strategy 3: Any good reputation' :
-       'Strategy 4: Last resort') :
-      'No DID found';
-
-    console.log('📊 DID Statistics:', {
-      total: stats.total,
-      active: stats.active,
-      goodReputation: stats.goodReputation,
-      hasCapacity: stats.hasCapacity,
-      strategy: strategy
+    // Reset cycle if all DIDs have been used or it's been more than 24 hours
+    const countQueryStart = Date.now();
+    const activeDids = await DID.countDocuments({ tenantId: req.tenant._id, status: 'active' });
+    const goodReputationDids = await DID.countDocuments({
+      tenantId: req.tenant._id,
+      status: 'active',
+      'reputation.score': { $gte: 50 }
     });
+    timings.countQueries = Date.now() - countQueryStart;
+    logger.debug(`⏱️ Count queries: ${timings.countQueries}ms`);
 
-    // Check if we need to reset cycle
-    const shouldResetCycle = usedDidsSet.size >= stats.goodReputation ||
+    const shouldResetCycle = usedDidsSet.size >= goodReputationDids ||
                             (new Date() - new Date(rotationState.lastReset)) > 24 * 60 * 60 * 1000;
 
-    if (shouldResetCycle && result.strategy2[0]) {
-      console.log('🔄 Resetting rotation cycle - starting fresh round');
+    if (shouldResetCycle) {
+      logger.debug('🔄 Resetting rotation cycle - starting fresh round');
       usedDidsSet.clear();
       rotationState.currentIndex = 0;
       rotationState.lastReset = new Date();
-      selectedDid = result.strategy2[0]; // Use strategy 2 after reset
     }
 
-    // Handle no DID found case
-    if (!selectedDid) {
-      console.error('❌ CRITICAL: No DIDs available at all. Using fallback.');
+    logger.debug('🎯 Rotation State:', {
+      currentIndex: rotationState.currentIndex,
+      usedInCycle: usedDidsSet.size,
+      totalActive: activeDids,
+      goodReputation: goodReputationDids
+    });
 
-      // Try to send capacity exhaustion email (non-blocking)
-      setImmediate(async () => {
-        try {
-          const adminUsers = await User.find({
-            tenantId: tenantId,
-            role: 'ADMIN'
-          }).select('email').lean();
+    // FAST: Just sort by lastUsed (indexed field) instead of calculating usage
+    // This avoids the expensive $reduce operation on 3,174 DIDs
+    const getLeastUsedDID = async (baseQuery) => {
+      // Find DIDs sorted by lastUsed (oldest first = least recently used)
+      const dids = await DID.find(baseQuery)
+        .sort({ 'usage.lastUsed': 1, 'reputation.score': -1, createdAt: 1 })
+        .limit(1)
+        .lean();
 
-          const adminEmails = adminUsers.map(u => u.email).filter(Boolean);
-          if (adminEmails.length > 0 && resend) {
-            await resend.emails.send({
-              from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
-              to: adminEmails,
-              subject: '⚠️ DID Pool Capacity Exhausted',
-              html: `
-                <h2 style="color: #ef4444;">DID Pool Capacity Exhausted</h2>
-                <p>All DIDs in your pool have reached their daily capacity limits.</p>
-                <p><strong>Campaign:</strong> ${campaign_id || 'Unknown'}</p>
-                <p><strong>Agent:</strong> ${agent_id || 'Unknown'}</p>
-                <p><strong>Time:</strong> ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })}</p>
-                <hr style="margin: 20px 0; border: none; border-top: 1px solid #e5e7eb;">
-                <p style="color: #6b7280; font-size: 14px;">
-                  Consider increasing your DID pool capacity or adding more DIDs to handle the call volume.
-                </p>
-              `
-            });
+      return dids[0] || null;
+    };
+
+    // NEW STRATEGY: Always select DID with least usage (no capacity filtering)
+    // Priority order:
+    // 1. State + NPANXX match (if customer data provided)
+    // 2. State match only (if customer state provided)
+    // 3. Any active DID with good reputation (≥50)
+    // 4. Any active DID
+
+    let query = {
+      tenantId: req.tenant._id,
+      status: 'active'
+    };
+
+    let selectedDidObj = null;
+    let did = null;
+    const findQueryStart = Date.now();
+
+    // Try geographic matching if customer data is available
+    if (customer_state && customer_phone) {
+      // Extract NPANXX (first 6 digits) from customer phone
+      const npanxx = customer_phone.replace(/\D/g, '').substring(0, 6);
+
+      if (npanxx.length === 6) {
+        logger.debug(`🌍 Trying geographic match: State=${customer_state}, NPANXX=${npanxx}`);
+
+        // Try state + NPANXX match first
+        const geoQuery = {
+          ...query,
+          state: customer_state,
+          npanxx: npanxx,
+          'reputation.score': { $gte: 50 }
+        };
+
+        selectedDidObj = await getLeastUsedDID(geoQuery);
+        if (selectedDidObj) {
+          logger.info(`✅ Geographic match found: State + NPANXX match`);
+        } else {
+          // Try state-only match
+          logger.debug(`🌍 No NPANXX match, trying state-only: ${customer_state}`);
+          const stateQuery = {
+            ...query,
+            state: customer_state,
+            'reputation.score': { $gte: 50 }
+          };
+          selectedDidObj = await getLeastUsedDID(stateQuery);
+          if (selectedDidObj) {
+            logger.info(`✅ Geographic match found: State-only match`);
           }
-        } catch (emailError) {
-          console.error('❌ Failed to send capacity exhaustion email:', emailError);
         }
-      });
+      }
+    }
 
-      return res.json({
-        success: true,
-        did: {
+    // If no geographic match, use any active DID with good reputation
+    if (!selectedDidObj) {
+      logger.debug('🔄 No geographic match, selecting least-used DID with good reputation');
+      const goodRepQuery = {
+        ...query,
+        'reputation.score': { $gte: 50 }
+      };
+      selectedDidObj = await getLeastUsedDID(goodRepQuery);
+    }
+
+    // Last resort: any active DID
+    if (!selectedDidObj) {
+      logger.debug('⚠️ No good reputation DIDs, using any active DID');
+      selectedDidObj = await getLeastUsedDID(query);
+    }
+
+    timings.findQuery = Date.now() - findQueryStart;
+
+    // Fetch full Mongoose document (we have lean() object, need full document for save())
+    did = selectedDidObj ? await DID.findById(selectedDidObj._id) : null;
+
+    // Check total DIDs for this tenant
+    const totalDids = await DID.countDocuments({ tenantId: req.tenant._id });
+
+    logger.debug('📊 DID Statistics:');
+    logger.debug('   Total DIDs for tenant:', totalDids);
+    logger.debug('   Active DIDs for tenant:', activeDids);
+    logger.debug('   Good reputation DIDs (≥50):', goodReputationDids);
+    logger.debug('   Bad reputation DIDs (<50):', activeDids - goodReputationDids);
+
+    // CRITICAL: Should always have a DID now with least-used strategy
+    if (!did) {
+      logger.error('❌ CRITICAL: No active DIDs found in database!');
+      return res.status(500).json({
+        success: false,
+        error: 'No DIDs available. Please add DIDs to your pool.',
+        fallback: {
           number: process.env.FALLBACK_DID || '+18005551234',
           is_fallback: true
         }
       });
     }
 
-    // Update rotation state
-    usedDidsSet.add(selectedDid._id.toString());
-    rotationState.currentIndex = (rotationState.currentIndex + 1) % stats.active;
-    rotationState.usedDidsInCycle = Array.from(usedDidsSet);
+    // Check if DID is over capacity and log/track accordingly
+    const currentUsage = did.getTodayUsage();
+    const defaultCapacity = parseInt(process.env.DEFAULT_DID_CAPACITY || '100', 10);
+    const capacity = did.capacity || defaultCapacity;
+    const isOverCapacity = (currentUsage >= capacity);
 
-    // Cache the updated rotation state
-    setCachedRotationState(tenantId, rotationState);
+    if (isOverCapacity) {
+      logger.warn(`⚠️ CAPACITY EXCEEDED: ${did.phoneNumber} has ${currentUsage} calls (capacity: ${capacity})`);
+      logger.warn(`   Continuing with least-used DID strategy - no shortage disruption`);
 
-    console.log('🎯 Selected DID:', {
-      number: selectedDid.phoneNumber,
-      strategy: strategy,
-      todayUsage: selectedDid.todayUsage,
-      capacity: selectedDid.effectiveCapacity,
-      reputation: selectedDid.reputation?.score || 'Unknown'
+      // Send email notification about capacity exhaustion (throttled to once per hour)
+      const lastNotificationKey = `capacity_notification_${req.tenant._id}`;
+      const lastNotification = global[lastNotificationKey] || 0;
+      const hourAgo = Date.now() - (60 * 60 * 1000);
+
+      if (lastNotification < hourAgo) {
+        global[lastNotificationKey] = Date.now();
+
+        try {
+          const adminUsers = await User.find({
+            tenantId: req.tenant._id,
+            role: 'ADMIN'
+          });
+
+          const adminEmails = adminUsers.map(u => u.email).filter(Boolean);
+
+          if (adminEmails.length > 0) {
+            await resend.emails.send({
+              from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
+              to: adminEmails,
+              subject: '⚠️ DID Pool Operating Over Capacity',
+              html: `
+                <h2 style="color: #f59e0b;">DID Pool Operating Over Capacity</h2>
+                <p>Your DID pool is handling calls beyond the configured capacity limits.</p>
+                <p><strong>Campaign:</strong> ${campaign_id || 'Unknown'}</p>
+                <p><strong>Time:</strong> ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })}</p>
+                <p><strong>Current Strategy:</strong> Using least-used DIDs (${did.phoneNumber} - ${currentUsage} calls today)</p>
+                <p style="color: #10b981; font-weight: 600;">✓ All calls are being handled normally - no disruption to operations.</p>
+                <hr style="margin: 20px 0; border: none; border-top: 1px solid #e5e7eb;">
+                <p style="color: #6b7280; font-size: 14px;">
+                  To optimize performance, consider:
+                  <ul>
+                    <li>Increasing DEFAULT_DID_CAPACITY (currently ${defaultCapacity} calls/DID/day)</li>
+                    <li>Adding more DIDs to your pool</li>
+                    <li>Reviewing your <a href="${process.env.FRONTEND_URL || 'https://dids.amdy.io'}/analytics">daily usage patterns</a></li>
+                  </ul>
+                </p>
+              `
+            });
+            logger.info('📧 Over-capacity notification sent to admins');
+          }
+        } catch (emailError) {
+          logger.error('❌ Failed to send capacity notification:', emailError);
+        }
+      }
+    } else {
+      logger.info('🎯 DID Selected:', `${did.phoneNumber} (Usage: ${currentUsage}/${capacity}, Reputation: ${did.reputation?.score || 'N/A'})`);
+    }
+
+    // Update rotation state atomically (no locks, no contention!)
+    const tenantSaveStart = Date.now();
+    const updatedTenant = await Tenant.findByIdAndUpdate(
+      req.tenant._id,
+      {
+        $set: {
+          'rotationState.currentIndex': (rotationState.currentIndex + 1) % activeDids,
+          'rotationState.lastReset': rotationState.lastReset
+        },
+        $addToSet: {
+          'rotationState.usedDidsInCycle': did._id.toString()
+        }
+      },
+      { new: true } // Return updated document
+    );
+    timings.tenantSave = Date.now() - tenantSaveStart;
+    logger.debug(`⏱️ Tenant atomic update: ${timings.tenantSave}ms`);
+    logger.debug('✅ Rotation state updated atomically');
+
+    // Update last used timestamp and usage tracking
+    const now = new Date();
+
+    // Initialize usage object if it doesn't exist
+    if (!did.usage) {
+      did.usage = {
+        totalCalls: 0,
+        dailyUsage: [],
+        lastUsed: null,
+        lastCampaign: null,
+        lastAgent: null
+      };
+    }
+
+    did.usage.lastUsed = now;
+    did.usage.totalCalls = (did.usage.totalCalls || 0) + 1;
+    did.usage.lastCampaign = campaign_id;
+    did.usage.lastAgent = agent_id;
+
+    // Increment today's usage count for daily limit tracking
+    did.incrementTodayUsage();
+
+    const todayUsage = did.getTodayUsage();
+    // Reuse defaultCapacity and capacity from earlier
+    const dailyCapacity = capacity;
+
+    logger.debug('📝 Updating DID usage:', {
+      did: did.phoneNumber,
+      didId: did._id,
+      oldLastUsed: did.usage.lastUsed,
+      newLastUsed: now,
+      totalCalls: did.usage.totalCalls,
+      todayUsage: todayUsage,
+      dailyCapacity: dailyCapacity,
+      percentageUsed: `${Math.round((todayUsage / dailyCapacity) * 100)}%`,
+      campaign: campaign_id,
+      agent: agent_id
     });
 
-    // **OPTIMIZED: Batch all writes together**
-    const now = new Date();
-    const uniqueid = req.headers['x-request-id'] || '';
+    try {
+      const didSaveStart = Date.now();
+      const savedDid = await did.save();
+      timings.didSave = Date.now() - didSaveStart;
+      logger.debug(`⏱️ DID save: ${timings.didSave}ms`);
+      logger.debug('✅ DID usage updated successfully:', {
+        id: savedDid._id,
+        phone: savedDid.phoneNumber,
+        lastUsed: savedDid.usage?.lastUsed,
+        totalCalls: savedDid.usage?.totalCalls
+      });
+    } catch (saveError) {
+      logger.error('❌ ERROR saving DID usage:', saveError);
+      logger.error('❌ DID object:', JSON.stringify(did, null, 2));
+    }
 
-    await Promise.all([
-      // Update DID usage with atomic operations
-      DID.findByIdAndUpdate(
-        selectedDid._id,
-        {
-          $set: {
-            'usage.lastUsed': now,
-            'usage.lastCampaign': campaign_id,
-            'usage.lastAgent': agent_id
-          },
-          $inc: { 'usage.totalCalls': 1 },
-          $push: {
-            'usage.dailyUsage': {
-              $each: [{ date: today, count: 1 }],
-              $position: 0,
-              $slice: 30 // Keep only last 30 days
-            }
-          }
-        },
-        { new: false }
-      ).lean(),
+    // Create call record for tracking (will be updated later with final disposition)
+    const uniqueid = req.headers['x-request-id'] || ''; // From AGI script
 
-      // Save rotation state to tenant
-      Tenant.findByIdAndUpdate(
-        tenantId,
-        { $set: { rotationState: rotationState } },
-        { new: false }
-      ).lean(),
+    const callRecord = new CallRecord({
+      didId: did._id,
+      tenantId: req.tenant._id,
+      phoneNumber: customer_phone || 'unknown',
+      callTimestamp: new Date(),
+      duration: 0, // Will be updated when call completes
+      result: 'answered', // Default - will be updated when call completes
+      disposition: 'initiated', // Initial state
+      campaignId: campaign_id,
+      agentId: agent_id,
+      customerState: customer_state,
+      customerAreaCode: customer_area_code,
+      metadata: {
+        callDirection: 'outbound',
+        recording: false,
+        uniqueid: uniqueid, // Store uniqueid for matching with call results
+        source: 'did-selection'
+      }
+    });
+    const callRecordSaveStart = Date.now();
+    await callRecord.save();
+    timings.callRecordSave = Date.now() - callRecordSaveStart;
+    logger.debug(`⏱️ CallRecord save: ${timings.callRecordSave}ms`);
 
-      // Create call record
-      CallRecord.create({
-        didId: selectedDid._id,
-        tenantId: tenantId,
-        phoneNumber: customer_phone || 'unknown',
-        callTimestamp: now,
-        duration: 0,
-        result: 'answered',
-        disposition: 'initiated',
-        campaignId: campaign_id,
-        agentId: agent_id,
-        customerState: customer_state,
-        customerAreaCode: customer_area_code,
-        metadata: {
-          callDirection: 'outbound',
-          recording: false,
-          uniqueid: uniqueid,
-          source: 'did-selection'
-        }
-      })
-    ]);
+    logger.debug('📞 Call record created:', callRecord._id, '| Uniqueid:', uniqueid, '| DID:', did.phoneNumber);
 
-    console.log('✅ All updates completed:', {
-      selectedDID: selectedDid.phoneNumber,
+    console.log('✅ Rotation state updated:', {
+      selectedDID: did.phoneNumber,
       newIndex: rotationState.currentIndex,
       usedInCycle: usedDidsSet.size,
-      totalActive: stats.active,
-      queryTime: `${queryTime}ms`
+      totalActive: activeDids
     });
+
+    // Calculate total request time
+    timings.total = Date.now() - requestStartTime;
+    const queryTime = (timings.tenantQuery || 0) + (timings.countQueries || 0) + (timings.findQuery || 0);
+    const saveTime = (timings.tenantSave || 0) + (timings.didSave || 0) + (timings.callRecordSave || 0);
+    const otherTime = timings.total - queryTime - saveTime;
+
+    logger.info('\n⏱️ ===== PERFORMANCE SUMMARY =====');
+    logger.info(`   Total request time: ${timings.total}ms`);
+    logger.debug(`\n   Read Operations (${queryTime}ms):`);
+    logger.debug(`   - Tenant query: ${timings.tenantQuery}ms`);
+    logger.debug(`   - Count queries: ${timings.countQueries}ms`);
+    logger.debug(`   - Find query: ${timings.findQuery}ms`);
+    logger.debug(`\n   Write Operations (${saveTime}ms):`);
+    logger.debug(`   - Tenant save: ${timings.tenantSave || 0}ms`);
+    logger.debug(`   - DID save: ${timings.didSave || 0}ms`);
+    logger.debug(`   - CallRecord save: ${timings.callRecordSave || 0}ms`);
+    logger.debug(`\n   Other operations: ${otherTime}ms`);
+    logger.info('=================================\n');
 
     res.json({
       success: true,
       did: {
-        number: selectedDid.phoneNumber,
-        location: selectedDid.location,
+        number: did.phoneNumber,
+        description: did.description,
+        carrier: did.carrier,
+        location: did.location,
         is_fallback: false
       },
       metadata: {
         campaign_id,
         agent_id,
-        timestamp: now.toISOString(),
-        performance: {
-          queryTime: `${queryTime}ms`
-        }
+        timestamp: new Date().toISOString()
       }
     });
-
   } catch (error) {
-    console.error('💥 VICIdial API error:', error);
+    logger.error('💥 VICIdial API error:', error);
     res.status(500).json({
       success: false,
       message: 'Internal server error',
@@ -808,7 +835,7 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
     let callRecord = await CallRecord.findOne({
       tenantId: req.tenant._id,
       'metadata.uniqueid': uniqueid
-    });
+    }).hint({ tenantId: 1, 'metadata.uniqueid': 1 });
 
     if (callRecord) {
       console.log(`🔄 [CALL-RESULTS] Updating existing CallRecord ${callRecord._id} with final results`);
@@ -969,16 +996,28 @@ passport.use(new GoogleStrategy({
       // Create a new tenant for the user's organization
       const orgName = `${profile.name?.givenName || profile.displayName.split(' ')[0] || ''} ${profile.name?.familyName || profile.displayName.split(' ')[1] || ''}`.trim() || email.split('@')[0];
       const emailDomain = email.split('@')[1];
+      const emailUsername = email.split('@')[0];
 
-      // Make domain unique by appending random string for common domains
-      const commonDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com'];
-      const isCommonDomain = commonDomains.includes(emailDomain.toLowerCase());
+      // Auto-generate an API key for new tenant
+      const crypto = await import('crypto');
+      const autoApiKey = 'did_' + crypto.randomBytes(32).toString('hex');
+
+      // Always create unique domain to avoid conflicts (username.domain)
+      const uniqueDomain = `${emailUsername}.${emailDomain}`;
 
       const newTenant = new Tenant({
         name: `${orgName}'s Organization`,
-        domain: isCommonDomain ? `${email.split('@')[0]}.${emailDomain}` : emailDomain,
+        domain: uniqueDomain,
         isActive: true,
-        apiKeys: [],
+        apiKeys: [{
+          _id: new mongoose.Types.ObjectId(),
+          name: 'Default API Key',
+          key: autoApiKey,
+          isActive: true,
+          createdAt: new Date(),
+          lastUsed: null,
+          permissions: ['read', 'write']
+        }],
         rotationState: {
           currentIndex: 0,
           lastReset: new Date(),
@@ -986,7 +1025,7 @@ passport.use(new GoogleStrategy({
         }
       });
       const savedTenant = await newTenant.save();
-      console.log('✅ New tenant created:', savedTenant.name, 'ID:', savedTenant._id);
+      console.log('✅ New tenant created:', savedTenant.name, 'ID:', savedTenant._id, 'with auto-generated API key');
 
       // Create new user with tenant
       user = new User({
@@ -1199,17 +1238,31 @@ app.post('/api/v1/auth/register', async (req, res) => {
 
     // Create a new tenant for the user's organization
     const emailDomain = email.split('@')[1];
-    const commonDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com'];
-    const isCommonDomain = commonDomains.includes(emailDomain.toLowerCase());
+    const emailUsername = email.split('@')[0];
+
+    // Auto-generate an API key for new tenant
+    const crypto = await import('crypto');
+    const autoApiKey = 'did_' + crypto.randomBytes(32).toString('hex');
+
+    // Always create unique domain to avoid conflicts (username.domain)
+    const uniqueDomain = `${emailUsername}.${emailDomain}`;
 
     const newTenant = new Tenant({
       name: `${firstName} ${lastName}'s Organization`,
-      domain: isCommonDomain ? `${email.split('@')[0]}.${emailDomain}` : emailDomain,
+      domain: uniqueDomain,
       subdomain: `${firstName.toLowerCase()}-${Date.now()}`,
       isActive: true,
-      apiKeys: [],
+      apiKeys: [{
+        _id: new mongoose.Types.ObjectId(),
+        name: 'Default API Key',
+        key: autoApiKey,
+        isActive: true,
+        createdAt: new Date(),
+        lastUsed: null,
+        permissions: ['read', 'write']
+      }],
       subscription: {
-        plan: 'starter',
+        plan: 'basic',
         status: 'trial',
         billingCycle: 'monthly'
       },
@@ -1220,7 +1273,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
       }
     });
     const savedTenant = await newTenant.save();
-    console.log('✅ New tenant created via registration:', savedTenant.name);
+    console.log('✅ New tenant created via registration:', savedTenant.name, 'with auto-generated API key');
 
     // Generate email verification token
     const emailVerificationToken = crypto.randomBytes(32).toString('hex');
@@ -1538,30 +1591,50 @@ app.get('/api/v1/auth/me', async (req, res) => {
 // Dashboard API Endpoints
 app.get('/api/v1/dashboard/stats', async (req, res) => {
   console.log('🔍 Dashboard stats endpoint called');
-  console.log('Headers:', req.headers);
   try {
-    // Get user from token
+    // Get user from JWT token OR session
     const token = req.headers.authorization?.replace('Bearer ', '');
     let userTenantId = null;
     let isAdmin = false;
 
+    // Try JWT auth first
     if (token) {
       try {
         const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
         const user = await User.findById(decoded.id);
         if (user) {
-          userTenantId = user.tenant;
+          userTenantId = user.tenant || user.tenantId;
           isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
-          console.log('👤 User role:', user.role, 'Tenant:', userTenantId);
+          console.log('👤 JWT User:', user.email, 'Tenant:', userTenantId);
         }
       } catch (error) {
         console.error('Token decode error:', error.message);
       }
     }
 
-    // Get actual data from database
-    const totalUsers = await User.countDocuments();
-    const totalTenants = await User.distinct('tenant').then(tenants => tenants.filter(Boolean).length);
+    // If no JWT, try session auth
+    if (!userTenantId && req.session?.user) {
+      userTenantId = req.session.user.tenantId || req.session.user.tenant;
+      isAdmin = req.session.user.role === 'ADMIN' || req.session.user.role === 'SUPER_ADMIN';
+      console.log('👤 Session User:', req.session.user.email, 'Tenant:', userTenantId);
+    }
+
+    // If no JWT, try passport user
+    if (!userTenantId && req.user) {
+      userTenantId = req.user.tenant || req.user.tenantId;
+      isAdmin = req.user.role === 'ADMIN' || req.user.role === 'SUPER_ADMIN';
+      console.log('👤 Passport User:', req.user.email, 'Tenant:', userTenantId);
+    }
+
+    // If still no tenant found and not admin, return error
+    if (!userTenantId && !isAdmin) {
+      console.log('❌ No authentication found - returning 401');
+      return res.status(401).json({ success: false, message: 'Access token required' });
+    }
+
+    // Get actual data from database (only count for this tenant, not system-wide)
+    const totalUsers = isAdmin ? await User.countDocuments() : 1;
+    const totalTenants = isAdmin ? await User.distinct('tenant').then(tenants => tenants.filter(Boolean).length) : 1;
 
     // Build DID query based on user role
     // Convert tenant ID to ObjectId for proper MongoDB comparison
@@ -1603,7 +1676,92 @@ app.get('/api/v1/dashboard/stats', async (req, res) => {
       ? `${((successfulCalls / totalCallsToday) * 100).toFixed(1)}%`
       : '0%';
 
-    const systemHealth = 'healthy';
+    // Real system health checks
+    let systemHealth = 'healthy';
+    let dbStatus = 'online';
+    let dbLatency = 0;
+
+    try {
+      const dbStartTime = Date.now();
+      await mongoose.connection.db.admin().ping();
+      dbLatency = Date.now() - dbStartTime;
+      dbStatus = 'online';
+    } catch (error) {
+      console.error('Database health check failed:', error);
+      dbStatus = 'offline';
+      systemHealth = 'error';
+    }
+
+    // Calculate active sessions (unique API keys in last 5 minutes)
+    const fiveMinutesAgo = new Date(Date.now() - 300000);
+    const activeSessions = await CallRecord.distinct('metadata.apiKey', {
+      callTimestamp: { $gte: fiveMinutesAgo }
+    }).then(keys => keys.filter(Boolean).length);
+
+    // Calculate performance metrics
+    // Get recent call records with metadata to calculate average query time
+    const recentCalls = await CallRecord.find({
+      ...callQuery,
+      callTimestamp: { $gte: today },
+      'metadata.responseTime': { $exists: true }
+    })
+      .select('metadata.responseTime metadata.endpoint')
+      .limit(1000)
+      .lean();
+
+    // Calculate average query time for DID endpoint
+    const didCalls = recentCalls.filter(call =>
+      call.metadata?.endpoint === '/api/v1/dids/next' || !call.metadata?.endpoint
+    );
+    let didQueryTime = 0;
+    if (didCalls.length > 0) {
+      const totalTime = didCalls.reduce((sum, call) => {
+        return sum + (call.metadata?.responseTime || 0);
+      }, 0);
+      didQueryTime = Math.round(totalTime / didCalls.length * 100) / 100;
+    }
+
+    // Calculate average query time for Results endpoint
+    const resultCalls = recentCalls.filter(call =>
+      call.metadata?.endpoint === '/api/v1/call-results'
+    );
+    let resultsQueryTime = 0;
+    if (resultCalls.length > 0) {
+      const totalTime = resultCalls.reduce((sum, call) => {
+        return sum + (call.metadata?.responseTime || 0);
+      }, 0);
+      resultsQueryTime = Math.round(totalTime / resultCalls.length * 100) / 100;
+    }
+
+    // Overall average query time (for backward compatibility)
+    let avgQueryTime = 0;
+    if (recentCalls.length > 0) {
+      const totalTime = recentCalls.reduce((sum, call) => {
+        return sum + (call.metadata?.responseTime || 0);
+      }, 0);
+      avgQueryTime = Math.round(totalTime / recentCalls.length * 100) / 100;
+    }
+
+    // Calculate requests per second (RPS)
+    // Get calls from the last 60 seconds for real-time RPS
+    const sixtySecondsAgo = new Date(Date.now() - 60000);
+    const callsLastMinute = await CallRecord.countDocuments({
+      ...callQuery,
+      callTimestamp: { $gte: sixtySecondsAgo }
+    });
+    const requestsPerSecond = Math.round((callsLastMinute / 60) * 100) / 100;
+
+    // Get tenant list for admin users
+    let tenantList = [];
+    if (isAdmin) {
+      const tenants = await mongoose.connection.db.collection('tenants').find({}).toArray();
+      tenantList = tenants.map(t => ({
+        _id: t._id,
+        name: t.name || 'Unnamed',
+        status: t.status || 'active',
+        subscription: t.subscription?.plan || 'free'
+      }));
+    }
 
     // Get recent activity from audit logs
     const recentActivity = await AuditLog.find({})
@@ -1628,6 +1786,7 @@ app.get('/api/v1/dashboard/stats', async (req, res) => {
     ];
 
     console.log('✅ Dashboard stats response ready');
+    console.log('📊 Performance metrics:', { avgQueryTime, didQueryTime, resultsQueryTime, requestsPerSecond, activeSessions });
     res.json({
       data: {
         // Admin view fields - using real data
@@ -1643,6 +1802,20 @@ app.get('/api/v1/dashboard/stats', async (req, res) => {
         apiUsage,
         systemHealth,
 
+        // System health details
+        dbStatus,
+        dbLatency,
+
+        // Performance metrics
+        avgQueryTime,
+        didQueryTime,
+        resultsQueryTime,
+        requestsPerSecond,
+        activeSessions,
+
+        // Tenant list (admin only)
+        tenantList,
+
         recentActivity: finalActivity
       }
     });
@@ -1652,9 +1825,329 @@ app.get('/api/v1/dashboard/stats', async (req, res) => {
   }
 });
 
+// Admin: Get all tenants with metrics
+app.get('/api/v1/admin/tenants', async (req, res) => {
+  try {
+    // Get user from token
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+
+    if (!user || (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN')) {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+
+    // Get all tenants from the database
+    const tenants = await mongoose.connection.db.collection('tenants').find({}).toArray();
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    // Get metrics for each tenant
+    const tenantsWithMetrics = await Promise.all(tenants.map(async (tenant) => {
+      const tenantId = tenant._id;
+
+      // Count users for this tenant
+      const userCount = await User.countDocuments({ tenant: tenantId.toString() });
+
+      // Count DIDs for this tenant
+      const didCount = await DID.countDocuments({ tenantId });
+
+      // Count calls today for this tenant
+      const callsToday = await CallRecord.countDocuments({
+        tenantId: tenantId.toString(),
+        callTimestamp: { $gte: today }
+      });
+
+      return {
+        _id: tenant._id,
+        name: tenant.name || 'Unnamed Tenant',
+        subdomain: tenant.subdomain || '',
+        status: tenant.status || 'active',
+        subscription: tenant.subscription?.plan || 'free',
+        users: userCount,
+        dids: didCount,
+        callsToday: callsToday,
+        createdAt: tenant.createdAt
+      };
+    }));
+
+    res.json({
+      success: true,
+      tenants: tenantsWithMetrics
+    });
+  } catch (error) {
+    console.error('Admin tenants error:', error);
+    res.status(500).json({ message: 'Failed to load tenants' });
+  }
+});
+
+// System Health - Detailed monitoring page
+app.get('/api/v1/system-health', async (req, res) => {
+  try {
+    // Get user from token
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+
+    if (!user || (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN')) {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+
+    console.log('📊 Fetching detailed system health metrics...');
+
+    // Database Health Check
+    let dbHealth = {
+      status: 'healthy',
+      latency: 0,
+      connections: 0,
+      collections: 0,
+      error: null
+    };
+
+    try {
+      const dbStart = Date.now();
+      await mongoose.connection.db.admin().ping();
+      dbHealth.latency = Date.now() - dbStart;
+      dbHealth.status = 'healthy';
+
+      // Get connection stats
+      const serverStatus = await mongoose.connection.db.admin().serverStatus();
+      dbHealth.connections = serverStatus.connections?.current || 0;
+
+      // Get collections count
+      const collections = await mongoose.connection.db.listCollections().toArray();
+      dbHealth.collections = collections.length;
+    } catch (error) {
+      console.error('Database health check failed:', error);
+      dbHealth.status = 'error';
+      dbHealth.error = error.message;
+    }
+
+    // Time ranges for queries
+    const now = new Date();
+    const last5Min = new Date(now - 5 * 60 * 1000);
+    const last1Hour = new Date(now - 60 * 60 * 1000);
+    const last24Hours = new Date(now - 24 * 60 * 60 * 1000);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    // Get all tenants
+    const tenants = await mongoose.connection.db.collection('tenants').find({}).toArray();
+
+    // Per-tenant metrics with query breakdown
+    const tenantMetrics = await Promise.all(tenants.map(async (tenant) => {
+      const tenantId = tenant._id.toString();
+
+      // Get call records for this tenant
+      const calls24h = await CallRecord.countDocuments({
+        tenantId,
+        callTimestamp: { $gte: last24Hours }
+      });
+
+      const calls1h = await CallRecord.countDocuments({
+        tenantId,
+        callTimestamp: { $gte: last1Hour }
+      });
+
+      const calls5m = await CallRecord.countDocuments({
+        tenantId,
+        callTimestamp: { $gte: last5Min }
+      });
+
+      // Get DID queries (endpoint: /api/v1/dids/next)
+      const didQueries24h = await CallRecord.countDocuments({
+        tenantId,
+        callTimestamp: { $gte: last24Hours },
+        $or: [
+          { 'metadata.endpoint': '/api/v1/dids/next' },
+          { 'metadata.endpoint': { $exists: false } }
+        ]
+      });
+
+      const didQueries1h = await CallRecord.countDocuments({
+        tenantId,
+        callTimestamp: { $gte: last1Hour },
+        $or: [
+          { 'metadata.endpoint': '/api/v1/dids/next' },
+          { 'metadata.endpoint': { $exists: false } }
+        ]
+      });
+
+      // Get Results queries (endpoint: /api/v1/call-results)
+      const resultQueries24h = await CallRecord.countDocuments({
+        tenantId,
+        callTimestamp: { $gte: last24Hours },
+        'metadata.endpoint': '/api/v1/call-results'
+      });
+
+      const resultQueries1h = await CallRecord.countDocuments({
+        tenantId,
+        callTimestamp: { $gte: last1Hour },
+        'metadata.endpoint': '/api/v1/call-results'
+      });
+
+      // Average query times for this tenant
+      const recentCalls = await CallRecord.find({
+        tenantId,
+        callTimestamp: { $gte: last1Hour },
+        'metadata.responseTime': { $exists: true }
+      }).limit(1000).lean();
+
+      const didCalls = recentCalls.filter(call =>
+        call.metadata?.endpoint === '/api/v1/dids/next' || !call.metadata?.endpoint
+      );
+      const resultCalls = recentCalls.filter(call =>
+        call.metadata?.endpoint === '/api/v1/call-results'
+      );
+
+      const avgDidQueryTime = didCalls.length > 0
+        ? didCalls.reduce((sum, call) => sum + (call.metadata?.responseTime || 0), 0) / didCalls.length
+        : 0;
+
+      const avgResultQueryTime = resultCalls.length > 0
+        ? resultCalls.reduce((sum, call) => sum + (call.metadata?.responseTime || 0), 0) / resultCalls.length
+        : 0;
+
+      // Get active DIDs for this tenant
+      const activeDIDs = await DID.countDocuments({
+        tenantId: tenant._id,
+        status: 'active'
+      });
+
+      // Get users for this tenant
+      const userCount = await User.countDocuments({ tenant: tenantId });
+
+      return {
+        tenantId,
+        name: tenant.name || 'Unnamed Tenant',
+        subscription: tenant.subscription?.plan || 'free',
+        status: tenant.status || 'active',
+        users: userCount,
+        activeDIDs,
+        queries: {
+          last5min: calls5m,
+          last1hour: calls1h,
+          last24hours: calls24h,
+          didQueries24h,
+          didQueries1h,
+          resultQueries24h,
+          resultQueries1h
+        },
+        performance: {
+          avgDidQueryTime: Math.round(avgDidQueryTime * 100) / 100,
+          avgResultQueryTime: Math.round(avgResultQueryTime * 100) / 100
+        }
+      };
+    }));
+
+    // System-wide metrics
+    const totalQueries24h = await CallRecord.countDocuments({
+      callTimestamp: { $gte: last24Hours }
+    });
+
+    const totalQueries1h = await CallRecord.countDocuments({
+      callTimestamp: { $gte: last1Hour }
+    });
+
+    const totalQueries5m = await CallRecord.countDocuments({
+      callTimestamp: { $gte: last5Min }
+    });
+
+    // Active sessions (unique API keys in last 5 minutes)
+    const activeSessions = await CallRecord.distinct('metadata.apiKey', {
+      callTimestamp: { $gte: last5Min }
+    }).then(keys => keys.filter(Boolean).length);
+
+    // Total active DIDs
+    const totalActiveDIDs = await DID.countDocuments({ status: 'active' });
+
+    // Total users
+    const totalUsers = await User.countDocuments();
+
+    // Requests per second (based on last 5 minutes)
+    const requestsPerSecond = totalQueries5m / 300; // 300 seconds in 5 minutes
+
+    // Overall average query times
+    const recentAllCalls = await CallRecord.find({
+      callTimestamp: { $gte: last1Hour },
+      'metadata.responseTime': { $exists: true }
+    }).limit(5000).lean();
+
+    const allDidCalls = recentAllCalls.filter(call =>
+      call.metadata?.endpoint === '/api/v1/dids/next' || !call.metadata?.endpoint
+    );
+    const allResultCalls = recentAllCalls.filter(call =>
+      call.metadata?.endpoint === '/api/v1/call-results'
+    );
+
+    const systemAvgDidQueryTime = allDidCalls.length > 0
+      ? allDidCalls.reduce((sum, call) => sum + (call.metadata?.responseTime || 0), 0) / allDidCalls.length
+      : 0;
+
+    const systemAvgResultQueryTime = allResultCalls.length > 0
+      ? allResultCalls.reduce((sum, call) => sum + (call.metadata?.responseTime || 0), 0) / allResultCalls.length
+      : 0;
+
+    console.log('✅ System health metrics collected');
+
+    res.json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      database: dbHealth,
+      system: {
+        activeSessions,
+        totalUsers,
+        totalTenants: tenants.length,
+        totalActiveDIDs,
+        queries: {
+          last5min: totalQueries5m,
+          last1hour: totalQueries1h,
+          last24hours: totalQueries24h
+        },
+        performance: {
+          requestsPerSecond: Math.round(requestsPerSecond * 100) / 100,
+          avgDidQueryTime: Math.round(systemAvgDidQueryTime * 100) / 100,
+          avgResultQueryTime: Math.round(systemAvgResultQueryTime * 100) / 100
+        }
+      },
+      tenants: tenantMetrics
+    });
+  } catch (error) {
+    console.error('System health error:', error);
+    res.status(500).json({ message: 'Failed to load system health data' });
+  }
+});
+
 // DID Management API Endpoints
 app.get('/api/v1/dids', async (req, res) => {
   try {
+    // Get user's tenant from JWT token
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    let userTenantId = null;
+    let isAdmin = false;
+
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        const user = await User.findById(decoded.id);
+        if (user) {
+          userTenantId = user.tenant || user.tenantId;
+          isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+        }
+      } catch (error) {
+        console.error('Token decode error in DID list:', error.message);
+      }
+    }
+
     // Parse pagination parameters
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 25;
@@ -1663,8 +2156,11 @@ app.get('/api/v1/dids', async (req, res) => {
     const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
     const search = req.query.search || '';
 
-    // Build query
+    // Build query - FILTER BY TENANT unless admin
     let query = {};
+    if (!isAdmin && userTenantId) {
+      query.tenantId = userTenantId;
+    }
     if (search) {
       query.phoneNumber = { $regex: search, $options: 'i' };
     }
@@ -1809,6 +2305,103 @@ app.get('/api/v1/dids/:id', async (req, res) => {
   } catch (error) {
     console.error('DID details error:', error);
     res.status(500).json({ message: 'Failed to load DID details' });
+  }
+});
+
+// Export DIDs to CSV
+app.get('/api/v1/dids/export', async (req, res) => {
+  try {
+    logger.info('📤 Export DIDs endpoint called');
+
+    // Get user's tenant from JWT token or session
+    let tenantId = req.session?.user?.tenantId || req.user?.tenantId;
+
+    // Try to get from JWT if not in session
+    if (!tenantId) {
+      const token = req.headers.authorization?.replace('Bearer ', '');
+      if (token) {
+        try {
+          const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+          const user = await User.findById(decoded.id);
+          if (user) {
+            tenantId = user.tenant || user.tenantId;
+          }
+        } catch (error) {
+          console.error('Token decode error in export:', error.message);
+        }
+      }
+    }
+
+    if (!tenantId) {
+      return res.status(401).json({ message: 'Unauthorized - no tenant ID' });
+    }
+
+    // Fetch all DIDs for the tenant
+    const dids = await DID.find({ tenantId }).sort({ createdAt: -1 }).lean();
+
+    logger.info(`📊 Exporting ${dids.length} DIDs for tenant ${tenantId}`);
+
+    // Generate CSV
+    const csvRows = [];
+
+    // CSV Header
+    csvRows.push([
+      'Phone Number',
+      'Status',
+      'Capacity',
+      'State',
+      'Area Code',
+      'NPANXX',
+      'Reputation Score',
+      'Total Calls',
+      'Today Usage',
+      'Last Used',
+      'Created At'
+    ].join(','));
+
+    // CSV Data rows
+    for (const did of dids) {
+      const areaCode = did.phoneNumber ? did.phoneNumber.substring(2, 5) : '';
+      const npanxx = did.npanxx || (did.phoneNumber ? did.phoneNumber.substring(2, 8) : '');
+
+      // Calculate today's usage
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const todayUsage = did.usage?.dailyUsage?.find(d => {
+        const usageDate = new Date(d.date);
+        usageDate.setHours(0, 0, 0, 0);
+        return usageDate.getTime() === today.getTime();
+      });
+
+      const row = [
+        `"${did.phoneNumber || ''}"`,
+        did.status || 'active',
+        did.capacity || process.env.DEFAULT_DID_CAPACITY || '100',
+        did.state || '',
+        areaCode,
+        npanxx,
+        did.reputation?.score || 0,
+        did.usage?.totalCalls || 0,
+        todayUsage?.count || 0,
+        did.usage?.lastUsed ? new Date(did.usage.lastUsed).toISOString() : 'Never',
+        did.createdAt ? new Date(did.createdAt).toISOString() : ''
+      ].join(',');
+
+      csvRows.push(row);
+    }
+
+    const csv = csvRows.join('\n');
+    const filename = `dids_export_${new Date().toISOString().split('T')[0]}.csv`;
+
+    // Set headers for CSV download
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+
+    logger.info(`✅ CSV export completed: ${filename}`);
+  } catch (error) {
+    logger.error('❌ Export DIDs error:', error);
+    res.status(500).json({ message: 'Failed to export DIDs', error: error.message });
   }
 });
 
@@ -2655,12 +3248,18 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
         const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
         const user = await User.findById(decoded.id);
         if (user) {
-          userTenantId = user.tenant;
+          userTenantId = user.tenant || user.tenantId;
           isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+          console.log('📊 Capacity - User tenant:', userTenantId, 'isAdmin:', isAdmin);
         }
       } catch (error) {
         console.error('Token decode error:', error.message);
       }
+    }
+
+    // If no tenant found, return error
+    if (!userTenantId && !isAdmin) {
+      return res.status(401).json({ success: false, message: 'Unauthorized - no tenant found' });
     }
 
     // Calculate last business day (exclude weekends)
@@ -2704,32 +3303,118 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
       'usage.lastUsed': { $gte: sevenDaysAgo }
     });
 
-    // Capacity analysis with utilization rate
-    const capacityStats = await DID.aggregate([
-      { $match: filter },
+    // Calculate last 7 business days (excluding weekends)
+    const businessDays = [];
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    let daysFound = 0;
+    let currentDate = new Date(today);
+
+    while (daysFound < 7) {
+      currentDate.setDate(currentDate.getDate() - 1);
+      const dayOfWeek = currentDate.getDay();
+      // Skip weekends (0 = Sunday, 6 = Saturday)
+      if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+        businessDays.push(new Date(currentDate));
+        daysFound++;
+      }
+    }
+
+    const oldestBusinessDay = businessDays[businessDays.length - 1];
+    oldestBusinessDay.setHours(0, 0, 0, 0);
+
+    console.log(`📊 Calculating capacity for last 7 business days (${oldestBusinessDay.toISOString().split('T')[0]} to ${today.toISOString().split('T')[0]})`);
+
+    // Get all DIDs for this tenant
+    const allDIDs = await DID.find(filter).lean();
+
+    // Get calls for each DID in the last 7 business days
+    const didCallCounts = await CallRecord.aggregate([
       {
-        $project: {
-          phoneNumber: 1,
-          capacity: 1,
-          totalCalls: '$usage.totalCalls',
-          lastUsed: '$usage.lastUsed',
-          location: 1,
-          utilizationRate: {
-            $cond: {
-              if: { $and: [{ $gt: ['$capacity', 0] }, { $gt: ['$usage.totalCalls', 0] }] },
-              then: { $multiply: [{ $divide: ['$usage.totalCalls', '$capacity'] }, 100] },
-              else: 0
-            }
-          }
+        $match: {
+          ...(!isAdmin && userTenantId ? { tenantId: userTenantId } : {}),
+          callTimestamp: { $gte: oldestBusinessDay, $lt: today },
+          selectedDID: { $exists: true, $ne: null }
         }
       },
-      { $sort: { utilizationRate: -1 } }
+      {
+        $group: {
+          _id: '$selectedDID',
+          totalCalls: { $sum: 1 }
+        }
+      }
     ]);
+
+    // Create a map of DID to call count
+    const didCallMap = new Map();
+    didCallCounts.forEach(item => {
+      didCallMap.set(item._id, item.totalCalls);
+    });
+
+    // Calculate capacity stats with average daily usage
+    const capacityStats = allDIDs.map(did => {
+      const totalCallsLast7Days = didCallMap.get(did.phoneNumber) || 0;
+      const avgCallsPerDay = totalCallsLast7Days / 7; // Average over 7 business days
+      const capacity = did.capacity || 100;
+      const utilizationRate = capacity > 0 ? (avgCallsPerDay / capacity) * 100 : 0;
+
+      return {
+        phoneNumber: did.phoneNumber,
+        capacity,
+        totalCalls: totalCallsLast7Days,
+        avgCallsPerDay: Math.round(avgCallsPerDay * 10) / 10, // Round to 1 decimal
+        lastUsed: did.usage?.lastUsed,
+        location: did.location,
+        utilizationRate: Math.round(utilizationRate * 10) / 10 // Round to 1 decimal
+      };
+    }).sort((a, b) => b.utilizationRate - a.utilizationRate);
 
     // Find over-capacity DIDs (>80% utilization)
     const overCapacityDIDs = capacityStats.filter(d => d.utilizationRate > 80);
 
-    // Area code analysis
+    // Area code analysis with 7-day average
+    const areaCodeCallCounts = await CallRecord.aggregate([
+      {
+        $match: {
+          ...(!isAdmin && userTenantId ? { tenantId: userTenantId } : {}),
+          callTimestamp: { $gte: oldestBusinessDay, $lt: today },
+          selectedDID: { $exists: true, $ne: null }
+        }
+      },
+      {
+        $lookup: {
+          from: 'dids',
+          localField: 'selectedDID',
+          foreignField: 'phoneNumber',
+          as: 'didInfo'
+        }
+      },
+      {
+        $unwind: {
+          path: '$didInfo',
+          preserveNullAndEmptyArrays: false
+        }
+      },
+      {
+        $match: {
+          'didInfo.location.areaCode': { $exists: true }
+        }
+      },
+      {
+        $group: {
+          _id: '$didInfo.location.areaCode',
+          totalCalls: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const areaCodeCallMap = new Map();
+    areaCodeCallCounts.forEach(item => {
+      areaCodeCallMap.set(item._id, item.totalCalls);
+    });
+
+    // Calculate area code stats
     const areaCodeStats = await DID.aggregate([
       { $match: { ...filter, 'location.areaCode': { $exists: true } } },
       {
@@ -2738,27 +3423,31 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
           state: { $first: '$location.state' },
           city: { $first: '$location.city' },
           didCount: { $sum: 1 },
-          totalCalls: { $sum: '$usage.totalCalls' },
-          totalCapacity: { $sum: '$capacity' },
-          avgUtilization: {
-            $avg: {
-              $cond: {
-                if: { $and: [{ $gt: ['$capacity', 0] }, { $gt: ['$usage.totalCalls', 0] }] },
-                then: { $multiply: [{ $divide: ['$usage.totalCalls', '$capacity'] }, 100] },
-                else: 0
-              }
-            }
-          }
+          totalCapacity: { $sum: '$capacity' }
         }
-      },
-      { $sort: { totalCalls: -1 } },
-      { $limit: 20 }
+      }
     ]);
 
-    // Calculate overall capacity
+    // Add call data and calculate average utilization
+    const areaCodeStatsWithCalls = areaCodeStats.map(ac => {
+      const totalCalls = areaCodeCallMap.get(ac._id) || 0;
+      const avgCallsPerDay = totalCalls / 7;
+      const avgUtilization = ac.totalCapacity > 0 ? (avgCallsPerDay / (ac.totalCapacity / ac.didCount)) * 100 : 0;
+
+      return {
+        ...ac,
+        totalCalls,
+        avgUtilization: Math.round(avgUtilization * 10) / 10
+      };
+    }).sort((a, b) => b.totalCalls - a.totalCalls).slice(0, 20);
+
+    // Calculate overall capacity with 7-day average
     const totalCapacity = capacityStats.reduce((sum, d) => sum + (d.capacity || 0), 0);
-    const totalUsage = capacityStats.reduce((sum, d) => sum + (d.totalCalls || 0), 0);
-    const overallUtilization = totalCapacity > 0 ? (totalUsage / totalCapacity) * 100 : 0;
+    const totalCallsLast7Days = capacityStats.reduce((sum, d) => sum + (d.totalCalls || 0), 0);
+    const avgDailyUsage = totalCallsLast7Days / 7;
+    const overallUtilization = totalCapacity > 0 ? (avgDailyUsage / totalCapacity) * 100 : 0;
+
+    console.log(`📊 Capacity Summary: Total Capacity=${totalCapacity}, Avg Daily Usage=${Math.round(avgDailyUsage)}, Utilization=${overallUtilization.toFixed(1)}%`);
 
     // Analyze DESTINATION area codes (where customers are located)
     // Use phoneNumber field which contains destination numbers (format: 12015551234 or +12015551234)
@@ -2923,11 +3612,11 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
           activeDIDs,
           overCapacityCount: overCapacityDIDs.length,
           totalCapacity,
-          totalUsage,
+          totalUsage: Math.round(avgDailyUsage),
           overallUtilization: Math.round(overallUtilization * 10) / 10
         },
         topOverCapacity,
-        areaCodeStats: areaCodeStats.map(ac => ({
+        areaCodeStats: areaCodeStatsWithCalls.map(ac => ({
           areaCode: ac._id,
           state: ac.state,
           city: ac.city,
@@ -2951,6 +3640,197 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
   } catch (error) {
     console.error('Analytics capacity error:', error);
     res.status(500).json({ success: false, message: 'Failed to load capacity analytics' });
+  }
+});
+
+// ============================================================================
+// TimescaleDB Analytics Proxy Endpoints
+// These endpoints proxy requests to the FastAPI service on port 5001
+// They handle JWT authentication and translate to API key auth
+// ============================================================================
+
+const FASTAPI_URL = 'http://127.0.0.1:5001';
+
+// Helper function to get user's API key from tenant
+async function getUserApiKey(req) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) {
+    console.log('getUserApiKey: No token provided');
+    return null;
+  }
+
+  try {
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+
+    // Get tenant ID from either tenant or tenantId field
+    const tenantId = user?.tenant || user?.tenantId;
+    if (!user || !tenantId) {
+      console.log('getUserApiKey: No user or tenant found');
+      return null;
+    }
+
+    // Get the tenant with API keys
+    const tenant = await Tenant.findById(tenantId);
+    if (!tenant || !tenant.apiKeys || tenant.apiKeys.length === 0) {
+      console.log('getUserApiKey: No tenant or API keys found for tenant:', tenantId);
+      return null;
+    }
+
+    // Find an active API key
+    const activeKey = tenant.apiKeys.find(k => k.isActive !== false);
+    const apiKey = activeKey ? activeKey.key : tenant.apiKeys[0].key;
+    console.log('getUserApiKey: Found API key for tenant:', tenant.name);
+    return apiKey;
+  } catch (error) {
+    console.error('Error getting user API key:', error.message);
+    return null;
+  }
+}
+
+// TimescaleDB Summary (Today/Week/Month overview)
+app.get('/api/v1/analytics/ts/summary', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) {
+      return res.status(401).json({ success: false, message: 'Unauthorized or no API key available' });
+    }
+
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/summary`, {
+      headers: { 'x-api-key': apiKey }
+    });
+
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    console.error('TimescaleDB summary proxy error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch analytics summary' });
+  }
+});
+
+// TimescaleDB Realtime stats
+app.get('/api/v1/analytics/ts/realtime', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) {
+      return res.status(401).json({ success: false, message: 'Unauthorized or no API key available' });
+    }
+
+    const minutes = req.query.minutes || 5;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/realtime?minutes=${minutes}`, {
+      headers: { 'x-api-key': apiKey }
+    });
+
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    console.error('TimescaleDB realtime proxy error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch realtime analytics' });
+  }
+});
+
+// TimescaleDB Hourly stats
+app.get('/api/v1/analytics/ts/hourly', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) {
+      return res.status(401).json({ success: false, message: 'Unauthorized or no API key available' });
+    }
+
+    const hours = req.query.hours || 24;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/hourly?hours=${hours}`, {
+      headers: { 'x-api-key': apiKey }
+    });
+
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    console.error('TimescaleDB hourly proxy error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch hourly analytics' });
+  }
+});
+
+// TimescaleDB Daily stats
+app.get('/api/v1/analytics/ts/daily', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) {
+      return res.status(401).json({ success: false, message: 'Unauthorized or no API key available' });
+    }
+
+    const days = req.query.days || 30;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/daily?days=${days}`, {
+      headers: { 'x-api-key': apiKey }
+    });
+
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    console.error('TimescaleDB daily proxy error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch daily analytics' });
+  }
+});
+
+// TimescaleDB Campaign stats
+app.get('/api/v1/analytics/ts/campaigns', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) {
+      return res.status(401).json({ success: false, message: 'Unauthorized or no API key available' });
+    }
+
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/campaigns?days=${days}`, {
+      headers: { 'x-api-key': apiKey }
+    });
+
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    console.error('TimescaleDB campaigns proxy error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch campaign analytics' });
+  }
+});
+
+// TimescaleDB Geographic stats
+app.get('/api/v1/analytics/ts/geographic', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) {
+      return res.status(401).json({ success: false, message: 'Unauthorized or no API key available' });
+    }
+
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/geographic?days=${days}`, {
+      headers: { 'x-api-key': apiKey }
+    });
+
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    console.error('TimescaleDB geographic proxy error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch geographic analytics' });
+  }
+});
+
+// TimescaleDB DID stats
+app.get('/api/v1/analytics/ts/dids', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) {
+      return res.status(401).json({ success: false, message: 'Unauthorized or no API key available' });
+    }
+
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/dids?days=${days}`, {
+      headers: { 'x-api-key': apiKey }
+    });
+
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    console.error('TimescaleDB dids proxy error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch DID analytics' });
   }
 });
 

@@ -3,6 +3,7 @@ import VICIdialSetting from '../models/VICIdialSetting.js';
 import Campaign from '../models/Campaign.js';
 import axios from 'axios';
 import https from 'https';
+import { authenticate } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -351,10 +352,44 @@ router.get('/campaigns', async (req, res) => {
 });
 
 // GET /api/v1/settings/vicidial/generate-config - Generate dids.conf file
-router.get('/generate-config', async (req, res) => {
+router.get('/generate-config', authenticate, async (req, res) => {
   try {
-    // Get user's API key
-    const apiKey = req.user?.apiKey || process.env.API_KEY || 'YOUR_API_KEY_HERE';
+    console.log('🔧 [CONFIG] Generate config request received');
+    console.log('🔧 [CONFIG] User ID:', req.user?._id);
+    console.log('🔧 [CONFIG] User tenant ID:', req.user?.tenant?._id);
+
+    // Get user's tenant (already populated by auth middleware)
+    const tenant = req.user?.tenant;
+
+    if (!tenant) {
+      console.log('❌ [CONFIG] No tenant found');
+      return res.status(404).json({
+        success: false,
+        error: 'Tenant not found. Please ensure you are logged in.'
+      });
+    }
+
+    console.log('✅ [CONFIG] Tenant found:', tenant.name);
+    console.log('🔧 [CONFIG] API Keys count:', tenant.apiKeys?.length || 0);
+
+    // Find first active API key
+    const activeApiKey = tenant.apiKeys?.find(key => key.isActive);
+
+    if (!activeApiKey) {
+      console.log('❌ [CONFIG] No active API key found');
+      return res.status(400).json({
+        success: false,
+        error: 'No API key found. Please create an API key in Settings → API Keys first.'
+      });
+    }
+
+    const apiKey = activeApiKey.key;
+    console.log('✅ [CONFIG] API key found:', apiKey.substring(0, 12) + '...');
+
+    // Update lastUsed timestamp for the API key
+    activeApiKey.lastUsed = new Date();
+    await tenant.save();
+    console.log('✅ [CONFIG] API key lastUsed updated');
 
     const config = `# DID Optimizer Pro Configuration
 # Location: /etc/asterisk/dids.conf
@@ -367,7 +402,7 @@ router.get('/generate-config', async (req, res) => {
 
 [general]
 # API Configuration
-api_base_url=${process.env.API_BASE_URL || 'https://dids.amdy.io'}
+api_base_url=${process.env.FASTAPI_BASE_URL || 'http://api3.amdy.io:5001'}
 api_key=${apiKey}
 api_timeout=10
 max_retries=3
@@ -429,8 +464,9 @@ read_timeout=60
     res.set('Content-Disposition', 'attachment; filename="dids.conf"');
     res.send(config);
   } catch (error) {
-    console.error('Error generating config:', error);
-    res.status(500).json({ success: false, error: 'Failed to generate configuration file' });
+    console.error('❌ [CONFIG] Error generating config:', error.message);
+    console.error('❌ [CONFIG] Error stack:', error.stack);
+    res.status(500).json({ success: false, error: error.message || 'Failed to generate configuration file' });
   }
 });
 

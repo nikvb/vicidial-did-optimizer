@@ -1,31 +1,31 @@
 {
    "results" : {
-      "actual_rps" : "81.44",
       "total" : 100,
+      "duration" : "30.89s",
+      "actual_rps" : "3.24",
       "success_rate" : "100.00%",
-      "successful" : 100,
       "failed" : 0,
+      "response_times" : {
+         "p95" : 3538.766,
+         "min" : 817.648,
+         "avg" : 2702.71288,
+         "max" : 3547.465,
+         "p99" : 3547.465,
+         "p50" : 2872.224,
+         "p90" : 3208.061
+      },
+      "errors" : {},
       "status_codes" : {
          "200" : 100
       },
-      "errors" : {},
-      "duration" : "1.23s",
-      "response_times" : {
-         "min" : 80.966,
-         "p50" : 108.986,
-         "p90" : 122.073,
-         "max" : 125.344,
-         "p99" : 125.344,
-         "avg" : 107.41326,
-         "p95" : 123.301
-      }
+      "successful" : 100
    },
+   "timestamp" : "2025-11-17T03:15:37Z",
    "config" : {
-      "api_url" : "http://localhost:5000/api/v1/dids/next",
+      "timeout" : "30",
+      "api_key" : "did_259b3759b3041137...",
       "total_requests" : "100",
       "concurrent" : "10",
-      "api_key" : "did_259b3759b3041137...",
-      "timeout" : "30"
-   },
-   "timestamp" : "2025-11-14T17:11:25Z"
+      "api_url" : "http://localhost:5000/api/v1/dids/next"
+   }
 }

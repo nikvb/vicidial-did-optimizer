@@ -1,0 +1,33 @@
+{
+  "config": {
+    "apiUrl": "http://localhost:5000/api/v1/dids/next",
+    "apiKey": "did_259b3759b3041137f2379fe1aff4aefeba4aa8b8bea355c4f0e33fbe714d46f7",
+    "concurrent": 50,
+    "totalRequests": 1000,
+    "timeout": 30000,
+    "reportFile": "stress-test-simple-report.json"
+  },
+  "results": {
+    "total": 1000,
+    "successful": 0,
+    "failed": 1000,
+    "successRate": "0.00%",
+    "duration": "5.48s",
+    "actualRPS": "182.52",
+    "responseTimes": {
+      "min": 2.1376060000002326,
+      "max": 5315.708282,
+      "avg": 270.1786588870001,
+      "p50": 4.556346000000303,
+      "p90": 8.860521999999946,
+      "p95": 16.68262700000014,
+      "p99": 5307.358294
+    },
+    "statusCodes": {},
+    "errors": {
+      "socket hang up": 50,
+      "connect ECONNREFUSED 127.0.0.1:5000": 950
+    }
+  },
+  "timestamp": "2025-11-13T22:37:24.694Z"
+}

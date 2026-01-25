@@ -65,6 +65,18 @@ const didSchema = new mongoose.Schema({
     }
   },
 
+  // NPANXX field for fast geographic matching (first 6 digits of phone number)
+  npanxx: {
+    type: String,
+    maxlength: 6,
+    validate: {
+      validator: function(v) {
+        return !v || /^\d{6}$/.test(v);
+      },
+      message: 'NPANXX must be exactly 6 digits'
+    }
+  },
+
   // Usage tracking (flexible schema)
   usage: {
     totalCalls: {
@@ -177,6 +189,11 @@ didSchema.index({ tenantId: 1, status: 1, 'reputation.score': 1 });
 // Index for daily usage filtering
 didSchema.index({ 'usage.dailyUsage.date': 1 });
 
+// NPANXX-based geographic matching indexes (Phase 1)
+didSchema.index({ npanxx: 1 });
+didSchema.index({ tenantId: 1, npanxx: 1, status: 1, 'reputation.score': -1 });
+didSchema.index({ tenantId: 1, 'location.areaCode': 1, status: 1, 'reputation.score': -1 });
+
 // Method to get today's usage count
 didSchema.methods.getTodayUsage = function() {
   const today = new Date();
@@ -250,39 +267,54 @@ didSchema.methods.getDistanceFrom = function(latitude, longitude) {
   );
 };
 
-// Pre-save middleware to automatically populate location data from NPANXX database
+// Pre-save middleware to automatically populate location data and NPANXX from phone number
 didSchema.pre('save', async function(next) {
-  // Only populate location if it's a new document or phone number changed
+  // Only populate if new document or phone number changed
   if (this.isNew || this.isModified('phoneNumber')) {
     try {
       // Import AreaCodeLocation here to avoid circular dependencies
       const AreaCodeLocation = mongoose.model('AreaCodeLocation');
 
-      // Extract area code from phone number
-      const extractAreaCode = (phoneNumber) => {
-        if (!phoneNumber) return null;
+      // Extract area code and NPANXX from phone number
+      const extractPhoneData = (phoneNumber) => {
+        if (!phoneNumber) return { areaCode: null, npanxx: null };
         const cleanNumber = phoneNumber.replace(/\D/g, '');
+
         if (cleanNumber.length >= 10) {
+          let digits = cleanNumber;
+          // Handle country code (1)
           if (cleanNumber.startsWith('1') && cleanNumber.length === 11) {
-            return cleanNumber.substring(1, 4);
+            digits = cleanNumber.substring(1);
           } else if (cleanNumber.length === 10) {
-            return cleanNumber.substring(0, 3);
+            digits = cleanNumber;
+          } else {
+            return { areaCode: null, npanxx: null };
           }
+
+          return {
+            areaCode: digits.substring(0, 3),
+            npanxx: digits.substring(0, 6)
+          };
         }
-        return null;
+        return { areaCode: null, npanxx: null };
       };
 
-      const areaCode = extractAreaCode(this.phoneNumber);
+      const { areaCode, npanxx } = extractPhoneData(this.phoneNumber);
 
+      // Set NPANXX field
+      if (npanxx) {
+        this.npanxx = npanxx;
+      }
+
+      // Lookup location data from AreaCodeLocation
       if (areaCode) {
-        // Lookup location data from NPANXX database
         const locationData = await AreaCodeLocation.findOne({ areaCode });
 
         if (locationData) {
-          // Only update if location data is not already set or source is not NPANXX
-          if (!this.location || this.location.source !== 'NPANXX') {
+          // Only update if not manually set
+          if (!this.location || this.location.source !== 'Manual') {
             this.location = {
-              ...this.location, // Preserve any existing manual data
+              ...this.location,
               areaCode: locationData.areaCode,
               city: locationData.city,
               state: locationData.state,
@@ -297,8 +329,8 @@ didSchema.pre('save', async function(next) {
         }
       }
     } catch (error) {
-      // Don't fail the save if location lookup fails
-      console.warn('Failed to populate location data for DID:', this.phoneNumber, error.message);
+      // Don't fail the save if location/NPANXX lookup fails
+      console.warn('Failed to populate location/NPANXX for DID:', this.phoneNumber, error.message);
     }
   }
   next();

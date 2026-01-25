@@ -197,10 +197,10 @@ async function bulkUpdateReputationFast() {
   let query = { isActive: true };
 
   if (!forceUpdate) {
-    // Only update DIDs that haven't been checked in 1 day
+    // Only update DIDs that haven't been checked in 48 hours
     query.$or = [
       { 'reputation.lastChecked': { $exists: false } },
-      { 'reputation.lastChecked': { $lt: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000) } }
+      { 'reputation.lastChecked': { $lt: new Date(Date.now() - 48 * 60 * 60 * 1000) } }
     ];
   }
 
@@ -224,18 +224,25 @@ async function bulkUpdateReputationFast() {
     errors: []
   };
 
-  const batchSize = 5; // Increased batch size since we have proxy rotation
-  // NO DELAYS - proxy rotation handles rate limiting
+  const batchSize = 3; // Reduced batch size to limit concurrent processes
+  const delayBetweenBatches = 5000; // 5 second delay between batches
+  const maxDidsPerRun = 200; // Maximum DIDs to process per run
 
-  console.log(`🔄 Processing ${results.total} DIDs in batches of ${batchSize} with proxy rotation (NO DELAYS)...`);
+  // Limit DIDs per run to avoid resource exhaustion
+  const limitedDids = didsToUpdate.slice(0, maxDidsPerRun);
+  if (didsToUpdate.length > maxDidsPerRun) {
+    console.log(`⚠️  Limiting to ${maxDidsPerRun} DIDs per run (${didsToUpdate.length} total need checking)`);
+  }
+
+  console.log(`🔄 Processing ${limitedDids.length} DIDs in batches of ${batchSize} with ${delayBetweenBatches/1000}s delay...`);
   console.log('');
 
-  for (let i = 0; i < didsToUpdate.length; i += batchSize) {
-    const batch = didsToUpdate.slice(i, i + batchSize);
+  for (let i = 0; i < limitedDids.length; i += batchSize) {
+    const batch = limitedDids.slice(i, i + batchSize);
     const batchNum = Math.floor(i / batchSize) + 1;
-    const totalBatches = Math.ceil(didsToUpdate.length / batchSize);
+    const totalBatches = Math.ceil(limitedDids.length / batchSize);
 
-    console.log(`📦 Batch ${batchNum}/${totalBatches} (DIDs ${i + 1}-${Math.min(i + batchSize, didsToUpdate.length)})`);
+    console.log(`📦 Batch ${batchNum}/${totalBatches} (DIDs ${i + 1}-${Math.min(i + batchSize, limitedDids.length)})`);
 
     // Process batch in parallel with proxy rotation
     const batchPromises = batch.map(updateSingleDID);
@@ -258,9 +265,15 @@ async function bulkUpdateReputationFast() {
     }
 
     // Progress update
-    const progress = ((i + batchSize) / didsToUpdate.length * 100).toFixed(1);
+    const progress = ((i + batchSize) / limitedDids.length * 100).toFixed(1);
     console.log(`📊 Progress: ${progress}% - Success: ${results.successful}, Failed: ${results.failed}`);
-    console.log(''); // Just a line break, no delays
+
+    // Delay between batches to prevent resource exhaustion
+    if (i + batchSize < limitedDids.length) {
+      console.log(`⏳ Waiting ${delayBetweenBatches/1000}s before next batch...`);
+      await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
+    }
+    console.log('');
   }
 
   console.log('\n' + '='.repeat(80));

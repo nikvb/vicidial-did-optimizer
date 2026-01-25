@@ -327,3 +327,52 @@ Reference the detailed specifications in:
 - never use https://endpoint.amdy.io always use https://dids.amdy.io
 - username for testing client@test3.com password: password123
 - check every change in UI with playwright server
+
+## FastAPI Service & TimescaleDB Analytics
+
+### Related Service
+A companion FastAPI service runs on port 5001 for high-performance DID selection and TimescaleDB analytics.
+
+**Location**: `/home/na/didapi-fastapi/`
+**Documentation**: See `/home/na/didapi-fastapi/CLAUDE.md` for full details
+
+### Service Management
+```bash
+# Start/restart FastAPI
+pm2 restart fastapi-did-optimizer
+
+# View logs
+pm2 logs fastapi-did-optimizer --lines 50
+```
+
+### TimescaleDB Analytics Overview
+
+| Component | Details |
+|-----------|---------|
+| Database | `did_analytics` on PostgreSQL 15/TimescaleDB |
+| Hypertable | `call_records` - partitioned by day |
+| Hourly Aggregate | `call_stats_hourly` - refreshed every 30 min |
+| Daily Aggregate | `call_stats_daily` - refreshed every hour |
+| Compression | After 7 days |
+| Retention | 365 days for raw data |
+| Records | 3.8M+ migrated from MongoDB |
+
+### Analytics Endpoints (Port 5001)
+Require `x-api-key` header (tenant API key from MongoDB).
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/v1/analytics/realtime?minutes=5` | Last N minutes from raw hypertable |
+| `GET /api/v1/analytics/hourly?hours=24` | Hourly aggregates |
+| `GET /api/v1/analytics/daily?days=30` | Daily aggregates |
+| `GET /api/v1/analytics/campaigns?days=7` | Campaign performance |
+| `GET /api/v1/analytics/geographic?days=7` | State/area code breakdown |
+| `GET /api/v1/analytics/dids?days=7` | DID performance |
+| `GET /api/v1/analytics/summary` | Today/week/month overview |
+
+### Performance
+- Daily analytics query: ~5ms (vs ~500ms from MongoDB)
+- Continuous aggregates provide instant rollup queries
+
+### Frontend Integration Status
+The React frontend (`Analytics.js`) currently uses the **Node.js backend (port 5000)** which queries MongoDB. TimescaleDB analytics on port 5001 are available for VICIdial integrations and external dashboards.
