@@ -24,17 +24,20 @@ AGI_SCRIPT="vicidial-did-optimizer.agi"
 AGI_SOURCE="https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/vicidial-did-optimizer.agi"
 CONFIG_FILE="/etc/asterisk/dids.conf"
 LOG_DIR="/var/log/astguiclient"
-ASTERISK_USER="asterisk"
-ASTERISK_GROUP="asterisk"
 
 # Required Perl modules
 PERL_MODULES=(
     "LWP::UserAgent"
+    "LWP::Protocol::https"
     "JSON"
     "URI::Escape"
     "Cache::FileCache"
     "Asterisk::AGI"
     "Time::HiRes"
+    "HTTP::Request"
+    "IO::Socket::SSL"
+    "Mozilla::CA"
+    "Net::SSLeay"
 )
 
 ################################################################################
@@ -106,32 +109,37 @@ install_perl_modules() {
     fi
 
     print_warning "Missing Perl modules: ${missing_modules[*]}"
-    print_info "Installing missing modules via CPAN..."
+    print_info "Installing missing modules..."
 
-    # Install CPAN if not available
-    if ! command -v cpan &> /dev/null; then
-        print_info "Installing CPAN..."
-        yum install -y perl-CPAN perl-YAML 2>/dev/null || apt-get install -y cpanminus 2>/dev/null
+    # Install cpanminus if not available
+    if ! command -v cpanm &> /dev/null; then
+        print_info "Installing cpanminus..."
+        if command -v dnf &> /dev/null; then
+            dnf install -y perl-App-cpanminus 2>/dev/null || \
+                curl -L https://cpanmin.us | perl - --self-upgrade 2>/dev/null
+        elif command -v yum &> /dev/null; then
+            yum install -y perl-App-cpanminus 2>/dev/null || \
+                curl -L https://cpanmin.us | perl - --self-upgrade 2>/dev/null
+        elif command -v apt-get &> /dev/null; then
+            apt-get install -y cpanminus 2>/dev/null
+        fi
     fi
 
-    # Try cpanm first (faster), fall back to cpan
-    if command -v cpanm &> /dev/null; then
-        for module in "${missing_modules[@]}"; do
-            print_info "Installing $module..."
-            cpanm --notest "$module" || {
-                print_error "Failed to install $module via cpanm"
+    for module in "${missing_modules[@]}"; do
+        print_info "Installing $module..."
+        if command -v cpanm &> /dev/null; then
+            if ! cpanm --notest --quiet "$module"; then
+                print_error "Failed to install $module"
                 return 1
-            }
-        done
-    else
-        for module in "${missing_modules[@]}"; do
-            print_info "Installing $module..."
-            cpan -T "$module" || {
-                print_error "Failed to install $module via cpan"
+            fi
+        else
+            if ! yes '' | cpan -T "$module" 2>&1 | grep -q "OK\|up to date"; then
+                print_error "Failed to install $module"
                 return 1
-            }
-        done
-    fi
+            fi
+        fi
+        print_step "$module installed"
+    done
 
     print_step "All Perl modules installed successfully"
 }
@@ -147,7 +155,6 @@ download_agi_script() {
         print_info "Using local copy from vicidial-integration directory"
         cp "../vicidial-integration/vicidial-did-optimizer.agi" "$AGI_DIR/$AGI_SCRIPT"
     else
-        # Download from GitHub
         print_info "Downloading from GitHub..."
         if command -v wget &> /dev/null; then
             wget -q -O "$AGI_DIR/$AGI_SCRIPT" "$AGI_SOURCE" || {
@@ -170,12 +177,9 @@ download_agi_script() {
 
 set_permissions() {
     print_info "Setting file permissions..."
-
-    # Make AGI script executable
     chmod 755 "$AGI_DIR/$AGI_SCRIPT"
-    chown ${ASTERISK_USER}:${ASTERISK_GROUP} "$AGI_DIR/$AGI_SCRIPT"
-
-    print_step "Permissions set (755, ${ASTERISK_USER}:${ASTERISK_GROUP})"
+    # VICIdial runs as root — no chown needed
+    print_step "Permissions set (755)"
 }
 
 create_log_directory() {
@@ -183,10 +187,8 @@ create_log_directory() {
         print_info "Creating log directory: $LOG_DIR"
         mkdir -p "$LOG_DIR"
     fi
-
-    chown ${ASTERISK_USER}:${ASTERISK_GROUP} "$LOG_DIR"
     chmod 755 "$LOG_DIR"
-
+    # VICIdial runs as root — no chown needed
     print_step "Log directory ready: $LOG_DIR"
 }
 
@@ -195,27 +197,60 @@ verify_config() {
         print_warning "Configuration file not found: $CONFIG_FILE"
         print_info "Please download dids.conf from the DID Optimizer web interface"
         print_info "and place it at: $CONFIG_FILE"
-        print_info "Then run: sudo chmod 600 $CONFIG_FILE && sudo chown ${ASTERISK_USER}:${ASTERISK_GROUP} $CONFIG_FILE"
+        print_info "Then run: sudo chmod 600 $CONFIG_FILE"
     else
         print_step "Configuration file exists: $CONFIG_FILE"
 
-        # Check permissions
-        local perms=$(stat -c %a "$CONFIG_FILE" 2>/dev/null || stat -f %OLp "$CONFIG_FILE" 2>/dev/null)
+        local perms
+        perms=$(stat -c %a "$CONFIG_FILE" 2>/dev/null || stat -f %OLp "$CONFIG_FILE" 2>/dev/null)
         if [ "$perms" != "600" ]; then
             print_warning "Configuration file permissions should be 600 (currently: $perms)"
             chmod 600 "$CONFIG_FILE"
             print_step "Corrected permissions to 600"
         fi
+    fi
+}
 
-        # Check ownership
-        chown ${ASTERISK_USER}:${ASTERISK_GROUP} "$CONFIG_FILE"
+install_logrotate() {
+    print_info "Configuring log rotation..."
+
+    if ! command -v logrotate &> /dev/null; then
+        print_warning "logrotate not found — skipping log rotation setup"
+        return 0
+    fi
+
+    cat > /etc/logrotate.d/did-optimizer << 'EOF'
+/var/log/astguiclient/did-optimizer.log
+/var/log/astguiclient/did-optimizer-stats.log {
+    su root root
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 644 root root
+    dateext
+    dateformat -%Y%m%d
+    sharedscripts
+    postrotate
+        # AGI script opens/closes the log on every call — no restart needed
+        true
+    endscript
+}
+EOF
+
+    # Validate the config
+    if logrotate --debug /etc/logrotate.d/did-optimizer 2>&1 | grep -q "error:"; then
+        print_warning "logrotate config validation produced warnings — check /etc/logrotate.d/did-optimizer"
+    else
+        print_step "Log rotation configured (daily, 30-day retention, compressed)"
     fi
 }
 
 test_installation() {
     print_info "Testing AGI script..."
 
-    # Basic syntax check
     if perl -c "$AGI_DIR/$AGI_SCRIPT" 2>&1 | grep -q "syntax OK"; then
         print_step "Perl syntax check passed"
     else
@@ -224,12 +259,21 @@ test_installation() {
         return 1
     fi
 
-    # Test with --test flag if available
-    if grep -q "test mode" "$AGI_DIR/$AGI_SCRIPT" 2>/dev/null; then
-        print_info "Running test mode..."
-        su - ${ASTERISK_USER} -s /bin/bash -c "perl $AGI_DIR/$AGI_SCRIPT --test" || {
-            print_warning "Test mode execution failed (this may be normal if config is not set up)"
-        }
+    # Verify HTTPS modules
+    print_info "Verifying HTTPS/SSL Perl modules..."
+    local https_ok=true
+    for module in "Net::SSLeay" "IO::Socket::SSL" "Mozilla::CA" "LWP::Protocol::https"; do
+        if perl -M"$module" -e 'exit 0' 2>/dev/null; then
+            print_step "$module working"
+        else
+            print_error "$module failed to load"
+            https_ok=false
+        fi
+    done
+
+    if [ "$https_ok" = false ]; then
+        print_error "Some HTTPS modules are not working"
+        return 1
     fi
 }
 
@@ -244,27 +288,21 @@ print_next_steps() {
         echo -e "1. ${YELLOW}Download dids.conf${NC}"
         echo -e "   - Log in to DID Optimizer web interface"
         echo -e "   - Go to Settings → VICIdial Integration"
-        echo -e "   - Click 'Download dids.conf'"
-        echo -e "   - Upload to: ${CONFIG_FILE}"
-        echo -e "   - Run: ${BLUE}sudo chmod 600 $CONFIG_FILE${NC}"
-        echo -e "   - Run: ${BLUE}sudo chown ${ASTERISK_USER}:${ASTERISK_GROUP} $CONFIG_FILE${NC}\n"
+        echo -e "   - Copy the configuration and paste into: ${CONFIG_FILE}"
+        echo -e "   - Run: ${BLUE}sudo chmod 600 $CONFIG_FILE${NC}\n"
     fi
 
-    echo -e "2. ${YELLOW}Configure Dialplan${NC}"
-    echo -e "   Add to /etc/asterisk/extensions.conf:\n"
-    echo -e "   ${BLUE}exten => _91NXXNXXXXXX,1,NoOp(Starting DID Optimizer for \${EXTEN})${NC}"
-    echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,Set(CUSTOMER_PHONE=\${EXTEN:1})${NC}"
+    echo -e "2. ${YELLOW}Configure Dialplan in VICIdial Admin${NC}"
+    echo -e "   ${RED}⚠️  DO NOT edit /etc/asterisk/extensions.conf directly!${NC}"
+    echo -e "   Use VICIdial Admin → Carriers → Dialplan Entry:\n"
     echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,AGI(vicidial-did-optimizer.agi)${NC}"
-    echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,NoOp(Selected DID: \${OPTIMIZER_DID})${NC}"
-    echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,Set(CALLERID(num)=\${OPTIMIZER_DID})${NC}"
-    echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,Dial(SIP/gateway/\${EXTEN:1},60,tTo)${NC}\n"
+    echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,Set(CALLERID(num)=\${OPTIMIZER_DID})${NC}\n"
+    echo -e "   Paste these ${YELLOW}BEFORE${NC} your Dial() command and click Submit.\n"
 
-    echo -e "3. ${YELLOW}Reload Asterisk Dialplan${NC}"
-    echo -e "   ${BLUE}asterisk -rx \"dialplan reload\"${NC}\n"
-
-    echo -e "4. ${YELLOW}Test${NC}"
+    echo -e "3. ${YELLOW}Test Integration${NC}"
     echo -e "   - Make a test call"
     echo -e "   - Monitor logs: ${BLUE}tail -f $LOG_DIR/did-optimizer.log${NC}"
+    echo -e "   - Stats log:    ${BLUE}tail -f $LOG_DIR/did-optimizer-stats.log${NC}"
     echo -e "   - Check DID Optimizer dashboard for call activity\n"
 
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}\n"
@@ -280,16 +318,15 @@ main() {
     check_root
     check_vicidial
     check_perl
-    install_perl_modules
+    install_perl_modules || { print_error "Perl module installation failed"; exit 1; }
     download_agi_script
     set_permissions
     create_log_directory
+    install_logrotate
     verify_config
     test_installation
     print_next_steps
 }
 
-# Run installation
 main
-
 exit 0
