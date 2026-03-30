@@ -1,160 +1,174 @@
 #!/usr/bin/perl
 
 ##############################################################################
-# VICIdial DID Optimizer - Call Result Reporting AGI
+# VICIdial DID Optimizer - Call Result Reporting AGI (v2)
 #
-# This AGI script reports call results back to the DID Optimizer API
-# for AI training and analytics purposes.
+# Runs in the Asterisk 'h' (hangup) extension to report call results
+# back to the DID Optimizer API in real-time.
 #
-# Usage: AGI(agi-did-optimizer-report.agi,CAMPAIGN_ID,CUSTOMER_PHONE,RESULT,DURATION,DISPOSITION)
+# Reads all data from channel variables — no arguments needed.
 #
-# Called from the 'h' extension (hangup handler) in the dialplan
+# Dialplan usage:
+#   exten => h,1,AGI(agi-did-optimizer-report.agi)
+#
+# Requires: /etc/asterisk/dids.conf with api_base_url, api_key
 ##############################################################################
 
 use strict;
 use warnings;
+use Asterisk::AGI;
 use LWP::UserAgent;
 use JSON;
+use POSIX qw(strftime);
 
-# AGI Environment variables
-my %agi_env;
-while (my $line = <STDIN>) {
-    chomp $line;
-    last if $line eq '';
-    if ($line =~ /^agi_(\w+):\s*(.*)$/) {
-        $agi_env{$1} = $2;
-    }
-}
+my $LOG_FILE = '/var/log/astguiclient/did-optimizer-report.log';
 
-# Get command line arguments
-my ($campaign_id, $customer_phone, $call_result, $call_duration, $disposition) = @ARGV;
+# Initialize AGI
+my $AGI = Asterisk::AGI->new;
+my %input = $AGI->ReadParse();
 
 # Read configuration
-my $config_file = '/etc/asterisk/dids.conf';
-my %config = read_config($config_file);
+my %config = read_config('/etc/asterisk/dids.conf');
 
-# Log function
-sub log_message {
-    my $message = shift;
-    my $log_file = $config{'log_file'} || '/var/log/astguiclient/did_optimizer.log';
+# Collect all available channel data
+my %call_data;
 
-    open my $fh, '>>', $log_file or return;
-    my $timestamp = localtime();
-    print $fh "[$timestamp] [REPORT-AGI] $message\n";
-    close $fh;
+# Standard AGI variables (always available)
+$call_data{uniqueid}  = $input{uniqueid}  || '';
+$call_data{channel}   = $input{channel}   || '';
+$call_data{extension} = $input{extension} || '';
+$call_data{callerid}  = $input{callerid}  || '';
+
+# Critical hangup variables
+$call_data{dialStatus}   = $AGI->get_variable('DIALSTATUS')   || 'UNKNOWN';
+$call_data{answeredTime} = $AGI->get_variable('ANSWEREDTIME') || '0';
+$call_data{dialedTime}   = $AGI->get_variable('DIALEDTIME')   || '0';
+$call_data{hangupCause}  = $AGI->get_variable('HANGUPCAUSE')  || '';
+
+# DID Optimizer variables (set by vicidial-did-optimizer.agi before the call)
+$call_data{optimizerDid}    = $AGI->get_variable('OPTIMIZER_DID')      || '';
+$call_data{optimizerStatus} = $AGI->get_variable('OPTIMIZER_STATUS')   || '';
+$call_data{optimizerScore}  = $AGI->get_variable('OPTIMIZER_SCORE')    || '';
+
+# VICIdial variables (if set in dialplan before Dial())
+$call_data{campaignId}    = $AGI->get_variable('CAMPAIGN_ID') || $AGI->get_variable('CAMPAIGN') || 'DEFAULT';
+$call_data{leadId}        = $AGI->get_variable('LEAD_ID')     || '';
+$call_data{listId}        = $AGI->get_variable('LIST_ID')     || '';
+$call_data{customerPhone} = $AGI->get_variable('CUSTOMER_PHONE') || '';
+$call_data{customerState} = $AGI->get_variable('STATE')       || '';
+$call_data{calledCount}   = $AGI->get_variable('CALLED_COUNT') || '0';
+
+# Clean the dialed number (strip dial prefix)
+my $dialed = $call_data{extension};
+if ($config{dial_prefixes}) {
+    my @prefixes = split(/\s*,\s*/, $config{dial_prefixes});
+    for my $prefix (sort { length($b) <=> length($a) } @prefixes) {
+        if ($dialed =~ s/^$prefix//) { last; }
+    }
+} else {
+    # Default: strip leading 9
+    $dialed =~ s/^9//;
 }
+$call_data{customerPhone} ||= $dialed;
 
-# Configuration reader
-sub read_config {
-    my $file = shift;
-    my %cfg;
+# Map DIALSTATUS to API result field
+my %status_map = (
+    'ANSWER'       => 'answered',
+    'BUSY'         => 'busy',
+    'NOANSWER'     => 'no_answer',
+    'NO ANSWER'    => 'no_answer',
+    'CANCEL'       => 'no_answer',
+    'CONGESTION'   => 'failed',
+    'CHANUNAVAIL'  => 'failed',
+    'DONTCALL'     => 'failed',
+    'TORTURE'      => 'failed',
+);
+my $result = $status_map{uc($call_data{dialStatus})} || 'no_answer';
 
-    open my $fh, '<', $file or do {
-        log_message("ERROR: Cannot read config file: $file");
-        return %cfg;
-    };
-
-    while (my $line = <$fh>) {
-        chomp $line;
-        next if $line =~ /^\s*[#;]/ || $line =~ /^\s*$/;
-        next if $line =~ /^\s*\[/;
-
-        if ($line =~ /^\s*(\w+)\s*=\s*(.*)$/) {
-            $cfg{$1} = $2;
-        }
-    }
-    close $fh;
-    return %cfg;
-}
-
-# Report call results to DID Optimizer API
-sub report_call_result {
-    my ($campaign, $phone, $result, $duration, $disp) = @_;
-
-    my $api_url = $config{api_base_url} || 'http://localhost:3001';
-    my $api_key = $config{api_key} || '';
-
-    unless ($api_key) {
-        log_message("ERROR: API key not configured for reporting");
-        return;
-    }
-
-    my $ua = LWP::UserAgent->new(
-        timeout => $config{api_timeout} || 10,
-        agent => 'VICIdial-DID-Optimizer-Report-AGI/1.0'
-    );
-
-    my $url = "$api_url/api/v1/calls/report";
-
-    # Prepare call result data
-    my $call_data = {
-        campaign_id => $campaign,
-        customer_phone => $phone,
-        call_result => $result || 'UNKNOWN',
-        call_duration => $duration || 0,
-        disposition => $disp || 'UNKNOWN',
-        timestamp => time(),
-        source => 'vicidial-agi'
-    };
-
-    # Add additional context from AGI environment
-    $call_data->{uniqueid} = $agi_env{uniqueid} if $agi_env{uniqueid};
-    $call_data->{channel} = $agi_env{channel} if $agi_env{channel};
-    $call_data->{callerid} = $agi_env{callerid} if $agi_env{callerid};
-
-    my $json_data = encode_json($call_data);
-
-    my $request = HTTP::Request->new(POST => $url);
-    $request->header('x-api-key' => $api_key);
-    $request->header('Content-Type' => 'application/json');
-    $request->content($json_data);
-
-    log_message("Reporting call result: $phone -> $result ($duration seconds, disposition: $disp)");
-
-    my $response = $ua->request($request);
-
-    if ($response->is_success) {
-        log_message("SUCCESS: Call result reported successfully");
-        return 1;
-    } else {
-        log_message("ERROR: Failed to report call result: " . $response->status_line);
-        return 0;
-    }
-}
-
-# AGI Response functions
-sub agi_verbose {
-    my ($message, $level) = @_;
-    $level ||= 1;
-    print "VERBOSE \"$message\" $level\n";
-}
-
-# Main execution
-eval {
-    log_message("DID Optimizer Report AGI started: campaign=$campaign_id, phone=$customer_phone, result=$call_result");
-
-    # Input validation
-    unless ($campaign_id && $customer_phone) {
-        log_message("WARNING: Missing campaign_id or customer_phone, skipping report");
-        agi_verbose("DID Optimizer Report: Skipping due to missing parameters");
-        exit 0;
-    }
-
-    # Report the call result
-    my $success = report_call_result($campaign_id, $customer_phone, $call_result, $call_duration, $disposition);
-
-    if ($success) {
-        agi_verbose("DID Optimizer Report: Call result reported successfully");
-    } else {
-        agi_verbose("DID Optimizer Report: Failed to report call result");
-    }
-
-    log_message("DID Optimizer Report AGI completed");
+# Build the API payload
+my $payload = {
+    uniqueid      => $call_data{uniqueid},
+    phoneNumber   => $call_data{optimizerDid} || $call_data{callerid},
+    customerPhone => $call_data{customerPhone},
+    campaignId    => $call_data{campaignId},
+    disposition   => $call_data{dialStatus},
+    duration      => int($call_data{answeredTime}),
+    dialStatus    => $call_data{dialStatus},
+    hangupCause   => int($call_data{hangupCause} || 0),
+    leadId        => $call_data{leadId},
+    listId        => $call_data{listId},
+    customerState => $call_data{customerState},
+    calledCount   => int($call_data{calledCount}),
+    timestamp     => time(),
+    source        => 'h-extension-agi',
 };
 
+# Log and send
+log_msg("CALL $call_data{uniqueid}: DID=$call_data{optimizerDid} DIAL=$call_data{dialStatus} DURATION=$call_data{answeredTime}s HANGUP=$call_data{hangupCause} CAMPAIGN=$call_data{campaignId}");
+
+my $api_url = $config{api_base_url};
+my $api_key = $config{api_key};
+
+unless ($api_url && $api_key) {
+    log_msg("ERROR: api_base_url or api_key not configured in /etc/asterisk/dids.conf");
+    exit 0;
+}
+
+# POST to API with short timeout (don't block hangup processing)
+my $ua = LWP::UserAgent->new(
+    timeout => 3,
+    agent   => 'VICIdial-DID-Report/2.0',
+);
+
+my $url = "$api_url/api/v1/call-results";
+my $json = encode_json($payload);
+
+eval {
+    my $response = $ua->post($url,
+        'Content-Type' => 'application/json',
+        'x-api-key'    => $api_key,
+        Content         => $json,
+    );
+
+    if ($response->is_success) {
+        log_msg("OK: Reported to API ($result, ${\ int($call_data{answeredTime})}s)");
+    } else {
+        log_msg("WARN: API returned " . $response->code . ": " . substr($response->content, 0, 200));
+    }
+};
 if ($@) {
-    log_message("ERROR: Report AGI script failed: $@");
-    agi_verbose("DID Optimizer Report: Error occurred during reporting");
+    log_msg("ERROR: $@");
 }
 
 exit 0;
+
+##############################################################################
+# Subroutines
+##############################################################################
+
+sub read_config {
+    my ($file) = @_;
+    my %cfg;
+    open(my $fh, '<', $file) or return %cfg;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^[;#]/ || $line =~ /^\s*$/;
+        if ($line =~ /^(\w+)\s*=\s*(.+)$/) {
+            my ($k, $v) = ($1, $2);
+            $v =~ s/\s+$//;
+            $cfg{$k} = $v;
+        }
+    }
+    close($fh);
+    return %cfg;
+}
+
+sub log_msg {
+    my ($message) = @_;
+    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    if (open(my $fh, '>>', $LOG_FILE)) {
+        flock($fh, 2);
+        print $fh "[$ts] $message\n";
+        close($fh);
+    }
+}

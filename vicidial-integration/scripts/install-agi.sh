@@ -175,6 +175,34 @@ download_agi_script() {
     print_step "AGI script downloaded to $AGI_DIR/$AGI_SCRIPT"
 }
 
+download_report_agi() {
+    print_info "Installing call-result reporting AGI (h extension)..."
+
+    REPORT_SCRIPT="agi-did-optimizer-report.agi"
+    REPORT_SOURCE="https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/agi/agi-did-optimizer-report.agi"
+
+    if [ -f "./agi-did-optimizer-report.agi" ]; then
+        cp "./agi-did-optimizer-report.agi" "$AGI_DIR/$REPORT_SCRIPT"
+    elif [ -f "../agi/agi-did-optimizer-report.agi" ]; then
+        cp "../agi/agi-did-optimizer-report.agi" "$AGI_DIR/$REPORT_SCRIPT"
+    else
+        if command -v wget &> /dev/null; then
+            wget -q -O "$AGI_DIR/$REPORT_SCRIPT" "$REPORT_SOURCE" || {
+                print_warning "Failed to download report AGI — skipping"
+                return 0
+            }
+        elif command -v curl &> /dev/null; then
+            curl -s -o "$AGI_DIR/$REPORT_SCRIPT" "$REPORT_SOURCE" || {
+                print_warning "Failed to download report AGI — skipping"
+                return 0
+            }
+        fi
+    fi
+
+    chmod 755 "$AGI_DIR/$REPORT_SCRIPT"
+    print_step "Report AGI installed to $AGI_DIR/$REPORT_SCRIPT"
+}
+
 set_permissions() {
     print_info "Setting file permissions..."
     chmod 755 "$AGI_DIR/$AGI_SCRIPT"
@@ -320,6 +348,7 @@ main() {
     check_perl
     install_perl_modules || { print_error "Perl module installation failed"; exit 1; }
     download_agi_script
+    download_report_agi
     set_permissions
     create_log_directory
     install_logrotate
