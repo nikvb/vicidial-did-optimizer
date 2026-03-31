@@ -90,6 +90,35 @@ check_perl() {
     print_step "Perl is installed ($(perl -v | grep -oP 'v\d+\.\d+\.\d+' | head -1))"
 }
 
+install_system_deps() {
+    print_info "Installing system dependencies for SSL/HTTPS..."
+
+    if command -v dnf &> /dev/null; then
+        dnf install -y --skip-broken gcc make openssl openssl-devel perl-devel \
+            perl-IO-Socket-SSL perl-Net-SSLeay perl-Mozilla-CA \
+            perl-LWP-Protocol-https ca-certificates 2>&1 | grep -v "Nothing to do" || true
+    elif command -v yum &> /dev/null; then
+        for pkg in gcc make openssl openssl-devel perl-devel \
+            perl-IO-Socket-SSL perl-Net-SSLeay perl-LWP-Protocol-https ca-certificates; do
+            yum install -y "$pkg" 2>&1 | grep -q "already installed\|Complete" || true
+        done
+    elif command -v apt-get &> /dev/null; then
+        apt-get update -qq
+        apt-get install -y build-essential libssl-dev \
+            libwww-perl libnet-ssleay-perl libio-socket-ssl-perl \
+            libmozilla-ca-perl cpanminus ca-certificates 2>/dev/null || true
+    fi
+
+    # Update CA certificates
+    if command -v update-ca-trust &> /dev/null; then
+        update-ca-trust extract 2>/dev/null || true
+    elif command -v update-ca-certificates &> /dev/null; then
+        update-ca-certificates 2>/dev/null || true
+    fi
+
+    print_step "System dependencies installed"
+}
+
 install_perl_modules() {
     print_info "Checking Perl module dependencies..."
 
@@ -346,9 +375,12 @@ print_next_steps() {
     echo -e "2. ${YELLOW}Configure Dialplan in VICIdial Admin${NC}"
     echo -e "   ${RED}⚠️  DO NOT edit /etc/asterisk/extensions.conf directly!${NC}"
     echo -e "   Use VICIdial Admin → Carriers → Dialplan Entry:\n"
+    echo -e "   ${BLUE}; BEFORE your Dial() command:${NC}"
     echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,AGI(vicidial-did-optimizer.agi)${NC}"
     echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,Set(CALLERID(num)=\${OPTIMIZER_DID})${NC}\n"
-    echo -e "   Paste these ${YELLOW}BEFORE${NC} your Dial() command and click Submit.\n"
+    echo -e "   ${BLUE}; AFTER all extensions (reports call result at hangup):${NC}"
+    echo -e "   ${BLUE}exten => h,1,AGI(agi-did-optimizer-report.agi)${NC}\n"
+    echo -e "   Paste these into the Dialplan Entry and click Submit.\n"
 
     echo -e "3. ${YELLOW}Test Integration${NC}"
     echo -e "   - Make a test call"
@@ -369,6 +401,7 @@ main() {
     check_root
     check_vicidial
     check_perl
+    install_system_deps
     install_perl_modules || { print_error "Perl module installation failed"; exit 1; }
     download_agi_script
     download_report_agi
