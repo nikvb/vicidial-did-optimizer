@@ -220,22 +220,45 @@ create_log_directory() {
     print_step "Log directory ready: $LOG_DIR"
 }
 
-verify_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        print_warning "Configuration file not found: $CONFIG_FILE"
-        print_info "Please download dids.conf from the DID Optimizer web interface"
-        print_info "and place it at: $CONFIG_FILE"
-        print_info "Then run: sudo chmod 600 $CONFIG_FILE"
-    else
-        print_step "Configuration file exists: $CONFIG_FILE"
+setup_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        print_step "Configuration file already exists: $CONFIG_FILE"
+        return 0
+    fi
 
-        local perms
-        perms=$(stat -c %a "$CONFIG_FILE" 2>/dev/null || stat -f %OLp "$CONFIG_FILE" 2>/dev/null)
-        if [ "$perms" != "600" ]; then
-            print_warning "Configuration file permissions should be 600 (currently: $perms)"
-            chmod 600 "$CONFIG_FILE"
-            print_step "Corrected permissions to 600"
-        fi
+    print_info "No configuration file found at $CONFIG_FILE"
+    echo ""
+    echo -e "${YELLOW}Enter your DID Optimizer API key to auto-generate the config.${NC}"
+    echo -e "${YELLOW}(Find it in the web UI: Settings → API Keys)${NC}"
+    echo ""
+    read -p "API Key (or press Enter to skip): " API_KEY_INPUT
+
+    if [ -z "$API_KEY_INPUT" ]; then
+        print_warning "Skipped config download — you'll need to create $CONFIG_FILE manually"
+        print_info "Get it from: Settings → VICIdial Integration in the web UI"
+        return 0
+    fi
+
+    print_info "Fetching configuration from API..."
+
+    local CONFIG_URL="https://dids.amdy.io/api/v1/settings/vicidial/download-config?key=${API_KEY_INPUT}"
+    local TEMP_CONFIG="/tmp/dids.conf.$$"
+
+    if command -v curl &> /dev/null; then
+        curl -s -f -o "$TEMP_CONFIG" "$CONFIG_URL" 2>/dev/null
+    elif command -v wget &> /dev/null; then
+        wget -q -O "$TEMP_CONFIG" "$CONFIG_URL" 2>/dev/null
+    fi
+
+    if [ -f "$TEMP_CONFIG" ] && grep -q "api_key=" "$TEMP_CONFIG" 2>/dev/null; then
+        mv "$TEMP_CONFIG" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+        print_step "Configuration downloaded and saved to $CONFIG_FILE"
+    else
+        rm -f "$TEMP_CONFIG"
+        print_error "Failed to fetch config — invalid API key or network error"
+        print_info "You can create it manually from: Settings → VICIdial Integration"
+        return 0
     fi
 }
 
@@ -352,7 +375,7 @@ main() {
     set_permissions
     create_log_directory
     install_logrotate
-    verify_config
+    setup_config
     test_installation
     print_next_steps
 }
