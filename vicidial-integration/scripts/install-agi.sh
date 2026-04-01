@@ -265,12 +265,19 @@ setup_config() {
         return 0
     fi
 
-    print_info "No configuration file found at $CONFIG_FILE"
-    echo ""
-    echo -e "${YELLOW}Enter your DID Optimizer API key to auto-generate the config.${NC}"
-    echo -e "${YELLOW}(Find it in the web UI: Settings → API Keys)${NC}"
-    echo ""
-    read -p "API Key (or press Enter to skip): " API_KEY_INPUT < /dev/tty
+    # Accept API key as first script argument, env var, or interactive prompt
+    local API_KEY_INPUT="${1:-$DID_API_KEY}"
+
+    if [ -z "$API_KEY_INPUT" ]; then
+        print_info "No configuration file found at $CONFIG_FILE"
+        echo ""
+        echo -e "${YELLOW}Enter your DID Optimizer API key to auto-generate the config.${NC}"
+        echo -e "${YELLOW}(Find it in the web UI: Settings → API Keys)${NC}"
+        echo ""
+        if [ -t 0 ] || [ -e /dev/tty ]; then
+            read -p "API Key (or press Enter to skip): " API_KEY_INPUT < /dev/tty 2>/dev/null || read -p "API Key: " API_KEY_INPUT
+        fi
+    fi
 
     if [ -z "$API_KEY_INPUT" ]; then
         print_warning "Skipped config download — you'll need to create $CONFIG_FILE manually"
@@ -419,10 +426,10 @@ main() {
     set_permissions
     create_log_directory
     install_logrotate
-    setup_config
+    setup_config "$1"
     test_installation
     print_next_steps
 }
 
-main
+main "$@"
 exit 0
