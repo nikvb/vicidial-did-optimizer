@@ -270,7 +270,7 @@ setup_config() {
     echo -e "${YELLOW}Enter your DID Optimizer API key to auto-generate the config.${NC}"
     echo -e "${YELLOW}(Find it in the web UI: Settings → API Keys)${NC}"
     echo ""
-    read -p "API Key (or press Enter to skip): " API_KEY_INPUT
+    read -p "API Key (or press Enter to skip): " API_KEY_INPUT < /dev/tty
 
     if [ -z "$API_KEY_INPUT" ]; then
         print_warning "Skipped config download — you'll need to create $CONFIG_FILE manually"
