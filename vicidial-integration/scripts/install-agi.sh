@@ -73,6 +73,15 @@ check_root() {
     fi
 }
 
+clean_previous() {
+    print_info "Cleaning previous installation..."
+    rm -f "$AGI_DIR/vicidial-did-optimizer.agi"
+    rm -f "$AGI_DIR/agi-did-optimizer-report.agi"
+    rm -f "$CONFIG_FILE"
+    rm -f /usr/src/install-agi.sh
+    print_step "Previous files removed"
+}
+
 check_vicidial() {
     if [ ! -d "$AGI_DIR" ]; then
         print_error "VICIdial AGI directory not found: $AGI_DIR"
@@ -399,6 +408,7 @@ main() {
     print_header
 
     check_root
+    clean_previous
     check_vicidial
     check_perl
     install_system_deps
