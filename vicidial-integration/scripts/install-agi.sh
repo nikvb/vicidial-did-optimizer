@@ -194,13 +194,14 @@ download_agi_script() {
         cp "../vicidial-integration/vicidial-did-optimizer.agi" "$AGI_DIR/$AGI_SCRIPT"
     else
         print_info "Downloading from GitHub..."
-        if command -v wget &> /dev/null; then
-            wget -q -O "$AGI_DIR/$AGI_SCRIPT" "$AGI_SOURCE" || {
+        local CACHE_BUST="?$(date +%s)"
+        if command -v curl &> /dev/null; then
+            curl -fsSL -o "$AGI_DIR/$AGI_SCRIPT" "${AGI_SOURCE}${CACHE_BUST}" || {
                 print_error "Failed to download AGI script"
                 exit 1
             }
-        elif command -v curl &> /dev/null; then
-            curl -s -o "$AGI_DIR/$AGI_SCRIPT" "$AGI_SOURCE" || {
+        elif command -v wget &> /dev/null; then
+            wget -q -O "$AGI_DIR/$AGI_SCRIPT" "${AGI_SOURCE}${CACHE_BUST}" || {
                 print_error "Failed to download AGI script"
                 exit 1
             }
