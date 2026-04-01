@@ -1,17 +1,21 @@
 #!/usr/bin/perl
 
 ##############################################################################
-# VICIdial DID Optimizer - Call Result Reporting AGI (v2)
+# VICIdial DID Optimizer - Call Result Reporting AGI (v3)
 #
-# Runs in the Asterisk 'h' (hangup) extension to report call results
+# Runs in the Asterisk 'h' (hangup) extension. Reports call results
 # back to the DID Optimizer API in real-time.
 #
-# Reads all data from channel variables — no arguments needed.
+# 1. Reads DIALSTATUS/ANSWEREDTIME/HANGUPCAUSE from Asterisk channel
+# 2. Fast query to VICIdial MySQL for agent, lead, customer data
+#    (uses uniqueid PK — instant, no lock, no table scan)
+# 3. POSTs everything to /api/v1/call-results
 #
 # Dialplan usage:
 #   exten => h,1,AGI(agi-did-optimizer-report.agi)
 #
-# Requires: /etc/asterisk/dids.conf with api_base_url, api_key
+# Requires: /etc/asterisk/dids.conf (api_base_url, api_key)
+#           /etc/astguiclient.conf  (VICIdial DB credentials — auto-detected)
 ##############################################################################
 
 use strict;
@@ -27,38 +31,30 @@ my $LOG_FILE = '/var/log/astguiclient/did-optimizer-report.log';
 my $AGI = Asterisk::AGI->new;
 my %input = $AGI->ReadParse();
 
-# Read configuration
+# Read DID Optimizer config
 my %config = read_config('/etc/asterisk/dids.conf');
 
-# Collect all available channel data
+# Read VICIdial DB config from /etc/astguiclient.conf
+my %vici_db = read_astguiclient_conf();
+
+##############################################################################
+# Step 1: Collect Asterisk channel data
+##############################################################################
+
 my %call_data;
 
-# Standard AGI variables (always available)
-$call_data{uniqueid}  = $input{uniqueid}  || '';
-$call_data{channel}   = $input{channel}   || '';
-$call_data{extension} = $input{extension} || '';
-$call_data{callerid}  = $input{callerid}  || '';
-
-# Critical hangup variables
+$call_data{uniqueid}     = $input{uniqueid}  || '';
+$call_data{channel}      = $input{channel}   || '';
+$call_data{extension}    = $input{extension} || '';
+$call_data{callerid}     = $input{callerid}  || '';
 $call_data{dialStatus}   = $AGI->get_variable('DIALSTATUS')   || 'UNKNOWN';
 $call_data{answeredTime} = $AGI->get_variable('ANSWEREDTIME') || '0';
 $call_data{dialedTime}   = $AGI->get_variable('DIALEDTIME')   || '0';
 $call_data{hangupCause}  = $AGI->get_variable('HANGUPCAUSE')  || '';
+$call_data{optimizerDid} = $AGI->get_variable('OPTIMIZER_DID')    || '';
+$call_data{campaignId}   = $AGI->get_variable('CAMPAIGN_ID') || $AGI->get_variable('CAMPAIGN') || 'DEFAULT';
 
-# DID Optimizer variables (set by vicidial-did-optimizer.agi before the call)
-$call_data{optimizerDid}    = $AGI->get_variable('OPTIMIZER_DID')      || '';
-$call_data{optimizerStatus} = $AGI->get_variable('OPTIMIZER_STATUS')   || '';
-$call_data{optimizerScore}  = $AGI->get_variable('OPTIMIZER_SCORE')    || '';
-
-# VICIdial variables (if set in dialplan before Dial())
-$call_data{campaignId}    = $AGI->get_variable('CAMPAIGN_ID') || $AGI->get_variable('CAMPAIGN') || 'DEFAULT';
-$call_data{leadId}        = $AGI->get_variable('LEAD_ID')     || '';
-$call_data{listId}        = $AGI->get_variable('LIST_ID')     || '';
-$call_data{customerPhone} = $AGI->get_variable('CUSTOMER_PHONE') || '';
-$call_data{customerState} = $AGI->get_variable('STATE')       || '';
-$call_data{calledCount}   = $AGI->get_variable('CALLED_COUNT') || '0';
-
-# Clean the dialed number (strip dial prefix)
+# Clean dialed number (strip prefix)
 my $dialed = $call_data{extension};
 if ($config{dial_prefixes}) {
     my @prefixes = split(/\s*,\s*/, $config{dial_prefixes});
@@ -66,12 +62,92 @@ if ($config{dial_prefixes}) {
         if ($dialed =~ s/^$prefix//) { last; }
     }
 } else {
-    # Default: strip leading 9
     $dialed =~ s/^9//;
 }
-$call_data{customerPhone} ||= $dialed;
+$call_data{customerPhone} = $dialed;
 
-# Map DIALSTATUS to API result field
+##############################################################################
+# Step 2: Fast VICIdial DB lookup (uniqueid = PK, <1ms)
+##############################################################################
+
+my %vici_data;
+
+if ($call_data{uniqueid} && $vici_db{db_host}) {
+    eval {
+        require DBI;
+
+        my $dsn = "DBI:mysql:database=$vici_db{db_name};host=$vici_db{db_host};port=$vici_db{db_port}";
+        my $dbh = DBI->connect($dsn, $vici_db{db_user}, $vici_db{db_pass}, {
+            RaiseError => 0,
+            PrintError => 0,
+            mysql_connect_timeout => 2,  # 2 second connect timeout
+        });
+
+        if ($dbh) {
+            # Query vicidial_log by uniqueid (PRIMARY KEY — instant)
+            # Only today's partition to be safe
+            my $sth = $dbh->prepare(
+                "SELECT user, lead_id, list_id, campaign_id, length_in_sec, "
+              . "phone_number, called_count, term_reason "
+              . "FROM vicidial_log "
+              . "WHERE uniqueid = ? AND call_date >= CURDATE() "
+              . "LIMIT 1"
+            );
+            $sth->execute($call_data{uniqueid});
+            my $row = $sth->fetchrow_hashref;
+
+            if ($row) {
+                $vici_data{agentId}       = $row->{user}          || '';
+                $vici_data{leadId}        = $row->{lead_id}       || '';
+                $vici_data{listId}        = $row->{list_id}       || '';
+                $vici_data{campaignId}    = $row->{campaign_id}   || '';
+                $vici_data{talkTime}      = $row->{length_in_sec} || 0;
+                $vici_data{customerPhone} = $row->{phone_number}  || '';
+                $vici_data{calledCount}   = $row->{called_count}  || 0;
+                $vici_data{termReason}    = $row->{term_reason}   || '';
+
+                log_msg("DB: agent=$vici_data{agentId} lead=$vici_data{leadId} list=$vici_data{listId}");
+
+                # If we have a lead_id, grab customer location from vicidial_list
+                if ($vici_data{leadId}) {
+                    my $sth2 = $dbh->prepare(
+                        "SELECT state, city, postal_code, phone_number "
+                      . "FROM vicidial_list "
+                      . "WHERE lead_id = ? "
+                      . "LIMIT 1"
+                    );
+                    $sth2->execute($vici_data{leadId});
+                    my $lead = $sth2->fetchrow_hashref;
+
+                    if ($lead) {
+                        $vici_data{customerState} = $lead->{state}        || '';
+                        $vici_data{customerCity}  = $lead->{city}         || '';
+                        $vici_data{customerZip}   = $lead->{postal_code}  || '';
+                        $vici_data{customerPhone} ||= $lead->{phone_number} || '';
+                        log_msg("LEAD: state=$vici_data{customerState} city=$vici_data{customerCity}");
+                    }
+                    $sth2->finish;
+                }
+            } else {
+                log_msg("DB: no vicidial_log row for uniqueid=$call_data{uniqueid}");
+            }
+
+            $sth->finish;
+            $dbh->disconnect;
+        } else {
+            log_msg("DB: connect failed — " . (DBI->errstr || 'unknown error'));
+        }
+    };
+    if ($@) {
+        # DBI not installed or DB error — not fatal, continue with channel data only
+        log_msg("DB: skip — $@");
+    }
+}
+
+##############################################################################
+# Step 3: Build payload and POST to API
+##############################################################################
+
 my %status_map = (
     'ANSWER'       => 'answered',
     'BUSY'         => 'busy',
@@ -85,60 +161,55 @@ my %status_map = (
 );
 my $result = $status_map{uc($call_data{dialStatus})} || 'no_answer';
 
-# Build the API payload
 my $payload = {
     uniqueid      => $call_data{uniqueid},
     phoneNumber   => $call_data{optimizerDid} || $call_data{callerid},
-    customerPhone => $call_data{customerPhone},
-    campaignId    => $call_data{campaignId},
+    customerPhone => $vici_data{customerPhone} || $call_data{customerPhone},
+    campaignId    => $vici_data{campaignId}    || $call_data{campaignId},
     disposition   => $call_data{dialStatus},
     duration      => int($call_data{answeredTime}),
     dialStatus    => $call_data{dialStatus},
     hangupCause   => int($call_data{hangupCause} || 0),
-    leadId        => $call_data{leadId},
-    listId        => $call_data{listId},
-    customerState => $call_data{customerState},
-    calledCount   => int($call_data{calledCount}),
+    agentId       => $vici_data{agentId}       || '0',
+    leadId        => $vici_data{leadId}        || '',
+    listId        => $vici_data{listId}        || '',
+    customerState => $vici_data{customerState} || '',
+    customerCity  => $vici_data{customerCity}  || '',
+    customerZip   => $vici_data{customerZip}   || '',
+    calledCount   => int($vici_data{calledCount} || $call_data{calledCount} || 0),
+    talkTime      => int($vici_data{talkTime}  || 0),
+    termReason    => $vici_data{termReason}     || '',
     timestamp     => time(),
-    source        => 'h-extension-agi',
+    source        => 'h-extension-agi-v3',
 };
 
-# Log and send
-log_msg("CALL $call_data{uniqueid}: DID=$call_data{optimizerDid} DIAL=$call_data{dialStatus} DURATION=$call_data{answeredTime}s HANGUP=$call_data{hangupCause} CAMPAIGN=$call_data{campaignId}");
+log_msg("CALL $call_data{uniqueid}: DID=$call_data{optimizerDid} DIAL=$call_data{dialStatus} DUR=$call_data{answeredTime}s AGENT=$payload->{agentId} CAMPAIGN=$payload->{campaignId}");
 
 my $api_url = $config{api_base_url};
 my $api_key = $config{api_key};
 
 unless ($api_url && $api_key) {
-    log_msg("ERROR: api_base_url or api_key not configured in /etc/asterisk/dids.conf");
+    log_msg("ERROR: api_base_url or api_key not configured");
     exit 0;
 }
 
-# POST to API with short timeout (don't block hangup processing)
-my $ua = LWP::UserAgent->new(
-    timeout => 3,
-    agent   => 'VICIdial-DID-Report/2.0',
-);
-
-my $url = "$api_url/api/v1/call-results";
+my $ua = LWP::UserAgent->new(timeout => 3, agent => 'VICIdial-DID-Report/3.0');
 my $json = encode_json($payload);
 
 eval {
-    my $response = $ua->post($url,
+    my $response = $ua->post("$api_url/api/v1/call-results",
         'Content-Type' => 'application/json',
         'x-api-key'    => $api_key,
         Content         => $json,
     );
 
     if ($response->is_success) {
-        log_msg("OK: Reported to API ($result, ${\ int($call_data{answeredTime})}s)");
+        log_msg("OK: $result ${\ int($call_data{answeredTime})}s agent=$payload->{agentId}");
     } else {
-        log_msg("WARN: API returned " . $response->code . ": " . substr($response->content, 0, 200));
+        log_msg("WARN: HTTP " . $response->code . " " . substr($response->content, 0, 200));
     }
 };
-if ($@) {
-    log_msg("ERROR: $@");
-}
+log_msg("ERROR: $@") if $@;
 
 exit 0;
 
@@ -161,6 +232,29 @@ sub read_config {
     }
     close($fh);
     return %cfg;
+}
+
+sub read_astguiclient_conf {
+    # Standard VICIdial config file — present on every VICIdial server
+    my $file = '/etc/astguiclient.conf';
+    my %db = (db_host => '', db_name => 'asterisk', db_user => 'cron', db_pass => '', db_port => 3306);
+
+    if (open(my $fh, '<', $file)) {
+        while (my $line = <$fh>) {
+            chomp $line;
+            if ($line =~ /^VARDB_server\s*=>\s*(.+)/) { $db{db_host} = $1; }
+            if ($line =~ /^VARDB_database\s*=>\s*(.+)/) { $db{db_name} = $1; }
+            if ($line =~ /^VARDB_user\s*=>\s*(.+)/) { $db{db_user} = $1; }
+            if ($line =~ /^VARDB_pass\s*=>\s*(.+)/) { $db{db_pass} = $1; }
+            if ($line =~ /^VARDB_port\s*=>\s*(.+)/) { $db{db_port} = $1; }
+        }
+        close($fh);
+        log_msg("DB config: host=$db{db_host} db=$db{db_name} user=$db{db_user}");
+    } else {
+        log_msg("DB config: /etc/astguiclient.conf not found — DB enrichment disabled");
+    }
+
+    return %db;
 }
 
 sub log_msg {
