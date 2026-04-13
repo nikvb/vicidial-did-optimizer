@@ -352,30 +352,63 @@ EOF
 setup_hangup_handler() {
     local EXTENSIONS_CONF="/etc/asterisk/extensions.conf"
     local REPORT_AGI="agi-did-optimizer-report.agi"
+    local H_LINE="exten => h,n,AGI($REPORT_AGI)"
 
     if [ ! -f "$EXTENSIONS_CONF" ]; then
         print_warning "extensions.conf not found — skipping h-extension setup"
-        print_info "Manually add to your dialplan: exten => h,n,AGI($REPORT_AGI)"
+        print_info "Manually add to your dialplan: $H_LINE"
         return 0
     fi
 
-    # Clean up any previous installations of our AGI in h extensions
+    # Clean up any previous installations
     if grep -q "$REPORT_AGI" "$EXTENSIONS_CONF" 2>/dev/null; then
-        print_info "Removing previous h-extension entries..."
         sed -i "/$REPORT_AGI/d" "$EXTENSIONS_CONF"
-        print_step "Cleaned up old entries"
+        print_info "Cleaned up previous h-extension entries"
     fi
 
-    # Find all VICIdial h,1 call_log lines and inject our AGI after each one
-    local COUNT=0
-    if grep -q "exten => h,1,AGI(agi://127.0.0.1:4577/call_log" "$EXTENSIONS_CONF" 2>/dev/null; then
-        sed -i "/exten => h,1,AGI(agi:\/\/127.0.0.1:4577\/call_log/a exten => h,n,AGI($REPORT_AGI)" "$EXTENSIONS_CONF"
-        COUNT=$(grep -c "$REPORT_AGI" "$EXTENSIONS_CONF")
-        print_step "Injected h-extension handler after $COUNT VICIdial call_log entries"
+    # Find the [default] context and check if it has an h extension
+    local DEFAULT_H=$(awk '/^\[default\]/,/^\[/' "$EXTENSIONS_CONF" | grep -n "exten => h,")
+
+    if [ -n "$DEFAULT_H" ]; then
+        # [default] already has an h extension — append ours after the last h line
+        # Find the line number of the last h extension in [default]
+        local DEFAULT_START=$(grep -n '^\[default\]' "$EXTENSIONS_CONF" | head -1 | cut -d: -f1)
+        local NEXT_CONTEXT=$(awk "NR>$DEFAULT_START && /^\[/" "$EXTENSIONS_CONF" | head -1)
+        local DEFAULT_END=$(grep -n "^\\[" "$EXTENSIONS_CONF" | awk -F: "NR>1 && \$1>$DEFAULT_START {print \$1; exit}")
+
+        # Find last h,N line within [default] range and inject after it
+        local LAST_H=$(sed -n "${DEFAULT_START},${DEFAULT_END:-99999}p" "$EXTENSIONS_CONF" | grep -n "exten => h," | tail -1 | cut -d: -f1)
+        if [ -n "$LAST_H" ]; then
+            local INSERT_LINE=$((DEFAULT_START + LAST_H))
+            sed -i "${INSERT_LINE}a $H_LINE" "$EXTENSIONS_CONF"
+            print_step "Added h-extension handler in [default] context (after existing h handler)"
+        fi
     else
-        print_warning "No VICIdial h-extension found in extensions.conf"
-        print_info "Manually add to your dialplan: exten => h,n,AGI($REPORT_AGI)"
-        return 0
+        # [default] has no h extension — add one before the next context
+        # Find end of [default] context and insert before it
+        local DEFAULT_START=$(grep -n '^\[default\]' "$EXTENSIONS_CONF" | head -1 | cut -d: -f1)
+        if [ -n "$DEFAULT_START" ]; then
+            local DEFAULT_END=$(awk "NR>$DEFAULT_START && /^\[/" "$EXTENSIONS_CONF" | head -1)
+            local INSERT_BEFORE=$(grep -n "^\[" "$EXTENSIONS_CONF" | awk -F: "\$1>$DEFAULT_START {print \$1; exit}")
+
+            if [ -n "$INSERT_BEFORE" ]; then
+                sed -i "${INSERT_BEFORE}i\\
+; DID Optimizer — report call result at hangup\\
+exten => h,1,AGI($REPORT_AGI)\\
+" "$EXTENSIONS_CONF"
+                print_step "Added h-extension handler in [default] context (new)"
+            else
+                # [default] is the last context — append at end
+                echo "" >> "$EXTENSIONS_CONF"
+                echo "; DID Optimizer — report call result at hangup" >> "$EXTENSIONS_CONF"
+                echo "exten => h,1,AGI($REPORT_AGI)" >> "$EXTENSIONS_CONF"
+                print_step "Added h-extension handler at end of [default] context"
+            fi
+        else
+            print_warning "No [default] context found in extensions.conf"
+            print_info "Manually add: $H_LINE"
+            return 0
+        fi
     fi
 
     # Reload Asterisk dialplan
@@ -383,7 +416,7 @@ setup_hangup_handler() {
         asterisk -rx "dialplan reload" > /dev/null 2>&1
         print_step "Asterisk dialplan reloaded"
     else
-        print_warning "Asterisk CLI not found — reload dialplan manually: asterisk -rx 'dialplan reload'"
+        print_warning "Asterisk CLI not found — reload manually: asterisk -rx 'dialplan reload'"
     fi
 }
 
