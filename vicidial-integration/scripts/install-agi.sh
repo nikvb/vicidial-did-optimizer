@@ -79,6 +79,10 @@ clean_previous() {
     rm -f "$AGI_DIR/agi-did-optimizer-report.agi"
     rm -f "$CONFIG_FILE"
     rm -f /usr/src/install-agi.sh
+    # Remove our h-extension entries from extensions.conf
+    if [ -f /etc/asterisk/extensions.conf ]; then
+        sed -i '/agi-did-optimizer-report.agi/d' /etc/asterisk/extensions.conf
+    fi
     print_step "Previous files removed"
 }
 
@@ -345,6 +349,44 @@ EOF
     fi
 }
 
+setup_hangup_handler() {
+    local EXTENSIONS_CONF="/etc/asterisk/extensions.conf"
+    local REPORT_AGI="agi-did-optimizer-report.agi"
+
+    if [ ! -f "$EXTENSIONS_CONF" ]; then
+        print_warning "extensions.conf not found — skipping h-extension setup"
+        print_info "Manually add to your dialplan: exten => h,n,AGI($REPORT_AGI)"
+        return 0
+    fi
+
+    # Clean up any previous installations of our AGI in h extensions
+    if grep -q "$REPORT_AGI" "$EXTENSIONS_CONF" 2>/dev/null; then
+        print_info "Removing previous h-extension entries..."
+        sed -i "/$REPORT_AGI/d" "$EXTENSIONS_CONF"
+        print_step "Cleaned up old entries"
+    fi
+
+    # Find all VICIdial h,1 call_log lines and inject our AGI after each one
+    local COUNT=0
+    if grep -q "exten => h,1,AGI(agi://127.0.0.1:4577/call_log" "$EXTENSIONS_CONF" 2>/dev/null; then
+        sed -i "/exten => h,1,AGI(agi:\/\/127.0.0.1:4577\/call_log/a exten => h,n,AGI($REPORT_AGI)" "$EXTENSIONS_CONF"
+        COUNT=$(grep -c "$REPORT_AGI" "$EXTENSIONS_CONF")
+        print_step "Injected h-extension handler after $COUNT VICIdial call_log entries"
+    else
+        print_warning "No VICIdial h-extension found in extensions.conf"
+        print_info "Manually add to your dialplan: exten => h,n,AGI($REPORT_AGI)"
+        return 0
+    fi
+
+    # Reload Asterisk dialplan
+    if command -v asterisk &> /dev/null; then
+        asterisk -rx "dialplan reload" > /dev/null 2>&1
+        print_step "Asterisk dialplan reloaded"
+    else
+        print_warning "Asterisk CLI not found — reload dialplan manually: asterisk -rx 'dialplan reload'"
+    fi
+}
+
 test_installation() {
     print_info "Testing AGI script..."
 
@@ -427,6 +469,7 @@ main() {
     create_log_directory
     install_logrotate
     setup_config "$1"
+    setup_hangup_handler
     test_installation
     print_next_steps
 }
