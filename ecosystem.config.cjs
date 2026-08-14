@@ -7,6 +7,7 @@ module.exports = {
   apps: [{
     name: 'did-optimizer',
     script: 'server-full.js',
+    interpreter: '/root/.nvm/versions/node/v24.19.0/bin/node',
 
     // Environment variables
     env: {
