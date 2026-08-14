@@ -194,22 +194,23 @@ install_perl_modules() {
         fi
     fi
 
+    # Install whatever the OS packages didn't cover. Prefer cpm (fast parallel
+    # installer; -g installs into the system perl @INC) when it is present, then
+    # cpanm, then legacy cpan. Clear local::lib env so modules land in system
+    # @INC (not ~/perl5). Never abort the loop on one failure — the loadability
+    # check below is the real gate and reports exactly what is still missing.
     for module in "${missing_modules[@]}"; do
         print_info "Installing $module..."
-        if command -v cpanm &> /dev/null; then
-            # Clear any local::lib env so cpanm installs into the system perl's
-            # @INC (not ~/perl5), otherwise the AGI can't load it at runtime.
-            if ! env PERL_MM_OPT= PERL_MB_OPT= cpanm --notest --quiet "$module"; then
-                print_error "Failed to install $module"
-                return 1
-            fi
+        if command -v cpm &> /dev/null; then
+            env PERL_MM_OPT= PERL_MB_OPT= cpm install -g --no-test "$module" 2>/dev/null \
+                || print_warning "cpm could not install $module (re-checked below)"
+        elif command -v cpanm &> /dev/null; then
+            env PERL_MM_OPT= PERL_MB_OPT= cpanm --notest --quiet "$module" \
+                || print_warning "cpanm could not install $module (re-checked below)"
         else
-            if ! yes '' | cpan -T "$module" 2>&1 | grep -q "OK\|up to date"; then
-                print_error "Failed to install $module"
-                return 1
-            fi
+            yes '' | cpan -T "$module" >/dev/null 2>&1 \
+                || print_warning "cpan could not install $module (re-checked below)"
         fi
-        print_step "$module installed"
     done
 
     # Final verification — every module must be loadable by the SAME perl the
