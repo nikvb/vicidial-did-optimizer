@@ -1,7 +1,11 @@
 import cron from 'node-cron';
 import Tenant from '../../models/Tenant.js';
 import Invoice from '../../models/Invoice.js';
+import Reseller from '../../models/Reseller.js';
+import ResellerInvoice from '../../models/ResellerInvoice.js';
+import DID from '../../models/DID.js';
 import { processMonthlyBilling, retryPayment } from './billingService.js';
+import { calculateResellerCharge } from './resellerPricing.js';
 
 /**
  * Monthly billing job
@@ -66,6 +70,72 @@ export function startMonthlyBillingJob() {
   });
 
   console.log('✅ Monthly billing job scheduled (1st of month at 2:00 AM UTC)');
+}
+
+/**
+ * Reseller monthly billing job.
+ * For each active reseller, sums active DIDs across their client tenants and
+ * creates a ResellerInvoice using the stepped per-DID pricing curve.
+ */
+export async function generateResellerInvoices(now = new Date()) {
+  const start = new Date(now.getFullYear(), now.getMonth(), 1);
+  const end   = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+  const dueDate = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+  const resellers = await Reseller.find({ status: 'active' }).lean();
+  console.log(`📊 Generating invoices for ${resellers.length} active resellers`);
+  const results = { generated: 0, skipped: 0, errored: 0, invoices: [] };
+
+  for (const reseller of resellers) {
+    try {
+      const tenants = await Tenant.find({ resellerId: reseller._id }, '_id name').lean();
+      if (!tenants.length) { results.skipped++; continue; }
+
+      const clientBreakdown = await Promise.all(tenants.map(async (t) => {
+        const didCount = await DID.countDocuments({ tenantId: t._id, status: 'active' });
+        return { tenantId: t._id, tenantName: t.name, didCount };
+      }));
+
+      const totalDids = clientBreakdown.reduce((s, x) => s + x.didCount, 0);
+      if (totalDids === 0) { results.skipped++; continue; }
+
+      const charge = calculateResellerCharge(totalDids);
+
+      const invoice = await ResellerInvoice.create({
+        resellerId: reseller._id,
+        billingPeriod: { start, end },
+        clientBreakdown,
+        tierBreakdown: charge.breakdown,
+        totalDids,
+        amounts: { subtotal: charge.total, tax: 0, total: charge.total },
+        status: 'pending',
+        metadata: { dueDate }
+      });
+
+      results.generated++;
+      results.invoices.push({ id: invoice._id, resellerId: reseller._id, total: charge.total });
+      console.log(`✅ ResellerInvoice ${invoice.invoiceNumber} for ${reseller.name}: $${charge.total} (${totalDids} DIDs)`);
+    } catch (err) {
+      console.error(`❌ Failed reseller invoice for ${reseller.name}:`, err.message);
+      results.errored++;
+    }
+  }
+
+  return results;
+}
+
+export function startResellerBillingJob() {
+  // Run at 2:30 AM on the 1st of every month (after the per-tenant cron at 2:00 AM)
+  cron.schedule('30 2 1 * *', async () => {
+    console.log('🔄 ===== STARTING RESELLER BILLING CYCLE =====');
+    try {
+      const r = await generateResellerInvoices(new Date());
+      console.log(`🔄 Reseller billing done — generated:${r.generated} skipped:${r.skipped} errored:${r.errored}`);
+    } catch (err) {
+      console.error('💥 Fatal error in reseller billing job:', err);
+    }
+  });
+  console.log('✅ Reseller billing job scheduled (1st of month at 2:30 AM UTC)');
 }
 
 /**
@@ -165,6 +235,7 @@ export function startAllBillingJobs() {
   console.log('\n🚀 ===== INITIALIZING BILLING JOBS =====\n');
 
   startMonthlyBillingJob();
+  startResellerBillingJob();
   startPaymentRetryJob();
   startUsageResetJob();
 
@@ -173,6 +244,8 @@ export function startAllBillingJobs() {
 
 export default {
   startMonthlyBillingJob,
+  startResellerBillingJob,
+  generateResellerInvoices,
   startPaymentRetryJob,
   startUsageResetJob,
   startAllBillingJobs

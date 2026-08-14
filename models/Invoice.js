@@ -26,44 +26,49 @@ const invoiceSchema = new mongoose.Schema({
   subscription: {
     plan: {
       type: String,
-      enum: ['basic', 'professional', 'enterprise'],
-      required: true
+      enum: ['payg', 'annual', 'enterprise', 'basic', 'professional'],
+      default: 'payg'
     },
     baseFee: {
       type: Number,
-      required: true
+      default: 0
     },
     billingCycle: {
       type: String,
       enum: ['monthly', 'yearly'],
-      required: true
+      default: 'monthly'
     }
   },
   didCharges: {
     didCount: {
       type: Number,
-      required: true,
       default: 0
     },
     includedDids: {
       type: Number,
-      required: true
+      default: 0
     },
     extraDids: {
       type: Number,
-      required: true,
       default: 0
     },
     perDidRate: {
       type: Number,
-      required: true
+      default: 0
     },
     totalDidFee: {
       type: Number,
-      required: true,
       default: 0
     }
   },
+  // Stepped pricing breakdown — populated for curve-billed tenants.
+  tierBreakdown: [{
+    from: Number,
+    to: Number,
+    rate: Number,
+    didsInTier: Number,
+    subtotal: Number
+  }],
   amounts: {
     subtotal: {
       type: Number,

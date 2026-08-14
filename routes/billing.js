@@ -52,11 +52,10 @@ router.get('/test-paypal-config', asyncHandler(async (req, res) => {
   });
 }));
 
-// @desc    Calculate cost estimate
+// @desc    Calculate cost estimate (curve-based — plan no longer affects price)
 // @route   POST /api/v1/billing/estimate
 // @access  Private
 router.post('/estimate', [
-  body('plan').isIn(['basic', 'professional', 'enterprise']).withMessage('Invalid plan'),
   body('didCount').isInt({ min: 0 }).withMessage('DID count must be a positive number'),
   body('billingCycle').optional().isIn(['monthly', 'yearly']).withMessage('Invalid billing cycle')
 ], asyncHandler(async (req, res) => {
@@ -65,9 +64,9 @@ router.post('/estimate', [
     throw createError.badRequest(errors.array()[0].msg);
   }
 
-  const { plan, didCount, billingCycle = 'monthly' } = req.body;
+  const { didCount, billingCycle = 'monthly' } = req.body;
 
-  const estimate = calculateEstimate(plan, didCount, billingCycle);
+  const estimate = calculateEstimate(didCount, billingCycle);
 
   res.json({
     success: true,
@@ -79,7 +78,7 @@ router.post('/estimate', [
 // SUBSCRIPTION MANAGEMENT
 // =====================================================
 
-// @desc    Get current subscription
+// @desc    Get current subscription (curve-based)
 // @route   GET /api/v1/billing/subscription
 // @access  Private
 router.get('/subscription', asyncHandler(async (req, res) => {
@@ -89,13 +88,15 @@ router.get('/subscription', asyncHandler(async (req, res) => {
     throw createError.notFound('Tenant not found');
   }
 
-  // Get active DID count
   const didCount = await DID.countDocuments({
     tenantId: tenant._id,
     isActive: true
   });
 
-  const currentPlan = PRICING_PLANS[tenant.subscription.plan];
+  const pricingModule = await import('../services/billing/pricingCurves.js');
+  const charge = pricingModule.calculateDirectCharge(didCount);
+  const tiers = pricingModule.serializeTiers(pricingModule.DIRECT_TIERS);
+  const currentPlan = PRICING_PLANS[tenant.subscription.plan] || PRICING_PLANS.payg;
 
   res.json({
     success: true,
@@ -105,185 +106,64 @@ router.get('/subscription', asyncHandler(async (req, res) => {
       usage: {
         ...tenant.usage,
         didCount,
-        includedDids: currentPlan?.includedDids || 0
+        currentMonthCharge: charge.totalMonthlyCharge,
+        tierBreakdown: charge.breakdown,
+        tier: charge.tierName,
+        baseFee: charge.baseFee,
+        didCharges: charge.didCharges
       },
-      currentPlan
+      currentPlan,
+      pricingTiers: tiers
     }
   });
 }));
 
-// @desc    Change subscription plan
-// @route   PUT /api/v1/billing/subscription/plan
+// @desc    Change billing cycle (PAYG monthly vs annual prepay) — pricing
+//         is uniform; only the cycle changes. Annual prepay charges 12 months
+//         at 10 months' worth on switch.
+// @route   PUT /api/v1/billing/subscription/cycle
 // @access  Private
-router.put('/subscription/plan', [
-  body('plan').isIn(['basic', 'professional']).withMessage('Invalid plan selected'),
-  body('billingCycle').optional().isIn(['monthly', 'yearly']).withMessage('Invalid billing cycle')
+router.put('/subscription/cycle', [
+  body('billingCycle').isIn(['monthly', 'yearly']).withMessage('billingCycle must be monthly or yearly')
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    throw createError.badRequest(errors.array()[0].msg);
-  }
+  if (!errors.isEmpty()) throw createError.badRequest(errors.array()[0].msg);
 
   const tenant = await Tenant.findById(req.user.tenant._id);
-  const { plan, billingCycle } = req.body;
+  if (!tenant) throw createError.notFound('Tenant not found');
 
-  if (!tenant) {
-    throw createError.notFound('Tenant not found');
-  }
+  const { billingCycle } = req.body;
+  const oldCycle = tenant.subscription.billingCycle;
 
-  // Check if user has at least one active payment method
-  const hasPaymentMethod = tenant.billing.paymentMethods.some(pm => pm.isActive);
-  if (!hasPaymentMethod) {
-    throw createError.badRequest('Please add a payment method before changing plans');
-  }
-
-  // Get current and new plan details
-  const currentPlan = PRICING_PLANS[tenant.subscription.plan];
-  const newPlan = PRICING_PLANS[plan];
-  const oldPlan = tenant.subscription.plan;
-  const oldBillingCycle = tenant.subscription.billingCycle;
-
-  // Prevent downgrade if it would exceed new plan limits
-  const didCount = await DID.countDocuments({
-    tenantId: tenant._id,
-    isActive: true
-  });
-
-  if (newPlan.includedDids !== 'unlimited' && didCount > newPlan.includedDids) {
-    throw createError.badRequest(
-      `Cannot downgrade to ${newPlan.name} plan. You have ${didCount} active DIDs but the plan only includes ${newPlan.includedDids} DIDs. Please deactivate ${didCount - newPlan.includedDids} DIDs first.`
-    );
-  }
-
-  // Update subscription
-  tenant.subscription.plan = plan;
-  if (billingCycle) {
-    tenant.subscription.billingCycle = billingCycle;
-  }
-
-  // Calculate prorated charges if upgrading
-  let proratedAmount = 0;
-  const now = new Date();
-  const nextBillingDate = new Date(tenant.subscription.nextBillingDate);
-  const daysRemaining = Math.ceil((nextBillingDate - now) / (1000 * 60 * 60 * 24));
-  const currentCycle = tenant.subscription.billingCycle || 'monthly';
-  const totalDays = currentCycle === 'monthly' ? 30 : 365;
-
-  // Calculate proration for plan changes
-  if (oldPlan !== plan) {
-    const currentPlanPrice = currentCycle === 'monthly'
-      ? currentPlan.monthlyPrice
-      : currentPlan.yearlyPrice;
-    const newPlanPrice = currentCycle === 'monthly'
-      ? newPlan.monthlyPrice
-      : newPlan.yearlyPrice;
-
-    // Credit for unused time on current plan
-    const unusedCredit = (currentPlanPrice / totalDays) * daysRemaining;
-
-    // Charge for new plan prorated
-    const newPlanCharge = (newPlanPrice / totalDays) * daysRemaining;
-
-    proratedAmount = newPlanCharge - unusedCredit;
-
-    console.log('📊 Plan Change Proration:');
-    console.log('  Old Plan:', oldPlan, '-', formatCurrency(currentPlanPrice));
-    console.log('  New Plan:', plan, '-', formatCurrency(newPlanPrice));
-    console.log('  Days Remaining:', daysRemaining);
-    console.log('  Unused Credit:', formatCurrency(unusedCredit));
-    console.log('  New Plan Charge:', formatCurrency(newPlanCharge));
-    console.log('  Prorated Amount:', formatCurrency(proratedAmount));
-  }
-
-  // If upgrade and prorated amount > 0, charge immediately
-  if (proratedAmount > 0) {
-    try {
-      // Get primary payment method
-      const primaryPaymentMethod = tenant.billing.paymentMethods.find(pm => pm.isPrimary && pm.isActive);
-
-      if (!primaryPaymentMethod) {
-        throw createError.badRequest('No primary payment method found');
-      }
-
-      // Charge the prorated amount
-      const chargeResult = await chargePaymentToken(
-        primaryPaymentMethod.vaultId,
-        proratedAmount,
-        'USD',
-        `Plan upgrade from ${currentPlan.name} to ${newPlan.name} (prorated)`
-      );
-
-      // Create invoice for the charge
-      const invoice = new Invoice({
-        tenantId: tenant._id,
-        invoiceNumber: `INV-${Date.now()}`,
-        type: 'subscription',
-        status: 'paid',
-        amounts: {
-          subtotal: proratedAmount,
-          tax: 0,
-          total: proratedAmount
-        },
-        items: [{
-          description: `Plan change from ${currentPlan.name} to ${newPlan.name} (prorated for ${daysRemaining} days)`,
-          quantity: 1,
-          unitPrice: proratedAmount,
-          totalPrice: proratedAmount
-        }],
-        paymentDetails: {
-          method: 'credit_card',
-          transactionId: chargeResult.transactionId,
-          paidAt: new Date(),
-          paymentMethodId: primaryPaymentMethod._id
-        }
-      });
-
-      await invoice.save();
-
-      console.log('✅ Prorated charge successful:', chargeResult.transactionId);
-    } catch (chargeError) {
-      console.error('❌ Failed to charge prorated amount:', chargeError);
-      console.error('❌ Full charge error:', JSON.stringify(chargeError, Object.getOwnPropertyNames(chargeError), 2));
-
-      // Extract detailed PayPal error information
-      let errorDetails = {
-        message: chargeError.message,
-        paypalError: chargeError.paypalError || null,
-        tokenId: chargeError.tokenId || primaryPaymentMethod.vaultId,
-        stack: chargeError.stack
-      };
-
-      // If there's a PayPal error nested, extract it
-      if (chargeError.paypalError) {
-        errorDetails.paypalDetails = {
-          message: chargeError.paypalError.message,
-          statusCode: chargeError.paypalError.statusCode,
-          result: chargeError.paypalError.result
-        };
-      }
-
-      const detailedError = createError.badRequest(`Failed to charge prorated amount: ${chargeError.message}`);
-      detailedError.details = errorDetails;
-      detailedError.fullError = JSON.stringify(chargeError, Object.getOwnPropertyNames(chargeError), 2);
-      throw detailedError;
-    }
-  }
-
+  tenant.subscription.billingCycle = billingCycle;
+  tenant.subscription.plan = billingCycle === 'yearly' ? 'annual' : 'payg';
   await tenant.save();
-
-  console.log(`✅ Plan changed: ${oldPlan} (${oldBillingCycle}) → ${plan} (${tenant.subscription.billingCycle})`);
 
   res.json({
     success: true,
-    message: proratedAmount > 0
-      ? `Plan upgraded successfully. You've been charged ${formatCurrency(proratedAmount)} prorated for the remaining billing period.`
-      : 'Plan changed successfully',
-    data: {
-      subscription: tenant.subscription,
-      oldPlan,
-      newPlan: plan,
-      proratedAmount: proratedAmount > 0 ? proratedAmount : null
-    }
+    data: { oldCycle, newCycle: billingCycle, plan: tenant.subscription.plan }
+  });
+}));
+
+// Legacy plan-change endpoint kept for backwards compatibility — pricing is
+// now uniform across all plans, so this only flips billingCycle if provided.
+router.put('/subscription/plan', [
+  body('billingCycle').optional().isIn(['monthly', 'yearly'])
+], asyncHandler(async (req, res) => {
+  const tenant = await Tenant.findById(req.user.tenant._id);
+  if (!tenant) throw createError.notFound('Tenant not found');
+
+  const { billingCycle } = req.body;
+  if (billingCycle) {
+    tenant.subscription.billingCycle = billingCycle;
+    tenant.subscription.plan = billingCycle === 'yearly' ? 'annual' : 'payg';
+    await tenant.save();
+  }
+
+  res.json({
+    success: true,
+    message: 'All tenants are on the unified per-DID curve. Use /subscription/cycle to switch between monthly PAYG and annual prepay.',
+    data: { subscription: tenant.subscription }
   });
 }));
 
@@ -795,6 +675,161 @@ router.post('/invoices/:id/retry', requireAdmin, asyncHandler(async (req, res) =
     success: true,
     message: 'Payment retry successful',
     data: { result }
+  });
+}));
+
+// =====================================================
+// ADMIN: MANUAL BILLING TRIGGER (FOR TESTING)
+// =====================================================
+
+// @desc    Manually trigger billing for a tenant (for testing auto-pay)
+// @route   POST /api/v1/billing/admin/trigger-billing
+// @access  Admin only
+router.post('/admin/trigger-billing', requireAdmin, [
+  body('tenantId').optional().isMongoId().withMessage('Invalid tenant ID')
+], asyncHandler(async (req, res) => {
+  const { tenantId } = req.body;
+  const { processMonthlyBilling } = await import('../services/billing/billingService.js');
+
+  // If tenantId provided, trigger for that tenant; otherwise for current user's tenant
+  const targetTenantId = tenantId || req.user.tenant._id;
+  const tenant = await Tenant.findById(targetTenantId);
+
+  if (!tenant) {
+    throw createError.notFound('Tenant not found');
+  }
+
+  if (!tenant.subscription.status === 'active') {
+    throw createError.badRequest('Tenant subscription is not active');
+  }
+
+  console.log(`\n🚀 MANUAL BILLING TRIGGER FOR: ${tenant.name} (${tenant._id})`);
+
+  try {
+    const invoice = await processMonthlyBilling(tenant);
+
+    res.json({
+      success: true,
+      message: `Manual billing triggered successfully for ${tenant.name}`,
+      data: {
+        tenantId: tenant._id,
+        tenantName: tenant.name,
+        invoice: {
+          id: invoice._id,
+          invoiceNumber: invoice.invoiceNumber,
+          status: invoice.status,
+          amount: invoice.amounts?.total,
+          createdAt: invoice.createdAt
+        },
+        autoPayEnabled: tenant.billing.autoPayEnabled,
+        primaryPaymentMethod: tenant.getPrimaryPaymentMethod() ? {
+          type: tenant.getPrimaryPaymentMethod().type,
+          last4: tenant.getPrimaryPaymentMethod().last4
+        } : null
+      }
+    });
+  } catch (error) {
+    console.error(`\n❌ Manual billing trigger failed for ${tenant.name}:`, error.message);
+    throw createError.badRequest(`Billing failed: ${error.message}`);
+  }
+}));
+
+// @desc    Get auto-pay status for current tenant
+// @route   GET /api/v1/billing/auto-pay-status
+// @access  Private
+router.get('/auto-pay-status', asyncHandler(async (req, res) => {
+  const tenant = await Tenant.findById(req.user.tenant._id);
+
+  const primaryPaymentMethod = tenant.getPrimaryPaymentMethod();
+
+  res.json({
+    success: true,
+    data: {
+      autoPayEnabled: tenant.billing.autoPayEnabled,
+      hasPaymentMethod: !!primaryPaymentMethod,
+      primaryPaymentMethod: primaryPaymentMethod ? {
+        type: primaryPaymentMethod.type,
+        last4: primaryPaymentMethod.last4,
+        expiryMonth: primaryPaymentMethod.expiryMonth,
+        expiryYear: primaryPaymentMethod.expiryYear,
+        isActive: primaryPaymentMethod.isActive
+      } : null,
+      billingSchedule: {
+        monthlyBillingDay: '1st of month',
+        monthlyBillingTime: '2:00 AM UTC',
+        paymentRetryTime: '3:00 AM UTC daily'
+      },
+      lastInvoiceDate: tenant.billing.lastInvoiceDate,
+      nextBillingDate: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1)
+    }
+  });
+}));
+
+// @desc    Toggle auto-pay on/off for current tenant
+// @route   PUT /api/v1/billing/auto-pay-settings
+// @access  Private
+router.put('/auto-pay-settings', [
+  body('enabled').isBoolean().withMessage('enabled must be a boolean')
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    throw createError.badRequest(errors.array()[0].msg);
+  }
+
+  const tenant = await Tenant.findById(req.user.tenant._id);
+  const oldValue = tenant.billing.autoPayEnabled;
+
+  tenant.billing.autoPayEnabled = req.body.enabled;
+  await tenant.save();
+
+  console.log(`✅ Auto-pay toggled for ${tenant.name}: ${oldValue} → ${req.body.enabled}`);
+
+  res.json({
+    success: true,
+    message: `Auto-pay ${req.body.enabled ? 'enabled' : 'disabled'}`,
+    data: {
+      autoPayEnabled: tenant.billing.autoPayEnabled,
+      previousValue: oldValue
+    }
+  });
+}));
+
+// @desc    Reactivate suspended account (self-service after payment recovery)
+// @route   POST /api/v1/billing/reactivate
+// @access  Private
+router.post('/reactivate', asyncHandler(async (req, res) => {
+  const tenant = await Tenant.findById(req.user.tenant._id);
+
+  if (!tenant) {
+    throw createError.notFound('Tenant not found');
+  }
+
+  if (tenant.subscription.status !== 'suspended') {
+    throw createError.badRequest('Account is not suspended. No reactivation needed.');
+  }
+
+  console.log(`🔄 Reactivating suspended account: ${tenant.name} (${tenant._id})`);
+
+  tenant.isActive = true;
+  tenant.subscription.status = 'active';
+  tenant.subscription.gracePeriod.currentFailedPayments = 0;
+  tenant.subscription.gracePeriod.suspendedAt = null;
+  tenant.subscription.gracePeriod.suspensionReason = null;
+
+  await tenant.save();
+
+  console.log(`✅ Account reactivated: ${tenant.name}`);
+
+  res.json({
+    success: true,
+    message: 'Account reactivated successfully',
+    data: {
+      tenantId: tenant._id,
+      tenantName: tenant.name,
+      isActive: tenant.isActive,
+      subscriptionStatus: tenant.subscription.status,
+      failedPaymentsReset: 0
+    }
   });
 }));
 

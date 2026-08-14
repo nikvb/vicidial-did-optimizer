@@ -2,6 +2,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import mongoose from 'mongoose';
 import crawl4aiService from './crawl4ai-service.js';
+import DID from '../models/DID.js';
 
 // DID Reputation Schema
 const DIDReputationSchema = new mongoose.Schema({
@@ -41,6 +42,25 @@ const DIDReputationSchema = new mongoose.Schema({
   checkCount: { type: Number, default: 0 },
   isBlacklisted: { type: Boolean, default: false },
   blacklistedAt: { type: Date },
+  restReason: { type: String },
+
+  // ── FAS probe-budget fields ──────────────────────────────────────────────
+  // After the 7-day FAS rest expires, a DID is moved into a probationary
+  // state instead of being fully released. The selector is allowed to pick
+  // it, but capped to `probeBudgetTotal` calls within the probe window
+  // (default 24h). A graduation cron then measures the DID's FAS rate over
+  // the probe window and either fully releases it (pass) or re-rests with
+  // an escalating window (fail).
+  probationaryUntil: { type: Date, default: null },
+  probeBudgetTotal: { type: Number, default: 0 },
+  probeBudgetUsed: { type: Number, default: 0 },
+  probeAttempts: { type: Number, default: 0 },
+  lastProbeOutcome: {
+    type: String,
+    enum: ['pass', 'fail', null],
+    default: null
+  },
+
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
@@ -51,6 +71,9 @@ DIDReputationSchema.index({ 'robokillerData.reputationStatus': 1 });
 DIDReputationSchema.index({ lastChecked: 1 });
 DIDReputationSchema.index({ nextCheckDue: 1 });
 DIDReputationSchema.index({ isBlacklisted: 1 });
+// Probe-budget indexes — used by the selector cap and the graduation cron
+DIDReputationSchema.index({ probationaryUntil: 1 });
+DIDReputationSchema.index({ isBlacklisted: 1, nextCheckDue: 1, probationaryUntil: 1 });
 
 const DIDReputation = mongoose.model('DIDReputation', DIDReputationSchema);
 
@@ -60,10 +83,23 @@ const DIDReputation = mongoose.model('DIDReputation', DIDReputationSchema);
 class ReputationService {
   constructor() {
     this.checkInterval = {
-      positive: 7 * 24 * 60 * 60 * 1000,  // 7 days for positive reputation
-      neutral: 3 * 24 * 60 * 60 * 1000,   // 3 days for neutral
-      negative: null                       // Never check negative DIDs again (blacklisted)
+      positive: 24 * 60 * 60 * 1000,      // 24 hours for positive reputation
+      neutral: 12 * 60 * 60 * 1000,       // 12 hours for neutral (re-check sooner)
+      // Re-check Negative DIDs every 7 days. Carriers un-flag DIDs after rest
+      // periods (typically 5-30 days). Previously this was `null` which meant
+      // a DID once-Negative stayed Negative forever — losing recovered DIDs
+      // and missing carrier reputation shifts.
+      negative: 7 * 24 * 60 * 60 * 1000   // 7 days
     };
+  }
+
+  // Canonical phone form for DIDReputation + DID lookups: bare 10-digit NANP.
+  // Accepts "+12067586013", "12067586013", "2067586013" — all collapse to "2067586013".
+  normalizePhone(phoneNumber) {
+    if (!phoneNumber) return '';
+    let n = String(phoneNumber).replace(/\D/g, '');
+    if (n.length === 11 && n.startsWith('1')) n = n.substring(1);
+    return n;
   }
 
   /**
@@ -221,8 +257,9 @@ class ReputationService {
    */
   async getReputation(phoneNumber, forceRefresh = false) {
     try {
-      // Check if we have cached data
-      let reputation = await DIDReputation.findOne({ phoneNumber });
+      const normalized = this.normalizePhone(phoneNumber);
+      // Check if we have cached data (accept both normalized and any legacy formats)
+      let reputation = await DIDReputation.findOne({ phoneNumber: normalized });
 
       // Determine if we need to refresh
       const shouldRefresh = forceRefresh ||
@@ -246,14 +283,21 @@ class ReputationService {
         let blacklistedAt = null;
 
         if (status === 'negative') {
-          // Negative DIDs are blacklisted - never check again
-          nextCheckDue = null;
+          // Blacklist for selection, but schedule a re-check in 7 days so
+          // we catch DIDs that recover after carrier rest periods.
+          nextCheckDue = new Date(Date.now() + this.checkInterval.negative);
           isBlacklisted = true;
           blacklistedAt = new Date();
-          console.log(`🚫 Blacklisting negative DID: ${phoneNumber}`);
+          console.log(`🚫 Blacklisting negative DID: ${phoneNumber} (re-check in 7d)`);
         } else {
           const checkInterval = this.checkInterval[status] || this.checkInterval.neutral;
           nextCheckDue = new Date(Date.now() + checkInterval);
+          // If this DID was previously blacklisted and is now Positive/Neutral,
+          // clear the blacklist flag so DID selection can use it again.
+          if (reputation && reputation.isBlacklisted) {
+            isBlacklisted = false;
+            console.log(`✅ Recovered DID (was Negative, now ${status}): ${phoneNumber}`);
+          }
         }
 
         if (reputation) {
@@ -268,9 +312,9 @@ class ReputationService {
           reputation.updatedAt = new Date();
           await reputation.save();
         } else {
-          // Create new record
+          // Create new record with normalized key
           reputation = await DIDReputation.create({
-            phoneNumber,
+            phoneNumber: normalized,
             robokillerData,
             reputationScore,
             nextCheckDue,
@@ -341,18 +385,24 @@ class ReputationService {
               let blacklistedAt = null;
 
               if (status === 'negative') {
+                // Re-check in 7 days; DIDs do recover.
+                nextCheckDue = new Date(Date.now() + this.checkInterval.negative);
                 isBlacklisted = true;
                 blacklistedAt = new Date();
-                console.log(`🚫 Blacklisting negative DID: ${scrapeResult.phoneNumber}`);
+                console.log(`🚫 Blacklisting negative DID: ${scrapeResult.phoneNumber} (re-check in 7d)`);
               } else {
                 const checkInterval = this.checkInterval[status] || this.checkInterval.neutral;
                 nextCheckDue = new Date(Date.now() + checkInterval);
               }
 
+              // Normalize the phone used as the reputation key (10-digit)
+              const normalizedPhone = this.normalizePhone(scrapeResult.phoneNumber);
+
               // Update or create reputation record
               const reputation = await DIDReputation.findOneAndUpdate(
-                { phoneNumber: scrapeResult.phoneNumber },
+                { phoneNumber: normalizedPhone },
                 {
+                  phoneNumber: normalizedPhone,
                   robokillerData,
                   reputationScore,
                   lastChecked: new Date(),
@@ -363,6 +413,21 @@ class ReputationService {
                   $inc: { checkCount: 1 }
                 },
                 { upsert: true, new: true }
+              );
+
+              // Also update the DID model's reputation field. DID.phoneNumber may be
+              // stored as "1NPANXXXXXX", "+1NPANXXXXXX", or "NPANXXXXXX" — match the
+              // tail of the normalized 10-digit number to cover all three.
+              const didUpdate = {
+                'reputation.score': reputationScore,
+                'reputation.status': robokillerData.reputationStatus || 'Unknown',
+                'reputation.lastChecked': new Date(),
+                'reputation.robokillerData': robokillerData
+              };
+              if (isBlacklisted) didUpdate['status'] = 'inactive';
+              await DID.updateMany(
+                { phoneNumber: new RegExp(normalizedPhone + '$') },
+                { $set: didUpdate }
               );
 
               results.push({

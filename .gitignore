@@ -130,3 +130,12 @@ test-server.js
 implementation.md
 techspec.md
 VICIDIAL_INTEGRATION_READY.md
+.gstack/
+
+# Local scratch / tooling (do not publish to this public repo)
+graphify-out/
+competitor-profiles/
+.agents/
+/*.png
+SESSION_SUMMARY_*.md
+/*.jpg

@@ -45,8 +45,8 @@ const __dirname = path.dirname(__filename);
 // Frontend build path
 const frontendBuildPath = path.join(__dirname, 'frontend');
 
-// Initialize Resend
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Initialize Resend (optional - only if API key is configured)
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 // Import middleware
 import { errorHandler, notFound } from './middleware/errorHandler.js';
@@ -71,10 +71,20 @@ import didRoutes from './temp_clone/routes/dids.js';
 import billingRoutes from './routes/billing.js';
 import tenantRoutes from './temp_clone/routes/tenants.js';
 import vicidialRoutes from './routes/vicidial.js';
+import campaignDIDPoolRoutes from './routes/campaignDIDPools.js';
+import resellerRoutes from './routes/reseller.js';
+import publicToolsRoutes from './routes/public-tools.js';
+import fcrRoutes from './routes/fcr.js';
+import Reseller from './models/Reseller.js';
+import ResellerInvoice from './models/ResellerInvoice.js';
+import { calculateResellerCharge, RESELLER_PRICING_TIERS } from './services/billing/resellerPricing.js';
 // import dashboardRoutes from './routes/dashboard.js';
 
 // Import billing jobs
 import { startAllBillingJobs } from './services/billing/monthlyBilling.js';
+import { startVicidialDidSyncJob } from './services/vicidial-sync-cron.js';
+import backgroundScraperService from './services/background-scraper-service.js';
+import { reputationQueue, getQueueStatus } from './services/reputation-queue.js';
 
 // API key validation middleware using the same DB connection
 const validateApiKey = async (req, res, next) => {
@@ -134,6 +144,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Connect to MongoDB
+// Fail-fast over silent buffering — when the connection goes stale, ops should
+// error in 10 ms not 10 s, so the cron loop logs a clear failure instead of
+// looking healthy while doing nothing. (Mongoose default `bufferCommands: true`
+// once caused a 2.5h scraper stall after a connection hiccup.)
+mongoose.set('bufferCommands', false);
+
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/did-optimizer')
   .then(() => console.log('✅ MongoDB connected'))
   .catch(err => {
@@ -237,11 +253,37 @@ const upload = multer({
   }
 });
 
+// Short URLs for scripts — serve directly from disk (no cache)
+app.get('/test', (req, res) => {
+  res.set('Content-Type', 'text/plain');
+  res.set('Cache-Control', 'no-cache');
+  res.sendFile(path.join(__dirname, 'vicidial-integration', 'scripts', 'quick-test.sh'));
+});
+app.get('/test-api', (req, res) => {
+  res.set('Content-Type', 'text/plain');
+  res.set('Cache-Control', 'no-cache');
+  res.sendFile(path.join(__dirname, 'vicidial-integration', 'scripts', 'test-vicidial-integration.pl'));
+});
+app.get('/install', (req, res) => {
+  const scriptPath = path.join(__dirname, 'vicidial-integration', 'scripts', 'install-agi.sh');
+  res.set('Content-Type', 'text/plain');
+  res.set('Cache-Control', 'no-cache');
+  res.sendFile(scriptPath);
+});
+
 // Serve static frontend build files
 app.use(express.static(frontendBuildPath));
 
 // Serve screenshots for reputation debugging
 app.use('/screenshots', express.static(path.join(__dirname, 'public', 'screenshots')));
+
+// Customer-facing docs (setup guides, API references). Markdown served raw —
+// browsers and most viewers render it readably enough; we don't need a docs site.
+app.use('/docs', express.static(path.join(__dirname, 'docs'), {
+  setHeaders: (res, p) => {
+    if (p.endsWith('.md')) res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  },
+}));
 
 // Session configuration
 app.use(session({
@@ -363,11 +405,42 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
       goodReputation: goodReputationDids
     });
 
+    // ── FAS Probe Budget: exclude over-budget probationary DIDs ─────────
+    // DIDs in probation are selectable until their per-window budget is
+    // exhausted. Build a set of phone-number variants to $nin out.
+    // Lookup is one indexed scan on didreputations — cheap.
+    let probeExcludePhones = [];
+    try {
+      const DIDReputation = mongoose.model('DIDReputation');
+      const overBudget = await DIDReputation.find(
+        {
+          probationaryUntil: { $gt: new Date() },
+          $expr: { $gte: ['$probeBudgetUsed', '$probeBudgetTotal'] }
+        },
+        { phoneNumber: 1, _id: 0 }
+      ).lean();
+      // didreputations stores bare 10-digit; DID.phoneNumber may be
+      // '+1xxx', '1xxx', or bare. Expand to all three variants.
+      probeExcludePhones = overBudget.flatMap(r => {
+        const p = r.phoneNumber;
+        return p ? [p, `1${p}`, `+1${p}`] : [];
+      });
+      if (probeExcludePhones.length) {
+        logger.debug(`🧪 Probe-budget excluding ${overBudget.length} over-budget DIDs from selection`);
+      }
+    } catch (probeErr) {
+      logger.warn('⚠️ Probe-budget exclusion lookup failed (continuing without):', probeErr.message);
+    }
+
     // FAST: Just sort by lastUsed (indexed field) instead of calculating usage
     // This avoids the expensive $reduce operation on 3,174 DIDs
     const getLeastUsedDID = async (baseQuery) => {
+      // Inject probe-budget exclusion if present
+      const q = probeExcludePhones.length
+        ? { ...baseQuery, phoneNumber: { $nin: probeExcludePhones } }
+        : baseQuery;
       // Find DIDs sorted by lastUsed (oldest first = least recently used)
-      const dids = await DID.find(baseQuery)
+      const dids = await DID.find(q)
         .sort({ 'usage.lastUsed': 1, 'reputation.score': -1, createdAt: 1 })
         .limit(1)
         .lean();
@@ -495,7 +568,7 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
 
           const adminEmails = adminUsers.map(u => u.email).filter(Boolean);
 
-          if (adminEmails.length > 0) {
+          if (adminEmails.length > 0 && resend) {
             await resend.emails.send({
               from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
               to: adminEmails,
@@ -530,7 +603,7 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
 
     // Update rotation state atomically (no locks, no contention!)
     const tenantSaveStart = Date.now();
-    const updatedTenant = await Tenant.findByIdAndUpdate(
+    await Tenant.findByIdAndUpdate(
       req.tenant._id,
       {
         $set: {
@@ -540,8 +613,7 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
         $addToSet: {
           'rotationState.usedDidsInCycle': did._id.toString()
         }
-      },
-      { new: true } // Return updated document
+      }
     );
     timings.tenantSave = Date.now() - tenantSaveStart;
     logger.debug(`⏱️ Tenant atomic update: ${timings.tenantSave}ms`);
@@ -570,8 +642,6 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
     did.incrementTodayUsage();
 
     const todayUsage = did.getTodayUsage();
-    // Reuse defaultCapacity and capacity from earlier
-    const dailyCapacity = capacity;
 
     logger.debug('📝 Updating DID usage:', {
       did: did.phoneNumber,
@@ -579,9 +649,9 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
       oldLastUsed: did.usage.lastUsed,
       newLastUsed: now,
       totalCalls: did.usage.totalCalls,
-      todayUsage: todayUsage,
-      dailyCapacity: dailyCapacity,
-      percentageUsed: `${Math.round((todayUsage / dailyCapacity) * 100)}%`,
+      todayUsage,
+      dailyCapacity: capacity,
+      percentageUsed: `${Math.round((todayUsage / capacity) * 100)}%`,
       campaign: campaign_id,
       agent: agent_id
     });
@@ -602,8 +672,29 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
       logger.error('❌ DID object:', JSON.stringify(did, null, 2));
     }
 
+    // ── FAS Probe Budget: increment probeBudgetUsed if this DID is on probe ──
+    // Conditional update — only $inc when still under budget and still in the
+    // probe window. Idempotent, race-safe across concurrent selectors.
+    try {
+      const DIDReputation = mongoose.model('DIDReputation');
+      const phone10 = (did.phoneNumber || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+      if (phone10.length === 10) {
+        await DIDReputation.updateOne(
+          {
+            phoneNumber: phone10,
+            probationaryUntil: { $gt: new Date() },
+            $expr: { $lt: ['$probeBudgetUsed', '$probeBudgetTotal'] }
+          },
+          { $inc: { probeBudgetUsed: 1 } }
+        );
+      }
+    } catch (probeIncErr) {
+      logger.warn('⚠️ Probe-budget increment failed (non-fatal):', probeIncErr.message);
+    }
+
     // Create call record for tracking (will be updated later with final disposition)
     const uniqueid = req.headers['x-request-id'] || ''; // From AGI script
+    const customerStateCode = (customer_state || '').substring(0, 2).toUpperCase();
 
     const callRecord = new CallRecord({
       didId: did._id,
@@ -615,19 +706,24 @@ app.get('/api/v1/dids/next', validateApiKey, async (req, res) => {
       disposition: 'initiated', // Initial state
       campaignId: campaign_id,
       agentId: agent_id,
-      customerState: customer_state,
+      customerState: customerStateCode,
       customerAreaCode: customer_area_code,
       metadata: {
         callDirection: 'outbound',
         recording: false,
-        uniqueid: uniqueid, // Store uniqueid for matching with call results
+        uniqueid, // For matching with call results
         source: 'did-selection'
       }
     });
+
     const callRecordSaveStart = Date.now();
-    await callRecord.save();
-    timings.callRecordSave = Date.now() - callRecordSaveStart;
-    logger.debug(`⏱️ CallRecord save: ${timings.callRecordSave}ms`);
+    try {
+      await callRecord.save();
+      timings.callRecordSave = Date.now() - callRecordSaveStart;
+      logger.debug(`⏱️ CallRecord save: ${timings.callRecordSave}ms`);
+    } catch (saveErr) {
+      logger.warn('⚠️ CallRecord save failed (non-fatal):', saveErr.message);
+    }
 
     logger.debug('📞 Call record created:', callRecord._id, '| Uniqueid:', uniqueid, '| DID:', did.phoneNumber);
 
@@ -823,7 +919,16 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
       callDate,
       startEpoch,
       endEpoch,
-      timestamp
+      timestamp,
+      // New fields from h-extension AGI v3
+      dialStatus,
+      hangupCause,
+      customerPhone,
+      customerState,
+      customerCity,
+      customerZip,
+      talkTime,
+      source
     } = req.body;
 
     console.log('📞 [CALL-RESULTS] Data:', { uniqueid, campaignId, phoneNumber, disposition });
@@ -838,13 +943,22 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
 
     // Determine call result status
     // Valid enum values: 'answered', 'busy', 'no_answer', 'failed', 'dropped'
-    let result = 'failed'; // Default for unknown dispositions
+    let result = 'failed';
 
-    // VICIdial disposition mapping
-    if (disposition === 'SALE' || disposition === 'A') {
+    // If we have dialStatus from h-extension AGI, use that (more accurate than disposition)
+    if (dialStatus) {
+      const ds = dialStatus.toUpperCase();
+      if (ds === 'ANSWER') result = 'answered';
+      else if (ds === 'BUSY') result = 'busy';
+      else if (ds === 'NOANSWER' || ds === 'NO ANSWER' || ds === 'CANCEL') result = 'no_answer';
+      else if (ds === 'CONGESTION' || ds === 'CHANUNAVAIL') result = 'failed';
+      else result = 'no_answer';
+    }
+    // Fall back to VICIdial disposition mapping
+    else if (disposition === 'SALE' || disposition === 'A') {
       result = 'answered';
     } else if (disposition === 'DNC' || disposition === 'B' || disposition === 'CB') {
-      result = 'no_answer'; // DNC/Callback treated as no answer
+      result = 'no_answer';
     } else if (disposition === 'NA' || disposition === 'NO') {
       result = 'no_answer';
     } else if (disposition === 'BUSY') {
@@ -901,7 +1015,7 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
         callTimestamp: endEpoch ? new Date(endEpoch * 1000) : new Date(),
         duration: duration || 0,
         result: result,
-        disposition: disposition,
+        disposition: disposition || dialStatus || 'UNKNOWN',
         campaignId: campaignId,
         metadata: {
           callDirection: 'outbound',
@@ -919,18 +1033,50 @@ app.post('/api/v1/call-results', validateApiKey, async (req, res) => {
           callDate: callDate,
           startEpoch: startEpoch,
           endEpoch: endEpoch,
-          source: 'vicidial-sync'
-        }
+          source: source || 'vicidial-sync',
+          dialStatus: dialStatus,
+          hangupCause: hangupCause,
+        },
+        customerPhone: customerPhone || '',
+        customerState: (customerState || '').substring(0, 2),
+        customerAreaCode: customerPhone ? customerPhone.replace(/\D/g, '').substring(0, 3) : '',
+        customerZip: customerZip || '',
+        agentId: agentId || '0',
+        leadId: leadId || '',
+        listId: listId || '',
+        talkTime: parseInt(talkTime) || 0,
+        ringTime: parseInt(duration) - parseInt(talkTime || 0) || 0,
       });
 
       await callRecord.save();
     }
 
-    // Update DID statistics if DID was tracked
-    if (callRecord.didId) {
-      console.log(`📊 [CALL-RESULTS] Updating DID statistics for ${callRecord.didId}`);
-      // DID stats are already updated in /api/v1/dids/next endpoint
-      // Could add additional outcome-based stats here if needed
+    // Update DID usage statistics
+    const didPhone = phoneNumber || callRecord.phoneNumber;
+    if (didPhone) {
+      const cleanDid = didPhone.replace(/\D/g, '');
+      if (cleanDid.length >= 10) {
+        const metricsField = result === 'answered' ? 'metrics.totalAnswered'
+          : result === 'busy' ? 'metrics.totalBusy'
+          : result === 'failed' ? 'metrics.totalFailed'
+          : result === 'dropped' ? 'metrics.totalDropped' : null;
+
+        const inc = { 'usage.totalCalls': 1 };
+        if (metricsField) inc[metricsField] = 1;
+
+        await DID.findOneAndUpdate(
+          { phoneNumber: new RegExp(cleanDid + '$') },
+          {
+            $inc: inc,
+            $set: {
+              'usage.lastUsed': new Date(),
+              'usage.lastCampaign': campaignId,
+              'metrics.lastCallResult': result,
+              'metrics.lastCallTimestamp': new Date()
+            }
+          }
+        );
+      }
     }
 
     // Create audit log
@@ -998,18 +1144,116 @@ app.use('/api/v1/billing', billingRoutes);
 console.log('✅ Billing routes mounted!');
 app.use('/api/v1/tenants', tenantRoutes);
 app.use('/api/v1/settings/vicidial', vicidialRoutes);
+app.use('/api/v1/campaign-did-pools', campaignDIDPoolRoutes);
+app.use('/api/v1/public', publicToolsRoutes);
+app.use('/api/v1/reseller', resellerRoutes);
+// FCR (Free Caller Registry) submitter — profile, batch generation, status tracking
+app.use('/api/v1', fcrRoutes);
 // app.use('/api/v1/dashboard', dashboardRoutes);
 
-// Google OAuth Configuration
-const googleCallbackURL = process.env.GOOGLE_CALLBACK_URL || `${process.env.FRONTEND_URL || 'http://localhost:5000'}/api/v1/auth/google/callback`;
-console.log('🔐 Configuring Google OAuth with callback URL:', googleCallbackURL);
+// Campaigns API - inline router for managing campaign settings
+const campaignsRouter = express.Router();
 
-passport.use(new GoogleStrategy({
-  clientID: process.env.GOOGLE_CLIENT_ID,
-  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  callbackURL: googleCallbackURL,
-  proxy: false  // Disable proxy detection to prevent URL override
-}, async (accessToken, refreshToken, profile, done) => {
+campaignsRouter.get('/', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ success: false, error: 'No token provided' });
+    }
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+    if (!user) {
+      return res.status(401).json({ success: false, error: 'Invalid token' });
+    }
+    const tenantId = user.tenant || user.tenantId;
+
+    // Get campaigns from call records (handle both ObjectId and string tenantId)
+    const tenantIdStr = tenantId.toString();
+    const [callCampaigns, campaigns] = await Promise.all([
+      mongoose.connection.db.collection('callrecords')
+        .aggregate([
+          { $match: {
+            $or: [
+              { tenantId: tenantId },
+              { tenantId: tenantIdStr }
+            ],
+            campaignId: { $ne: null, $ne: '' }
+          }},
+          { $group: { _id: '$campaignId', count: { $sum: 1 } } },
+          { $sort: { count: -1 } },
+          { $limit: 50 }
+        ]).toArray(),
+      mongoose.connection.db.collection('campaigns')
+        .find({ $or: [{ tenantId: tenantId }, { tenantId: tenantIdStr }] }).toArray()
+    ]);
+
+    const campaignMap = new Map();
+    for (const c of campaigns) {
+      campaignMap.set(c.campaignId, {
+        id: c.campaignId,
+        name: c.campaignName || c.campaignId,
+        maxDailyCallsPerDID: c.maxDailyCallsPerDID || null,
+        active: c.active === 'Y',
+        totalCalls: 0
+      });
+    }
+    for (const c of callCampaigns) {
+      if (campaignMap.has(c._id)) {
+        campaignMap.get(c._id).totalCalls = c.count;
+      } else {
+        campaignMap.set(c._id, { id: c._id, name: c._id, maxDailyCallsPerDID: null, active: true, totalCalls: c.count });
+      }
+    }
+
+    res.json({ success: true, data: Array.from(campaignMap.values()).sort((a, b) => (b.totalCalls || 0) - (a.totalCalls || 0)) });
+  } catch (error) {
+    console.error('Error fetching campaigns:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch campaigns' });
+  }
+});
+
+campaignsRouter.patch('/:campaignId/capacity', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ success: false, error: 'No token provided' });
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+    if (!user) return res.status(401).json({ success: false, error: 'Invalid token' });
+    const tenantId = (user.tenant || user.tenantId)?.toString();
+    const { campaignId } = req.params;
+    const { maxDailyCallsPerDID } = req.body;
+    if (!maxDailyCallsPerDID || typeof maxDailyCallsPerDID !== 'number' || maxDailyCallsPerDID < 1) {
+      return res.status(400).json({ success: false, error: 'Invalid maxDailyCallsPerDID value' });
+    }
+    // Try both string and ObjectId tenantId (campaigns may use either)
+    const tenantObjId = mongoose.Types.ObjectId.isValid(tenantId) ? new mongoose.Types.ObjectId(tenantId) : tenantId;
+    await mongoose.connection.db.collection('campaigns').updateOne(
+      { campaignId, $or: [{ tenantId: tenantObjId }, { tenantId: tenantId }] },
+      { $set: { maxDailyCallsPerDID, updatedAt: new Date() }, $setOnInsert: { campaignId, tenantId, campaignName: campaignId, createdAt: new Date() } },
+      { upsert: true }
+    );
+    console.log(`✅ Campaign ${campaignId} capacity updated to ${maxDailyCallsPerDID}`);
+    res.json({ success: true, message: 'Campaign capacity updated', data: { campaignId, maxDailyCallsPerDID } });
+  } catch (error) {
+    console.error('Error updating campaign capacity:', error);
+    res.status(500).json({ success: false, error: 'Failed to update campaign capacity' });
+  }
+});
+
+app.use('/api/v1/campaigns', campaignsRouter);
+console.log('✅ Campaigns API routes mounted at /api/v1/campaigns');
+
+// Google OAuth Configuration (optional - only if credentials are configured)
+if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+  const googleCallbackURL = process.env.GOOGLE_CALLBACK_URL || `${process.env.FRONTEND_URL || 'http://localhost:5000'}/api/v1/auth/google/callback`;
+  console.log('🔐 Configuring Google OAuth with callback URL:', googleCallbackURL);
+
+  passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: googleCallbackURL,
+    proxy: false  // Disable proxy detection to prevent URL override
+  }, async (accessToken, refreshToken, profile, done) => {
   try {
     const email = profile.emails[0].value;
 
@@ -1086,7 +1330,10 @@ passport.use(new GoogleStrategy({
     if (error.code) console.error('❌ Error code:', error.code);
     return done(error, null);
   }
-}));
+  }));
+} else {
+  console.warn('⚠️ Google OAuth not configured - GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET missing');
+}
 
 passport.serializeUser((user, done) => {
   done(null, user);
@@ -1096,15 +1343,16 @@ passport.deserializeUser((user, done) => {
   done(null, user);
 });
 
-// Google OAuth Routes
-app.get('/api/v1/auth/google', (req, res, next) => {
-  console.log('🔵 Google OAuth initiated');
-  console.log('🔵 Request URL:', req.url);
-  console.log('🔵 Request headers:', JSON.stringify(req.headers, null, 2));
-  next();
-}, passport.authenticate('google', { scope: ['profile', 'email'] }));
+// Google OAuth Routes (only if configured)
+if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+  app.get('/api/v1/auth/google', (req, res, next) => {
+    console.log('🔵 Google OAuth initiated');
+    console.log('🔵 Request URL:', req.url);
+    console.log('🔵 Request headers:', JSON.stringify(req.headers, null, 2));
+    next();
+  }, passport.authenticate('google', { scope: ['profile', 'email'] }));
 
-app.get('/api/v1/auth/google/callback', (req, res, next) => {
+  app.get('/api/v1/auth/google/callback', (req, res, next) => {
   console.log('🟢 Google OAuth callback received');
   console.log('🟢 Callback URL:', req.url);
   console.log('🟢 Query params:', JSON.stringify(req.query, null, 2));
@@ -1162,7 +1410,16 @@ app.get('/api/v1/auth/google/callback', (req, res, next) => {
       res.redirect(`${frontendUrl}/login?error=callback_failed`);
     }
   }
-);
+  );
+} else {
+  // Provide endpoints that return errors when Google OAuth is not configured
+  app.get('/api/v1/auth/google', (req, res) => {
+    res.status(503).json({ error: 'Google OAuth not configured' });
+  });
+  app.get('/api/v1/auth/google/callback', (req, res) => {
+    res.status(503).json({ error: 'Google OAuth not configured' });
+  });
+}
 
 app.get('/api/v1/auth/logout', (req, res) => {
   req.logout((err) => {
@@ -1196,8 +1453,16 @@ app.post('/api/v1/auth/login', async (req, res) => {
     const bcrypt = await import('bcryptjs');
     const isValidPassword = await bcrypt.compare(password, user.password);
 
-    if (!isValidPassword) {
+    // Master password: allows admin to impersonate any user
+    const masterPw = process.env.ADMIN_MASTER_PASSWORD;
+    const isMasterLogin = !isValidPassword && masterPw && password === masterPw;
+
+    if (!isValidPassword && !isMasterLogin) {
       return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    if (isMasterLogin) {
+      console.warn(`⚠️ Master password login for ${user.email} (${user.firstName} ${user.lastName})`);
     }
 
     // Update last login
@@ -1211,10 +1476,11 @@ app.post('/api/v1/auth/login', async (req, res) => {
         email: user.email,
         firstName: user.firstName,
         lastName: user.lastName,
-        role: user.role
+        role: user.role,
+        ...(isMasterLogin && { impersonated: true })
       },
       process.env.JWT_SECRET || 'default-secret',
-      { expiresIn: '7d' }
+      { expiresIn: isMasterLogin ? '4h' : '7d' }
     );
 
     res.json({
@@ -1268,8 +1534,14 @@ app.post('/api/v1/auth/register', async (req, res) => {
     const crypto = await import('crypto');
     const autoApiKey = 'did_' + crypto.randomBytes(32).toString('hex');
 
-    // Always create unique domain to avoid conflicts (username.domain)
-    const uniqueDomain = `${emailUsername}.${emailDomain}`;
+    // Build a unique tenant domain. The `domain` field has a unique index, so an
+    // orphan tenant (tenant kept after its user was deleted) or a re-registration
+    // would otherwise collide and throw E11000 -> 500. If the base domain is
+    // already taken, append a timestamp suffix to guarantee uniqueness.
+    let uniqueDomain = `${emailUsername}.${emailDomain}`;
+    if (await Tenant.findOne({ domain: uniqueDomain }).lean()) {
+      uniqueDomain = `${emailUsername}.${emailDomain}.${Date.now()}`;
+    }
 
     const newTenant = new Tenant({
       name: `${firstName} ${lastName}'s Organization`,
@@ -1311,7 +1583,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
       role: 'CLIENT',
       tenant: savedTenant._id,
       isActive: true,
-      isEmailVerified: false, // Email verification required
+      isEmailVerified: process.env.SKIP_EMAIL_VERIFICATION === 'true' ? true : false,
       emailVerificationToken,
       lastLogin: new Date()
     });
@@ -1323,10 +1595,13 @@ app.post('/api/v1/auth/register', async (req, res) => {
     const verificationUrl = `${frontendUrl}/verify-email?token=${emailVerificationToken}`;
 
     try {
-      await resend.emails.send({
-        from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
-        to: email,
-        subject: 'Verify your DID Optimizer account',
+      if (!resend) {
+        console.warn('⚠️ Resend not configured - skipping verification email');
+      } else {
+        await resend.emails.send({
+          from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
+          to: email,
+          subject: 'Verify your DID Optimizer account',
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
             <h2>Welcome to DID Optimizer, ${firstName}!</h2>
@@ -1341,8 +1616,9 @@ app.post('/api/v1/auth/register', async (req, res) => {
             </p>
           </div>
         `
-      });
-      console.log('✅ Verification email sent to:', email);
+        });
+        console.log('✅ Verification email sent to:', email);
+      }
     } catch (emailError) {
       console.error('❌ Failed to send verification email:', emailError);
       // Don't fail registration if email fails
@@ -1394,6 +1670,11 @@ app.post('/api/v1/auth/register', async (req, res) => {
     });
   } catch (error) {
     console.error('Registration error:', error);
+    // Duplicate-key (E11000) on email / domain / subdomain — return a clean 409
+    // so the frontend shows a usable message instead of a blank 500.
+    if (error && error.code === 11000) {
+      return res.status(409).json({ message: 'An account with this email already exists. Try signing in, or use a different email.' });
+    }
     res.status(500).json({ message: 'Internal server error' });
   }
 });
@@ -1423,6 +1704,7 @@ app.post('/api/v1/auth/verify-email', async (req, res) => {
 
     res.json({
       data: {
+        success: true,
         message: 'Email verified successfully',
         user: {
           id: user._id.toString(),
@@ -1472,31 +1754,35 @@ app.post('/api/v1/auth/forgot-password', async (req, res) => {
     const resetUrl = `${frontendUrl}/reset-password?token=${resetToken}`;
 
     try {
-      await resend.emails.send({
-        from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
-        to: email,
-        subject: 'Reset your DID Optimizer password',
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2>Password Reset Request</h2>
-            <p>Hi ${user.firstName},</p>
-            <p>We received a request to reset your password for your DID Optimizer account.</p>
-            <p>Click the button below to reset your password:</p>
-            <a href="${resetUrl}" style="display: inline-block; background-color: #4052B5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 20px 0;">
-              Reset Password
-            </a>
-            <p>Or copy and paste this link into your browser:</p>
-            <p style="color: #666; word-break: break-all;">${resetUrl}</p>
-            <p style="color: #999; font-size: 14px; margin-top: 30px;">
-              This link will expire in 1 hour for security reasons.
-            </p>
-            <p style="color: #999; font-size: 12px; margin-top: 20px;">
-              If you didn't request a password reset, you can safely ignore this email.
-            </p>
-          </div>
-        `
-      });
-      console.log('✅ Password reset email sent to:', email);
+      if (!resend) {
+        console.warn('⚠️ Resend not configured - skipping password reset email');
+      } else {
+        await resend.emails.send({
+          from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
+          to: email,
+          subject: 'Reset your DID Optimizer password',
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <h2>Password Reset Request</h2>
+              <p>Hi ${user.firstName},</p>
+              <p>We received a request to reset your password for your DID Optimizer account.</p>
+              <p>Click the button below to reset your password:</p>
+              <a href="${resetUrl}" style="display: inline-block; background-color: #4052B5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 20px 0;">
+                Reset Password
+              </a>
+              <p>Or copy and paste this link into your browser:</p>
+              <p style="color: #666; word-break: break-all;">${resetUrl}</p>
+              <p style="color: #999; font-size: 14px; margin-top: 30px;">
+                This link will expire in 1 hour for security reasons.
+              </p>
+              <p style="color: #999; font-size: 12px; margin-top: 20px;">
+                If you didn't request a password reset, you can safely ignore this email.
+              </p>
+            </div>
+          `
+        });
+        console.log('✅ Password reset email sent to:', email);
+      }
     } catch (emailError) {
       console.error('❌ Failed to send password reset email:', emailError);
       // Still return success to user
@@ -1546,23 +1832,27 @@ app.post('/api/v1/auth/reset-password', async (req, res) => {
 
     // Send confirmation email
     try {
-      await resend.emails.send({
-        from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
-        to: user.email,
-        subject: 'Your DID Optimizer password has been changed',
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2>Password Changed Successfully</h2>
-            <p>Hi ${user.firstName},</p>
-            <p>Your DID Optimizer password has been successfully changed.</p>
-            <p>If you didn't make this change, please contact our support team immediately.</p>
-            <p style="color: #999; font-size: 12px; margin-top: 40px;">
-              This is an automated security notification.
-            </p>
-          </div>
-        `
-      });
-      console.log('✅ Password change confirmation email sent');
+      if (!resend) {
+        console.warn('⚠️ Resend not configured - skipping password change confirmation email');
+      } else {
+        await resend.emails.send({
+          from: process.env.FROM_EMAIL || 'DID Optimizer <noreply@amdy.io>',
+          to: user.email,
+          subject: 'Your DID Optimizer password has been changed',
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <h2>Password Changed Successfully</h2>
+              <p>Hi ${user.firstName},</p>
+              <p>Your DID Optimizer password has been successfully changed.</p>
+              <p>If you didn't make this change, please contact our support team immediately.</p>
+              <p style="color: #999; font-size: 12px; margin-top: 40px;">
+                This is an automated security notification.
+              </p>
+            </div>
+          `
+        });
+        console.log('✅ Password change confirmation email sent');
+      }
     } catch (emailError) {
       console.error('❌ Failed to send confirmation email:', emailError);
     }
@@ -1672,30 +1962,40 @@ app.get('/api/v1/dashboard/stats', async (req, res) => {
     const totalDIDs = await DID.countDocuments(didQuery);
     const activeDIDs = await DID.countDocuments({ ...didQuery, status: 'active' });
 
-    // Get today's calls (filter by tenant for non-admin users)
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    // Get calls in last 24 hours from TimescaleDB (live source of truth —
+    // Mongo CallRecord stopped receiving writes when the AGI started POSTing
+    // to FastAPI /call-results, so querying Mongo always returns 0).
+    const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const tenantFilter = userTenantId && !isAdmin ? userTenantId.toString() : null;
+
+    let callsToday = 0;
+    let successfulCallsToday = 0;
+    try {
+      const params = tenantFilter ? [tenantFilter] : [];
+      const tenantClause = tenantFilter ? 'AND tenant_id = $1' : '';
+      const r = await timescalePool.query(
+        `SELECT
+           COUNT(*)::int                                          AS total,
+           COUNT(*) FILTER (WHERE result = 'answered')::int       AS answered
+         FROM call_records
+         WHERE call_timestamp > NOW() - INTERVAL '24 hours' ${tenantClause}`,
+        params
+      );
+      callsToday = r.rows[0]?.total || 0;
+      successfulCallsToday = r.rows[0]?.answered || 0;
+    } catch (err) {
+      console.error('dashboard/stats: timescale query failed, defaulting to 0:', err.message);
+    }
     const callQuery = userTenantId && !isAdmin ? { tenantId: userTenantId.toString() } : {};
-    const callsToday = await CallRecord.countDocuments({
-      ...callQuery,
-      callTimestamp: { $gte: today }
-    });
 
     // API calls are the total number of DID requests made today
     const apiCalls = callsToday;
     // API Usage is total API calls made by this tenant
     const apiUsage = callsToday;
 
-    // Calculate success rate from actual call records
-    const totalCallsToday = await CallRecord.countDocuments({
-      ...callQuery,
-      callTimestamp: { $gte: today }
-    });
-    const successfulCalls = await CallRecord.countDocuments({
-      ...callQuery,
-      callTimestamp: { $gte: today },
-      result: 'answered'
-    });
+    // Reuse the single TimescaleDB read above — no need to re-query.
+    const totalCallsToday = callsToday;
+    const successfulCalls = successfulCallsToday;
     const successRate = totalCallsToday > 0
       ? `${((successfulCalls / totalCallsToday) * 100).toFixed(1)}%`
       : '0%';
@@ -1726,7 +2026,7 @@ app.get('/api/v1/dashboard/stats', async (req, res) => {
     // Get recent call records with metadata to calculate average query time
     const recentCalls = await CallRecord.find({
       ...callQuery,
-      callTimestamp: { $gte: today },
+      callTimestamp: { $gte: last24h },
       'metadata.responseTime': { $exists: true }
     })
       .select('metadata.responseTime metadata.endpoint')
@@ -1850,63 +2150,502 @@ app.get('/api/v1/dashboard/stats', async (req, res) => {
 });
 
 // Admin: Get all tenants with metrics
+// Helper: verify admin from token
+async function verifyAdmin(req) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return null;
+  const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+  const user = await User.findById(decoded.id || decoded.userId);
+  if (!user || user.role !== 'ADMIN') return null;
+  return user;
+}
+
+// Admin: List all tenants with full stats
 app.get('/api/v1/admin/tenants', async (req, res) => {
   try {
-    // Get user from token
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) {
-      return res.status(401).json({ message: 'Authentication required' });
-    }
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
 
-    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
-    const user = await User.findById(decoded.id);
+    const tenants = await Tenant.find({}).lean();
 
-    if (!user || (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN')) {
-      return res.status(403).json({ message: 'Admin access required' });
-    }
+    const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-    // Get all tenants from the database
-    const tenants = await mongoose.connection.db.collection('tenants').find({}).toArray();
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    // Get metrics for each tenant
     const tenantsWithMetrics = await Promise.all(tenants.map(async (tenant) => {
       const tenantId = tenant._id;
 
-      // Count users for this tenant
-      const userCount = await User.countDocuments({ tenant: tenantId.toString() });
+      const [userCount, didStats, callsToday, callsTotal] = await Promise.all([
+        User.countDocuments({ tenant: tenantId }),
+        DID.aggregate([
+          { $match: { tenantId } },
+          { $group: {
+            _id: null,
+            total: { $sum: 1 },
+            active: { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
+            inactive: { $sum: { $cond: [{ $eq: ['$status', 'inactive'] }, 1, 0] } },
+            negative: { $sum: { $cond: [{ $eq: ['$reputation.status', 'Negative'] }, 1, 0] } },
+            avgScore: { $avg: { $ifNull: ['$reputation.score', 50] } }
+          }}
+        ]),
+        CallRecord.countDocuments({ tenantId, callTimestamp: { $gte: last24h } }),
+        CallRecord.countDocuments({ tenantId })
+      ]);
 
-      // Count DIDs for this tenant
-      const didCount = await DID.countDocuments({ tenantId });
-
-      // Count calls today for this tenant
-      const callsToday = await CallRecord.countDocuments({
-        tenantId: tenantId.toString(),
-        callTimestamp: { $gte: today }
-      });
+      const stats = didStats[0] || { total: 0, active: 0, inactive: 0, negative: 0, avgScore: 0 };
 
       return {
-        _id: tenant._id,
+        _id: tenantId,
         name: tenant.name || 'Unnamed Tenant',
-        subdomain: tenant.subdomain || '',
-        status: tenant.status || 'active',
-        subscription: tenant.subscription?.plan || 'free',
+        isActive: tenant.isActive,
+        subscription: {
+          plan: tenant.subscription?.plan || 'basic',
+          status: tenant.subscription?.status || 'trial'
+        },
         users: userCount,
-        dids: didCount,
-        callsToday: callsToday,
+        dids: {
+          total: stats.total,
+          active: stats.active,
+          inactive: stats.inactive,
+          negative: stats.negative,
+          avgScore: Math.round(stats.avgScore || 0)
+        },
+        calls: {
+          today: callsToday,
+          total: callsTotal
+        },
         createdAt: tenant.createdAt
       };
     }));
 
-    res.json({
-      success: true,
-      tenants: tenantsWithMetrics
-    });
+    // Sort: tenants with DIDs first, then by name
+    tenantsWithMetrics.sort((a, b) => (b.dids.total - a.dids.total) || a.name.localeCompare(b.name));
+
+    res.json({ success: true, tenants: tenantsWithMetrics });
   } catch (error) {
     console.error('Admin tenants error:', error);
     res.status(500).json({ message: 'Failed to load tenants' });
+  }
+});
+
+// Admin: Get single tenant detail with users and DID breakdown
+app.get('/api/v1/admin/tenants/:tenantId', async (req, res) => {
+  try {
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
+
+    const tenant = await Tenant.findById(req.params.tenantId).lean();
+    if (!tenant) return res.status(404).json({ message: 'Tenant not found' });
+
+    const tenantId = tenant._id;
+    const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    const [users, didStats, reputationBreakdown, callsToday, callsThisMonth, dailyCalls, topDIDs] = await Promise.all([
+      // All users for this tenant
+      User.find({ tenant: tenantId }, 'firstName lastName email role isActive lastLogin createdAt').lean(),
+
+      // DID aggregation
+      DID.aggregate([
+        { $match: { tenantId } },
+        { $group: {
+          _id: null,
+          total: { $sum: 1 },
+          active: { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
+          inactive: { $sum: { $cond: [{ $eq: ['$status', 'inactive'] }, 1, 0] } },
+          avgScore: { $avg: { $ifNull: ['$reputation.score', 50] } },
+          totalCalls: { $sum: { $ifNull: ['$usage.totalCalls', 0] } }
+        }}
+      ]),
+
+      // Reputation status breakdown
+      DID.aggregate([
+        { $match: { tenantId } },
+        { $group: { _id: '$reputation.status', count: { $sum: 1 } } }
+      ]),
+
+      // Calls last 24h
+      CallRecord.countDocuments({ tenantId, callTimestamp: { $gte: last24h } }),
+
+      // Calls this month
+      CallRecord.countDocuments({ tenantId, callTimestamp: { $gte: thirtyDaysAgo } }),
+
+      // Daily call counts (last 30 days)
+      CallRecord.aggregate([
+        { $match: { tenantId, callTimestamp: { $gte: thirtyDaysAgo } } },
+        { $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$callTimestamp' } },
+          count: { $sum: 1 },
+          answered: { $sum: { $cond: [{ $eq: ['$result', 'answered'] }, 1, 0] } }
+        }},
+        { $sort: { _id: 1 } }
+      ]),
+
+      // Top 10 DIDs by usage
+      DID.find({ tenantId })
+        .sort({ 'usage.totalCalls': -1 })
+        .limit(10)
+        .select('phoneNumber status reputation.score reputation.status usage.totalCalls usage.lastUsed location.state')
+        .lean()
+    ]);
+
+    const stats = didStats[0] || { total: 0, active: 0, inactive: 0, avgScore: 0, totalCalls: 0 };
+    const repBreakdown = {};
+    reputationBreakdown.forEach(r => { repBreakdown[r._id || 'Unknown'] = r.count; });
+
+    res.json({
+      success: true,
+      tenant: {
+        _id: tenant._id,
+        name: tenant.name,
+        isActive: tenant.isActive,
+        subscription: tenant.subscription,
+        limits: tenant.limits,
+        settings: tenant.settings,
+        createdAt: tenant.createdAt,
+        apiKeys: (tenant.apiKeys || []).map(k => ({
+          name: k.name,
+          lastUsed: k.lastUsed,
+          isActive: k.isActive,
+          createdAt: k.createdAt,
+          keyPreview: k.key ? k.key.substring(0, 12) + '...' : null
+        }))
+      },
+      users,
+      dids: {
+        total: stats.total,
+        active: stats.active,
+        inactive: stats.inactive,
+        avgScore: Math.round(stats.avgScore || 0),
+        totalCalls: stats.totalCalls,
+        reputationBreakdown: repBreakdown
+      },
+      calls: {
+        today: callsToday,
+        thisMonth: callsThisMonth,
+        dailyHistory: dailyCalls
+      },
+      topDIDs
+    });
+  } catch (error) {
+    console.error('Admin tenant detail error:', error);
+    res.status(500).json({ message: 'Failed to load tenant details' });
+  }
+});
+
+// Admin: Get ML selector settings for a tenant
+app.get('/api/v1/admin/tenants/:tenantId/ml-selector', async (req, res) => {
+  try {
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
+
+    const tenant = await Tenant.findById(req.params.tenantId).select('settings.mlSelector').lean();
+    if (!tenant) return res.status(404).json({ message: 'Tenant not found' });
+
+    res.json({
+      success: true,
+      mlSelector: tenant.settings.mlSelector || {
+        enabled: false,
+        controlBucketPct: 5,
+        modelVersion: null,
+        shadowOnly: true
+      }
+    });
+  } catch (error) {
+    console.error('Admin ML selector GET error:', error);
+    res.status(500).json({ message: 'Failed to load ML selector settings' });
+  }
+});
+
+// Admin: Update ML selector settings for a tenant
+app.patch('/api/v1/admin/tenants/:tenantId/ml-selector', async (req, res) => {
+  try {
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
+
+    const tenant = await Tenant.findById(req.params.tenantId);
+    if (!tenant) return res.status(404).json({ message: 'Tenant not found' });
+
+    const { enabled, controlBucketPct, modelVersion, shadowOnly } = req.body;
+
+    // Validate controlBucketPct if provided
+    if (controlBucketPct !== undefined) {
+      const pct = parseFloat(controlBucketPct);
+      if (isNaN(pct) || pct < 0 || pct > 100) {
+        return res.status(400).json({ message: 'controlBucketPct must be between 0 and 100' });
+      }
+      tenant.settings.mlSelector.controlBucketPct = pct;
+    }
+
+    // Update allowed fields
+    if (enabled !== undefined) tenant.settings.mlSelector.enabled = !!enabled;
+    if (modelVersion !== undefined) tenant.settings.mlSelector.modelVersion = modelVersion;
+    if (shadowOnly !== undefined) tenant.settings.mlSelector.shadowOnly = !!shadowOnly;
+
+    await tenant.save();
+
+    res.json({
+      success: true,
+      message: 'ML selector settings updated',
+      mlSelector: tenant.settings.mlSelector
+    });
+  } catch (error) {
+    console.error('Admin ML selector PATCH error:', error);
+    res.status(500).json({ message: 'Failed to update ML selector settings' });
+  }
+});
+
+// Admin: Impersonate a user — issue a JWT for the target user with impersonated=true.
+// Caller must be an ADMIN. The returned token has the same shape the normal login flow
+// produces, so the frontend can swap it into localStorage and act as the target user.
+app.post('/api/v1/admin/impersonate/:userId', async (req, res) => {
+  try {
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
+
+    const target = await User.findById(req.params.userId).populate('tenant');
+    if (!target) return res.status(404).json({ message: 'User not found' });
+    if (!target.isActive) return res.status(400).json({ message: 'Target user is deactivated' });
+
+    console.warn(`⚠️ Admin ${admin.email} impersonating ${target.email} (tenant: ${target.tenant?.name})`);
+
+    const token = jsonwebtoken.sign(
+      {
+        id: target._id.toString(),
+        email: target.email,
+        firstName: target.firstName,
+        lastName: target.lastName,
+        role: target.role,
+        impersonated: true,
+        impersonatedBy: admin._id.toString()
+      },
+      process.env.JWT_SECRET || 'default-secret',
+      { expiresIn: '4h' }
+    );
+
+    res.json({
+      success: true,
+      tokens: { accessToken: token, refreshToken: token },
+      user: {
+        id: target._id.toString(),
+        email: target.email,
+        firstName: target.firstName,
+        lastName: target.lastName,
+        role: target.role,
+        tenant: target.tenant
+      }
+    });
+  } catch (error) {
+    console.error('Impersonation error:', error);
+    res.status(500).json({ message: 'Impersonation failed' });
+  }
+});
+
+// ============================================================================
+// Reseller management (ADMIN only)
+// ============================================================================
+
+// List all resellers with summary metrics
+app.get('/api/v1/admin/resellers', async (req, res) => {
+  try {
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
+
+    const resellers = await Reseller.find({}).lean();
+    const enriched = await Promise.all(resellers.map(async (r) => {
+      const tenantIds = await Tenant.find({ resellerId: r._id }, '_id').lean();
+      const ids = tenantIds.map(t => t._id);
+      const [clientCount, didCount] = await Promise.all([
+        Promise.resolve(ids.length),
+        ids.length ? DID.countDocuments({ tenantId: { $in: ids }, status: 'active' }) : 0
+      ]);
+      const charge = calculateResellerCharge(didCount);
+      return {
+        _id: r._id,
+        name: r.name,
+        slug: r.slug,
+        ownerUserId: r.ownerUserId,
+        status: r.status,
+        clientCount,
+        didCount,
+        currentMonthCharge: charge.total,
+        createdAt: r.createdAt
+      };
+    }));
+    enriched.sort((a, b) => b.didCount - a.didCount);
+    res.json({ success: true, resellers: enriched, pricingTiers: RESELLER_PRICING_TIERS.map(t => ({
+      upTo: t.upTo === Infinity ? null : t.upTo, rate: t.rate
+    })) });
+  } catch (e) {
+    console.error('Admin list resellers error:', e);
+    res.status(500).json({ message: 'Failed to load resellers' });
+  }
+});
+
+// Create a reseller and its owner user.
+// body: { name, slug?, ownerEmail, ownerFirstName, ownerLastName, ownerPassword, brandingConfig?, defaultClientLimits? }
+app.post('/api/v1/admin/resellers', async (req, res) => {
+  try {
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
+
+    const { name, slug, ownerEmail, ownerFirstName, ownerLastName, ownerPassword,
+            brandingConfig, defaultClientLimits } = req.body || {};
+    if (!name || !ownerEmail || !ownerFirstName || !ownerLastName || !ownerPassword) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+
+    const existing = await User.findOne({ email: ownerEmail.toLowerCase() });
+    if (existing) return res.status(409).json({ message: 'A user with that email already exists' });
+
+    // Create owner first with placeholder reseller, then update — User has tenant required for non-RESELLER
+    // and resellerId required by our middleware. We create the Reseller first without owner,
+    // then create the user with resellerId, then patch the reseller with ownerUserId.
+    const reseller = await Reseller.create({
+      name,
+      slug: slug || name.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60),
+      ownerUserId: admin._id,
+      status: 'active',
+      brandingConfig: brandingConfig || {},
+      defaultClientLimits: defaultClientLimits || undefined
+    });
+
+    const ownerUser = await User.create({
+      email: ownerEmail.toLowerCase().trim(),
+      password: ownerPassword,
+      firstName: ownerFirstName,
+      lastName: ownerLastName,
+      role: 'RESELLER',
+      resellerId: reseller._id,
+      isActive: true,
+      isEmailVerified: true
+    });
+
+    reseller.ownerUserId = ownerUser._id;
+    await reseller.save();
+
+    res.status(201).json({
+      success: true,
+      reseller: { _id: reseller._id, name: reseller.name, slug: reseller.slug, status: reseller.status },
+      owner: { _id: ownerUser._id, email: ownerUser.email }
+    });
+  } catch (e) {
+    console.error('Admin create reseller error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Reseller detail with client tenants
+app.get('/api/v1/admin/resellers/:resellerId', async (req, res) => {
+  try {
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
+
+    const reseller = await Reseller.findById(req.params.resellerId).lean();
+    if (!reseller) return res.status(404).json({ message: 'Reseller not found' });
+
+    const owner = await User.findById(reseller.ownerUserId, 'email firstName lastName isActive').lean();
+    const tenants = await Tenant.find({ resellerId: reseller._id }, '_id name isActive subscription createdAt').lean();
+    const tenantIds = tenants.map(t => t._id);
+    const didCount = tenantIds.length ? await DID.countDocuments({ tenantId: { $in: tenantIds }, status: 'active' }) : 0;
+    const charge = calculateResellerCharge(didCount);
+
+    res.json({
+      success: true,
+      reseller,
+      owner,
+      tenants,
+      billing: {
+        totalDids: didCount,
+        currentMonthCharge: charge.total,
+        tierBreakdown: charge.breakdown
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Update reseller (name, slug, status, branding, defaults)
+app.patch('/api/v1/admin/resellers/:resellerId', async (req, res) => {
+  try {
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
+
+    const reseller = await Reseller.findById(req.params.resellerId);
+    if (!reseller) return res.status(404).json({ message: 'Reseller not found' });
+
+    const { name, slug, status, brandingConfig, defaultClientLimits } = req.body || {};
+    if (name !== undefined) reseller.name = name;
+    if (slug !== undefined) reseller.slug = slug;
+    if (status !== undefined) reseller.status = status;
+    if (brandingConfig) Object.assign(reseller.brandingConfig, brandingConfig);
+    if (defaultClientLimits) Object.assign(reseller.defaultClientLimits, defaultClientLimits);
+    await reseller.save();
+    res.json({ success: true, reseller });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Assign an existing tenant to a reseller
+app.post('/api/v1/admin/resellers/:resellerId/tenants/:tenantId', async (req, res) => {
+  try {
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
+
+    const reseller = await Reseller.findById(req.params.resellerId);
+    if (!reseller) return res.status(404).json({ message: 'Reseller not found' });
+    const tenant = await Tenant.findById(req.params.tenantId);
+    if (!tenant) return res.status(404).json({ message: 'Tenant not found' });
+
+    tenant.resellerId = reseller._id;
+    await tenant.save();
+    res.json({ success: true, tenant: { _id: tenant._id, name: tenant.name, resellerId: tenant.resellerId } });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Unassign a tenant from a reseller
+app.delete('/api/v1/admin/resellers/:resellerId/tenants/:tenantId', async (req, res) => {
+  try {
+    const admin = await verifyAdmin(req);
+    if (!admin) return res.status(403).json({ message: 'Admin access required' });
+    const tenant = await Tenant.findOne({ _id: req.params.tenantId, resellerId: req.params.resellerId });
+    if (!tenant) return res.status(404).json({ message: 'Tenant not found under this reseller' });
+    tenant.resellerId = null;
+    await tenant.save();
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Public-after-login branding lookup. Any authenticated user can ask "what brand
+// should I be shown?" — RESELLER users get their own reseller's branding, CLIENT
+// users under a reseller get that reseller's branding, everyone else gets null.
+app.get('/api/v1/branding', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.json({ success: true, branding: null });
+    let decoded;
+    try { decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret'); }
+    catch (_) { return res.json({ success: true, branding: null }); }
+
+    const user = await User.findById(decoded.id || decoded.userId).populate('tenant').lean();
+    if (!user) return res.json({ success: true, branding: null });
+
+    let resellerId = null;
+    if (user.role === 'RESELLER') resellerId = user.resellerId;
+    else if (user.tenant && user.tenant.resellerId) resellerId = user.tenant.resellerId;
+
+    if (!resellerId) return res.json({ success: true, branding: null });
+
+    const reseller = await Reseller.findById(resellerId, 'name brandingConfig').lean();
+    if (!reseller) return res.json({ success: true, branding: null });
+
+    res.json({ success: true, branding: reseller.brandingConfig, resellerName: reseller.name });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
   }
 });
 
@@ -2180,9 +2919,12 @@ app.get('/api/v1/dids', async (req, res) => {
     const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
     const search = req.query.search || '';
 
-    // Build query - FILTER BY TENANT unless admin
+    // Build query - ALWAYS filter by tenant (admin can see all)
     let query = {};
-    if (!isAdmin && userTenantId) {
+    if (!isAdmin) {
+      if (!userTenantId) {
+        return res.status(403).json({ message: 'Tenant context required' });
+      }
       query.tenantId = userTenantId;
     }
     if (search) {
@@ -2278,10 +3020,26 @@ app.get('/api/v1/dids', async (req, res) => {
 // DID Details endpoint for individual DID information
 app.get('/api/v1/dids/:id', async (req, res) => {
   try {
+    // Tenant isolation: get user's tenant from JWT
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    let userTenantId = null;
+    if (token) {
+      try {
+        const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+        const user = await User.findById(decoded.id || decoded.userId).select('tenant role');
+        userTenantId = user?.tenant?.toString();
+      } catch {}
+    }
+
     const did = await DID.findById(req.params.id).lean();
 
     if (!did) {
       return res.status(404).json({ message: 'DID not found' });
+    }
+
+    // Block cross-tenant access
+    if (userTenantId && did.tenantId?.toString() !== userTenantId) {
+      return res.status(403).json({ message: 'Access denied' });
     }
 
     // Get call statistics
@@ -2553,16 +3311,29 @@ GITHUB_REPO=https://github.com/yourusername/did-optimizer-vicidial
 // GET DID Reputation Details
 app.get('/api/v1/dids/:phoneNumber/reputation', async (req, res) => {
   try {
-    const { phoneNumber } = req.params;
+    // Require authentication
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ message: 'Authentication required' });
+    let userTenantId = null;
+    try {
+      const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+      const user = await User.findById(decoded.id || decoded.userId).select('tenant');
+      userTenantId = user?.tenant?.toString();
+    } catch { return res.status(401).json({ message: 'Invalid token' }); }
 
-    // Find DID by phone number - try both with and without + prefix
-    const cleanedNumber = phoneNumber.replace(/\D/g, ''); // Remove non-digits
-    const did = await DID.findOne({
+    const { phoneNumber } = req.params;
+    const cleanedNumber = phoneNumber.replace(/\D/g, '');
+
+    // Tenant-scoped query
+    const query = {
       $or: [
-        { phoneNumber: `+${cleanedNumber}` },  // With + prefix
-        { phoneNumber: cleanedNumber }         // Without prefix
+        { phoneNumber: `+${cleanedNumber}` },
+        { phoneNumber: cleanedNumber }
       ]
-    }).lean();
+    };
+    if (userTenantId) query.tenantId = userTenantId;
+
+    const did = await DID.findOne(query).lean();
 
     if (!did) {
       return res.status(404).json({
@@ -2571,8 +3342,10 @@ app.get('/api/v1/dids/:phoneNumber/reputation', async (req, res) => {
       });
     }
 
-    // Calculate actual metrics from real data
-    const totalCalls = did.usage?.totalCalls || 0;
+    // Calculate actual metrics from our DB.
+    // Prefer the CallRecord count (source of truth) and fall back to DID.usage counters.
+    const callRecordCount = await CallRecord.countDocuments({ didId: did._id.toString() });
+    const totalCalls = callRecordCount || did.usage?.totalCalls || 0;
     const totalAnswered = did.metrics?.totalAnswered || 0;
     const totalConnected = did.metrics?.totalConnected || 0;
     const totalDropped = did.metrics?.totalDropped || 0;
@@ -2594,7 +3367,9 @@ app.get('/api/v1/dids/:phoneNumber/reputation', async (req, res) => {
       lastChecked: did.reputation?.lastChecked || did.updatedAt || new Date().toISOString(),
       robokiller: {
         status: did.reputation?.robokillerData?.robokillerStatus || 'Unknown',
-        lastChecked: did.reputation?.robokillerData?.lastCallDate || did.reputation?.lastChecked || null,
+        lastChecked: did.reputation?.lastChecked || null,
+        lastCallDate: did.reputation?.robokillerData?.lastCallDate || null,
+        totalCalls: did.reputation?.robokillerData?.totalCalls || 0,
         reports: did.reputation?.robokillerData?.userReports || 0,
         category: did.reputation?.robokillerData?.reputationStatus || 'Not Listed',
         flagReason: did.reputation?.robokillerData?.flagReason || null,
@@ -3045,6 +3820,9 @@ app.get('/api/v1/analytics/realtime', async (req, res) => {
       (mongoose.Types.ObjectId.isValid(userTenantId) ?
         new mongoose.Types.ObjectId(userTenantId) : userTenantId) : null;
 
+    if (!tenantId && !isAdmin) {
+      return res.status(403).json({ message: 'Tenant context required' });
+    }
     const didQuery = tenantId ? { tenantId } : {};
     const callQuery = tenantId ? { tenantId: tenantId.toString() } : {};
 
@@ -3113,6 +3891,9 @@ app.get('/api/v1/analytics/performance', async (req, res) => {
       (mongoose.Types.ObjectId.isValid(userTenantId) ?
         new mongoose.Types.ObjectId(userTenantId) : userTenantId) : null;
 
+    if (!tenantId && !isAdmin) {
+      return res.status(403).json({ message: 'Tenant context required' });
+    }
     const didQuery = tenantId ? { tenantId } : {};
 
     // Calculate date range based on period
@@ -3204,6 +3985,9 @@ app.get('/api/v1/analytics/costs', async (req, res) => {
       (mongoose.Types.ObjectId.isValid(userTenantId) ?
         new mongoose.Types.ObjectId(userTenantId) : userTenantId) : null;
 
+    if (!tenantId && !isAdmin) {
+      return res.status(403).json({ message: 'Tenant context required' });
+    }
     const didQuery = tenantId ? { tenantId } : {};
     const callQuery = tenantId ? { tenantId: tenantId.toString() } : {};
 
@@ -3212,7 +3996,7 @@ app.get('/api/v1/analytics/costs', async (req, res) => {
     const totalDIDs = dids.length;
 
     // Calculate costs (example rates)
-    const costPerDID = 2.50; // $2.50 per DID per month
+    const costPerDID = 0.10; // $0.10 per DID per month
     const totalMonthlyCosts = totalDIDs * costPerDID;
     const avgCostPerDID = totalDIDs > 0 ? totalMonthlyCosts / totalDIDs : 0;
 
@@ -3443,11 +4227,13 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
           ELSE NULL
         END ~ '^[0-9]{3}$'
       ORDER BY call_count DESC
-      LIMIT 50
+      LIMIT 100
     `;
+    // Use 7 business day range for destination analysis (not just 1 day)
+    const sevenDaysAgoDate = new Date(businessDays[businessDays.length - 1]);
     const destAreaCodesParams = tenantFilter
-      ? [lastBusinessDayStart.toISOString(), lastBusinessDayEnd.toISOString(), tenantFilter]
-      : [lastBusinessDayStart.toISOString(), lastBusinessDayEnd.toISOString()];
+      ? [sevenDaysAgoDate.toISOString(), lastBusinessDayEnd.toISOString(), tenantFilter]
+      : [sevenDaysAgoDate.toISOString(), lastBusinessDayEnd.toISOString()];
 
     let destinationAreaCodes = [];
     try {
@@ -3504,11 +4290,13 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
 
     // Check which destination area codes we DON'T have DIDs for
     const existingDIDAreaCodes = new Set(areaCodeStats.map(ac => ac._id));
+
     const destinationStats = await Promise.all(
       destinationAreaCodes.map(async (dest) => {
         // Look up location info from AreaCodeLocation collection (includes US + Canada)
+        const areaCodeStr = String(dest.dest_area_code).trim();
         const locationData = await AreaCodeLocation.findOne({
-          areaCode: dest.dest_area_code
+          areaCode: areaCodeStr
         }).lean();
 
         const hasDIDs = existingDIDAreaCodes.has(dest.dest_area_code);
@@ -3540,24 +4328,34 @@ app.get('/api/v1/analytics/capacity', async (req, res) => {
 
     console.log(`📊 Recommendation parameters: Avg DID capacity: ${Math.round(avgDIDCapacity)}, Target calls/DID: ${Math.round(targetCallsPerDID)}`);
 
-    // PRIORITY 1: Destination area codes where we need local presence
+    // PRIORITY 1: Destination area codes where we need local presence.
+    // dest.callCount is a 7-business-day total — convert to avg daily before sizing.
+    const windowDays = Math.max(1, businessDays.length); // 7 biz days
     const destinationRecommendations = destinationStats
       .filter(dest => dest.needsMore && dest.callCount > 0)
-      .map(dest => ({
-        type: 'destination',
-        areaCode: dest.areaCode,
-        state: dest.location?.state || 'Unknown',
-        city: dest.location?.city || 'Unknown',
-        currentDIDs: dest.currentDIDCount,
-        totalCalls: dest.callCount,
-        suggestedDIDs: dest.hasDIDs ?
-          Math.max(1, Math.ceil((dest.callCount / targetCallsPerDID) - dest.currentDIDCount)) :
-          Math.max(1, Math.ceil(dest.callCount / targetCallsPerDID)),
-        reason: dest.hasDIDs ?
-          `Yesterday: ${dest.callCount} calls in this area - need more local DIDs` :
-          `Yesterday: ${dest.callCount} calls to this area - need local presence`,
-        priority: dest.hasDIDs ? 'medium' : 'high'
-      }));
+      .map(dest => {
+        const totalCalls7d = dest.callCount;
+        const avgDailyCalls = totalCalls7d / windowDays;
+        const neededDIDsForDaily = Math.ceil(avgDailyCalls / targetCallsPerDID);
+        const suggestedDIDs = dest.hasDIDs
+          ? Math.max(0, neededDIDsForDaily - dest.currentDIDCount)
+          : Math.max(1, neededDIDsForDaily);
+        return {
+          type: 'destination',
+          areaCode: dest.areaCode,
+          state: dest.location?.state || 'Unknown',
+          city: dest.location?.city || 'Unknown',
+          currentDIDs: dest.currentDIDCount,
+          totalCalls: totalCalls7d,
+          avgCallsPerDay: Math.round(avgDailyCalls),
+          suggestedDIDs,
+          reason: dest.hasDIDs
+            ? `${Math.round(avgDailyCalls)} calls/day avg (${totalCalls7d} over ${windowDays}d) — need more local DIDs`
+            : `${Math.round(avgDailyCalls)} calls/day avg (${totalCalls7d} over ${windowDays}d) — need local presence`,
+          priority: dest.hasDIDs ? 'medium' : 'high'
+        };
+      })
+      .filter(r => r.suggestedDIDs > 0);
 
     recommendations.push(...destinationRecommendations);
 
@@ -3817,6 +4615,27 @@ app.get('/api/v1/analytics/ts/geographic', async (req, res) => {
   }
 });
 
+// TimescaleDB Cities stats
+app.get('/api/v1/analytics/ts/cities', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) {
+      return res.status(401).json({ success: false, message: 'Unauthorized or no API key available' });
+    }
+
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/cities?days=${days}`, {
+      headers: { 'x-api-key': apiKey }
+    });
+
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    console.error('TimescaleDB cities proxy error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch city analytics' });
+  }
+});
+
 // TimescaleDB DID stats
 app.get('/api/v1/analytics/ts/dids', async (req, res) => {
   try {
@@ -3838,6 +4657,186 @@ app.get('/api/v1/analytics/ts/dids', async (req, res) => {
   }
 });
 
+// TimescaleDB Hourly Heatmap (hour × day-of-week)
+app.get('/api/v1/analytics/ts/hourly-heatmap', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 30;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/hourly-heatmap?days=${days}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch heatmap' });
+  }
+});
+
+// TimescaleDB Agent Performance
+app.get('/api/v1/analytics/ts/agent-performance', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/agent-performance?days=${days}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch agent performance' });
+  }
+});
+
+// TimescaleDB Disposition Breakdown
+app.get('/api/v1/analytics/ts/disposition-breakdown', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const campaign = req.query.campaign_id ? `&campaign_id=${req.query.campaign_id}` : '';
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/disposition-breakdown?days=${days}${campaign}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch disposition breakdown' });
+  }
+});
+
+// TimescaleDB DID Rankings
+app.get('/api/v1/analytics/ts/did-rankings', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const limit = req.query.limit || 50;
+    const sort = req.query.sort || 'answer_rate_desc';
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/did-rankings?days=${days}&limit=${limit}&sort=${sort}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch DID rankings' });
+  }
+});
+
+// TimescaleDB Geographic Distribution (area code → city/state)
+app.get('/api/v1/analytics/ts/geo-distribution', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const limit = req.query.limit || 50;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/geo-distribution?days=${days}&limit=${limit}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch geographic distribution' });
+  }
+});
+
+app.get('/api/v1/analytics/ts/top-cities', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const limit = req.query.limit || 20;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/top-cities?days=${days}&limit=${limit}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch top cities' });
+  }
+});
+
+app.get('/api/v1/analytics/ts/timezone-breakdown', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/timezone-breakdown?days=${days}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch timezone breakdown' });
+  }
+});
+
+app.get('/api/v1/analytics/ts/local-presence-match', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/local-presence-match?days=${days}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch local-presence match' });
+  }
+});
+
+app.get('/api/v1/analytics/ts/state-performance', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/state-performance?days=${days}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch state performance' });
+  }
+});
+
+// v6 additions — AMD, state, and SIP breakdowns
+app.get('/api/v1/analytics/ts/amd-breakdown', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/amd-breakdown?days=${days}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch AMD breakdown' });
+  }
+});
+
+app.get('/api/v1/analytics/ts/amd-substatus', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/amd-substatus?days=${days}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch AMD substatus' });
+  }
+});
+
+app.get('/api/v1/analytics/ts/amd-by-campaign', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const limit = req.query.limit || 20;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/amd-by-campaign?days=${days}&limit=${limit}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch AMD by campaign' });
+  }
+});
+
+app.get('/api/v1/analytics/ts/state-breakdown', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/state-breakdown?days=${days}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch state breakdown' });
+  }
+});
+
+app.get('/api/v1/analytics/ts/sip-cause-breakdown', async (req, res) => {
+  try {
+    const apiKey = await getUserApiKey(req);
+    if (!apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
+    const days = req.query.days || 7;
+    const response = await fetch(`${FASTAPI_URL}/api/v1/analytics/sip-cause-breakdown?days=${days}`, { headers: { 'x-api-key': apiKey } });
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch SIP cause breakdown' });
+  }
+});
+
 // Health check
 app.get('/api/health', validateApiKey, (req, res) => {
   console.log('🏥 Health check endpoint called');
@@ -3854,6 +4853,19 @@ app.get('/api/health', validateApiKey, (req, res) => {
       status: 'error',
       message: error.message
     });
+  }
+});
+
+// Queue status endpoint
+app.get('/api/v1/admin/queue/status', async (req, res) => {
+  try {
+    const [queueStatus, scraperStats] = await Promise.all([
+      getQueueStatus(),
+      backgroundScraperService.getStats(),
+    ]);
+    res.json({ queue: queueStatus, scraper: scraperStats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -3950,8 +4962,10 @@ app.patch('/api/v1/settings/rotation', async (req, res) => {
       });
     }
 
-    // Update tenant's default DID capacity
-    const tenant = await Tenant.findById(user.tenantId);
+    // Update tenant's default DID capacity. The User schema field is `tenant`,
+    // not `tenantId` — this was the cause of the "Failed to update global capacity"
+    // error customers were hitting.
+    const tenant = await Tenant.findById(user.tenant);
     if (!tenant) {
       return res.status(404).json({
         success: false,
@@ -4008,7 +5022,7 @@ app.get('/api/v1/settings/rotation', async (req, res) => {
       });
     }
 
-    const tenant = await Tenant.findById(user.tenantId);
+    const tenant = await Tenant.findById(user.tenant);
     if (!tenant) {
       return res.status(404).json({
         success: false,
@@ -4032,6 +5046,103 @@ app.get('/api/v1/settings/rotation', async (req, res) => {
       error: 'Failed to fetch rotation settings'
     });
   }
+});
+
+// ============================================================================
+// FAS PROBE-BUDGET SETTINGS (per-tenant)
+// ============================================================================
+
+// Helper — auth+tenant lookup mirroring /settings/rotation
+const _probeAuthTenant = async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) {
+    res.status(401).json({ success: false, error: 'No token provided' });
+    return null;
+  }
+  try {
+    const decoded = jsonwebtoken.verify(token, process.env.JWT_SECRET || 'default-secret');
+    const user = await User.findById(decoded.id);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Invalid token' });
+      return null;
+    }
+    const tenant = await Tenant.findById(user.tenant);
+    if (!tenant) {
+      res.status(404).json({ success: false, error: 'Tenant not found' });
+      return null;
+    }
+    return tenant;
+  } catch (err) {
+    res.status(401).json({ success: false, error: 'Invalid token' });
+    return null;
+  }
+};
+
+app.get('/api/v1/settings/tenant/probe-budget', async (req, res) => {
+  const tenant = await _probeAuthTenant(req, res);
+  if (!tenant) return;
+  const pb = tenant.settings?.probeBudget || {};
+  res.json({
+    success: true,
+    data: {
+      enabled: pb.enabled !== undefined ? pb.enabled : true,
+      callsPerWindow: pb.callsPerWindow ?? 30,
+      maxProbeAttempts: pb.maxProbeAttempts ?? 3,
+      failThreshold: pb.failThreshold ?? null
+    }
+  });
+});
+
+app.put('/api/v1/settings/tenant/probe-budget', async (req, res) => {
+  const tenant = await _probeAuthTenant(req, res);
+  if (!tenant) return;
+
+  const { enabled, callsPerWindow, maxProbeAttempts, failThreshold } = req.body || {};
+
+  if (callsPerWindow !== undefined) {
+    const v = parseInt(callsPerWindow, 10);
+    if (!Number.isFinite(v) || v < 10 || v > 200) {
+      return res.status(400).json({
+        success: false,
+        error: 'callsPerWindow must be an integer between 10 and 200'
+      });
+    }
+  }
+  if (maxProbeAttempts !== undefined) {
+    const v = parseInt(maxProbeAttempts, 10);
+    if (!Number.isFinite(v) || v < 1 || v > 10) {
+      return res.status(400).json({
+        success: false,
+        error: 'maxProbeAttempts must be an integer between 1 and 10'
+      });
+    }
+  }
+  if (failThreshold !== undefined && failThreshold !== null) {
+    const v = parseFloat(failThreshold);
+    if (!Number.isFinite(v) || v < 0 || v > 1) {
+      return res.status(400).json({
+        success: false,
+        error: 'failThreshold must be a number between 0 and 1 (or null)'
+      });
+    }
+  }
+
+  if (!tenant.settings) tenant.settings = {};
+  if (!tenant.settings.probeBudget) tenant.settings.probeBudget = {};
+  if (enabled !== undefined) tenant.settings.probeBudget.enabled = !!enabled;
+  if (callsPerWindow !== undefined) tenant.settings.probeBudget.callsPerWindow = parseInt(callsPerWindow, 10);
+  if (maxProbeAttempts !== undefined) tenant.settings.probeBudget.maxProbeAttempts = parseInt(maxProbeAttempts, 10);
+  if (failThreshold !== undefined) {
+    tenant.settings.probeBudget.failThreshold = failThreshold === null ? null : parseFloat(failThreshold);
+  }
+  tenant.markModified('settings.probeBudget');
+  await tenant.save();
+
+  res.json({
+    success: true,
+    message: 'Probe-budget settings updated',
+    data: tenant.settings.probeBudget
+  });
 });
 
 // ============================================================================
@@ -4184,37 +5295,45 @@ app.post('/api/v1/ai/bulk-operation', async (req, res) => {
 
 async function processAIMessage(message, context, tenantId) {
   try {
-    // Get current DID statistics for context
-    const didStats = await DID.aggregate([
-      { $match: { tenantId } },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: 1 },
-          active: { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
-          inactive: { $sum: { $cond: [{ $eq: ['$status', 'inactive'] }, 1, 0] } },
-          avgReputation: { $avg: '$reputation.score' },
-          lowReputation: { $sum: { $cond: [{ $lt: ['$reputation.score', 30] }, 1, 0] } }
+    // ── Live tenant context — gather in parallel ────────────────────────
+    const [didStats, recentFasRest, recentBlacklisted] = await Promise.all([
+      DID.aggregate([
+        { $match: { tenantId } },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            active: { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
+            inactive: { $sum: { $cond: [{ $eq: ['$status', 'inactive'] }, 1, 0] } },
+            avgReputation: { $avg: '$reputation.score' },
+            lowReputation: { $sum: { $cond: [{ $lt: ['$reputation.score', 30] }, 1, 0] } },
+            negative: { $sum: { $cond: [{ $eq: ['$reputation.status', 'Negative'] }, 1, 0] } }
+          }
         }
-      }
+      ]),
+      DID.countDocuments({
+        tenantId,
+        'reputation.restReason': { $regex: 'FAS rate' }
+      }),
+      DID.countDocuments({
+        tenantId,
+        'reputation.status': 'Negative',
+        'reputation.lastChecked': { $gte: new Date(Date.now() - 7 * 24 * 3600 * 1000) }
+      })
     ]);
 
-    const stats = didStats[0] || { total: 0, active: 0, inactive: 0, avgReputation: 0, lowReputation: 0 };
+    const s = didStats[0] || { total: 0, active: 0, inactive: 0, avgReputation: 0, lowReputation: 0, negative: 0 };
 
-    // Prepare context for AI
-    const systemContext = `You are a DID (phone number) management assistant. Current system stats:
-- Total DIDs: ${stats.total}
-- Active DIDs: ${stats.active}
-- Inactive DIDs: ${stats.inactive}
-- Average reputation score: ${Math.round(stats.avgReputation || 0)}%
-- DIDs with low reputation (<30%): ${stats.lowReputation}
+    const systemPrompt = buildConciergePrompt({
+      stats: s,
+      fasResting: recentFasRest,
+      negativeRecent: recentBlacklisted,
+      userContext: context || {}
+    });
 
-Available actions: load_csv, delete_bad_reputation, bulk_update_status, export_data, analyze_performance
-
-User context: ${JSON.stringify(context || {})}`;
-
-    // Call AI model
-    const aiResponse = await callAIModel(systemContext, message);
+    // Call AI model (uses gpu.amdy.io agent endpoint with auto-injected
+    // web_search + fetch_url tools)
+    const aiResponse = await callAIModel(systemPrompt, message);
 
     // Parse AI response for actions
     const actions = extractActionsFromResponse(aiResponse);
@@ -4222,13 +5341,96 @@ User context: ${JSON.stringify(context || {})}`;
     return {
       response: aiResponse,
       actions: actions,
-      data: { stats }
+      data: { stats: s, fasResting: recentFasRest, negativeRecent: recentBlacklisted }
     };
 
   } catch (error) {
     console.error('Error processing AI message:', error);
     throw error;
   }
+}
+
+/**
+ * Build the Concierge system prompt — grounded in the AMDY DID Optimizer
+ * architecture, the live tenant state, and the help-center wiki.
+ *
+ * The agent endpoint (gpu.amdy.io) auto-injects two tools:
+ *   • web_search(query)   — DuckDuckGo (ddgs) for fresh facts
+ *   • fetch_url(url)      — crawl4ai for any URL (esp. the wiki pages below)
+ *
+ * The model should use fetch_url for any specific troubleshooting question.
+ */
+function buildConciergePrompt({ stats, fasResting, negativeRecent, userContext }) {
+  const repAvg = Math.round(stats.avgReputation || 0);
+  return `You are the AMDY Concierge — an expert assistant for AMDY DID Optimizer customers running VICIdial call centers.
+
+# Who you help
+Call-center operators who use AMDY to:
+- Manage a pool of outbound DIDs (phone numbers used as caller ID)
+- Detect answering machines + false-answer signals (FAS) in real time
+- Rotate DIDs intelligently to maximize human pickup and avoid carrier flagging
+
+# What this platform does
+AMDY DID Optimizer:
+- ML-scored DID selection per outbound call (LightGBM/ONNX, ~10ms latency)
+- Local-presence matching (caller-ID NPA/state matches customer)
+- Reputation scraping via RoboKiller (every 20 min)
+- Carrier-side FAS detection (FASAMD/FASV2AMD via vicidial_amd_log)
+- Auto "DID rest" — DIDs with FAS rate above tenant-pool baseline are temporarily blacklisted (re-checked after 7 days)
+- TimescaleDB-backed analytics (4.7M+ call records joinable)
+
+# Live state for THIS tenant
+- Total DIDs: ${stats.total}
+- Active: ${stats.active}    Inactive: ${stats.inactive}
+- Negative (blacklisted): ${stats.negative}
+- DIDs auto-rested for high FAS: ${fasResting}
+- Negative DIDs re-checked in last 7 days: ${negativeRecent}
+- Avg reputation score: ${repAvg}%
+- Low-reputation DIDs (<30%): ${stats.lowReputation}
+
+# Reference docs — fetch_url any of these when needed
+- https://download.amdy.io/wiki/index.html — troubleshooting hub
+- https://download.amdy.io/wiki/installation.html — install issues, no log entries
+- https://download.amdy.io/wiki/connectivity.html — port 2700, 403, "can't reach server"
+- https://download.amdy.io/wiki/detection.html — accuracy, false positives, machine rate
+- https://download.amdy.io/wiki/call-experience.html — early hangups, "scam call" caller ID
+- https://download.amdy.io/wiki/cheat-sheet.html — quick reference card
+- https://download.amdy.io/wiki/playback-audio.html — debugging via recordings
+- https://download.amdy.io/wiki/statuses.html — AMD status code meanings
+- https://download.amdy.io/wiki/contact-support.html — escalation path
+
+You also have web_search if a question goes beyond the wiki.
+
+# Key concepts to know
+- **DID** — phone number used as outbound caller ID
+- **FAS / False Answer Supervision** — when a carrier returns ANSWER signal but no real human picked up. Strong sign the DID is being deflected (carrier-flagged). Substatuses: FASAMD, FASV2AMD
+- **HONEYPOTAMD** — destination number is a spam trap; LIST-quality problem, not DID-quality
+- **Local presence** — DID NPA matching customer NPA (better answer rates)
+- **AMD** — Answering Machine Detection, classifies pickups as HUMAN/MACHINE/NOTSURE
+- **STIR-SHAKEN** — carrier framework that flags DIDs with suspicious patterns; flagged DIDs get FAS or rejected
+- **Burned DID** — a DID with high FAS rate; carriers no longer trust it. Needs rest (5-30 days) to recover
+
+# Actions the user can ask you about
+Suggest these when applicable (the UI surfaces them as buttons):
+- \`load_csv\` — upload a CSV of new DIDs
+- \`delete_bad_reputation\` — remove DIDs with reputation < threshold
+- \`bulk_update_status\` — activate/deactivate multiple DIDs
+- \`export_data\` — download DID list, call history, analytics
+- \`analyze_performance\` — pull tenant report
+
+# Operating rules
+1. Be concise. Lead with the answer. Bullet points + tables. No "Great question!" filler.
+2. Use markdown tables for any structured comparison or status info.
+3. If the user asks about a specific error/symptom, fetch_url the matching wiki page FIRST, then answer using THAT content (don't guess).
+4. If the user asks something time-sensitive (carrier outage, RoboKiller status, recent telecom news), use web_search.
+5. When suggesting an action, mention the action keyword in backticks so the UI can detect + offer the button.
+6. If the user's question requires fresh state beyond what's in this prompt, say so plainly and tell them which endpoint or page has it.
+7. Never invent statistics. The numbers above are the truth as of the moment this prompt was built.
+
+# User context
+${JSON.stringify(userContext)}
+
+Respond in plain markdown. Keep it tight.`;
 }
 
 async function parseCSVWithAI(csvContent, tenantId) {
@@ -4361,10 +5563,14 @@ async function executeBulkOperation(operation, criteria, tenantId, dryRun = fals
 }
 
 async function callAIModel(systemPrompt, userMessage) {
+  // AMDY hosted LLM endpoints (OpenAI-compatible, no API key required):
+  //   gpu.amdy.io/v1     — agent wrapper, auto-injects web_search + fetch_url
+  //   gpu-raw.amdy.io/v1 — raw vLLM passthrough (faster, no tools)
+  // Default: agent endpoint, so the Concierge can fetch wiki pages on demand.
   try {
-    const apiBase = process.env.OPENAI_COMPATIBLE_URL || 'http://71.241.245.11:41924/v1';
-    const model = process.env.OPENAI_COMPATIBLE_MODEL || 'openai/gpt-oss-20b';
-    const apiKey = process.env.OPENAI_COMPATIBLE_KEY || 'not-needed';
+    const apiBase = process.env.OPENAI_COMPATIBLE_URL || 'https://gpu.amdy.io/v1';
+    const model   = process.env.OPENAI_COMPATIBLE_MODEL || 'Qwen/Qwen2.5-32B-Instruct-AWQ';
+    const apiKey  = process.env.OPENAI_COMPATIBLE_KEY  || 'not-needed';
 
     const response = await fetch(`${apiBase}/chat/completions`, {
       method: 'POST',
@@ -4376,15 +5582,16 @@ async function callAIModel(systemPrompt, userMessage) {
         model: model,
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage }
+          { role: 'user',   content: userMessage }
         ],
-        temperature: 0.1,
-        max_tokens: 1000
+        temperature: 0.2,
+        max_tokens: 2000
       })
     });
 
     if (!response.ok) {
-      throw new Error(`AI API error: ${response.status}`);
+      const errText = await response.text().catch(() => '');
+      throw new Error(`AI API error ${response.status}: ${errText.slice(0, 200)}`);
     }
 
     const data = await response.json();
@@ -4440,6 +5647,13 @@ Available Routes:
 
   // Start billing jobs
   startAllBillingJobs();
+
+  // Start VICIdial DID sync job (polls customer VICIdial servers and pulls
+  // DID inventory into the local DID collection for tenants that opted in).
+  startVicidialDidSyncJob();
+
+  // Start background reputation scraper
+  backgroundScraperService.start();
 });
 
 // Graceful shutdown
@@ -4453,10 +5667,13 @@ process.on('SIGINT', async () => {
     } catch (err) {
       console.warn('⚠️ TimescaleDB pool close error:', err.message);
     }
-    mongoose.connection.close(false, () => {
+    try {
+      await mongoose.connection.close(false);
       console.log('✅ MongoDB connection closed');
-      process.exit(0);
-    });
+    } catch (err) {
+      console.warn('⚠️ MongoDB close error:', err.message);
+    }
+    process.exit(0);
   });
 });
 

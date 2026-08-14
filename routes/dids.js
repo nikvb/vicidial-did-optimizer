@@ -4,11 +4,12 @@ import { body, validationResult } from 'express-validator';
 import multer from 'multer';
 import fs from 'fs';
 import csv from 'csv-parser';
-// Import DID model from shared models directory
 import DID from '../../models/DID.js';
 import AreaCodeLocation from '../../models/AreaCodeLocation.js';
+import CampaignDIDPool from '../../models/CampaignDIDPool.js';
 import { asyncHandler, createError } from '../middleware/errorHandler.js';
 import { authenticate, validateApiKey } from '../../middleware/auth.js';
+import { enqueueReputationCheck } from '../../services/reputation-queue.js';
 
 const router = express.Router();
 
@@ -69,46 +70,39 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
     DID.countDocuments(query)
   ]);
 
-  // Enrich DIDs with NPANXX location data
-  const enrichedDIDs = await Promise.all(dids.map(async (did) => {
-    const didObj = did.toObject();
+  // Enrich DIDs with NPANXX location data — single batch query
+  const didObjects = dids.map(d => d.toObject());
 
-    // Extract area code from phone number (first 3 digits after country code)
-    const phoneNumber = didObj.phoneNumber;
+  const areaCodeSet = new Set();
+  for (const didObj of didObjects) {
+    const clean = (didObj.phoneNumber || '').replace(/\D/g, '');
+    if (clean.length === 11 && clean.startsWith('1')) areaCodeSet.add(clean.substring(1, 4));
+    else if (clean.length === 10) areaCodeSet.add(clean.substring(0, 3));
+  }
+
+  const locationRows = areaCodeSet.size > 0
+    ? await AreaCodeLocation.find({ areaCode: { $in: [...areaCodeSet] } }).lean()
+    : [];
+  const locationMap = new Map(locationRows.map(l => [l.areaCode, l]));
+
+  const enrichedDIDs = didObjects.map(didObj => {
+    const clean = (didObj.phoneNumber || '').replace(/\D/g, '');
     let areaCode = null;
+    if (clean.length === 11 && clean.startsWith('1')) areaCode = clean.substring(1, 4);
+    else if (clean.length === 10) areaCode = clean.substring(0, 3);
 
-    if (phoneNumber) {
-      // Handle different phone number formats (+1XXXXXXXXXX, 1XXXXXXXXXX, XXXXXXXXXX)
-      const cleanNumber = phoneNumber.replace(/\D/g, '');
-      if (cleanNumber.length >= 10) {
-        if (cleanNumber.startsWith('1') && cleanNumber.length === 11) {
-          areaCode = cleanNumber.substring(1, 4);
-        } else if (cleanNumber.length === 10) {
-          areaCode = cleanNumber.substring(0, 3);
-        }
-      }
+    const loc = areaCode ? locationMap.get(areaCode) : null;
+    if (loc) {
+      didObj.npanxxLocation = {
+        areaCode: loc.areaCode,
+        city: loc.city,
+        state: loc.state,
+        country: loc.country,
+        coordinates: loc.location.coordinates
+      };
     }
-
-    // Lookup location data from NPANXX database
-    if (areaCode) {
-      try {
-        const locationData = await AreaCodeLocation.findOne({ areaCode });
-        if (locationData) {
-          didObj.npanxxLocation = {
-            areaCode: locationData.areaCode,
-            city: locationData.city,
-            state: locationData.state,
-            country: locationData.country,
-            coordinates: locationData.location.coordinates
-          };
-        }
-      } catch (error) {
-        console.warn(`Failed to lookup location for area code ${areaCode}:`, error.message);
-      }
-    }
-
     return didObj;
-  }));
+  });
 
   // Calculate pagination info
   const totalPages = Math.ceil(total / limit);
@@ -140,28 +134,26 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
 router.get('/stats', authenticate, asyncHandler(async (req, res) => {
   const tenantId = req.user.tenant._id;
 
-  // Get total count
-  const total = await DID.countDocuments({ tenantId });
+  const [agg] = await DID.aggregate([
+    { $match: { tenantId } },
+    { $group: {
+      _id: null,
+      total: { $sum: 1 },
+      active: { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
+      totalScore: { $sum: { $ifNull: ['$reputation.score', 50] } },
+      issues: { $sum: { $cond: [
+        { $or: [
+          { $lt: [{ $ifNull: ['$reputation.score', 50] }, 50] },
+          { $eq: ['$status', 'inactive'] }
+        ]}, 1, 0
+      ]}}
+    }}
+  ]);
 
-  // Get active count
-  const active = await DID.countDocuments({ tenantId, status: 'active' });
-
-  // Calculate average score and issues count
-  const didsWithScores = await DID.find({ tenantId }, 'reputation.score status');
-
-  let totalScore = 0;
-  let issues = 0;
-
-  didsWithScores.forEach(did => {
-    const score = did.reputation?.score || 50;
-    totalScore += score;
-
-    if (score < 50 || did.status === 'inactive') {
-      issues++;
-    }
-  });
-
-  const avgScore = total > 0 ? Math.round(totalScore / total) : 0;
+  const total = agg?.total || 0;
+  const active = agg?.active || 0;
+  const issues = agg?.issues || 0;
+  const avgScore = total > 0 ? Math.round((agg?.totalScore || 0) / total) : 0;
 
   res.json({
     success: true,
@@ -329,6 +321,7 @@ router.post('/bulk', authenticate, upload.single('file'), asyncHandler(async (re
     skipped: 0,
     errors: []
   };
+  const createdPhones = [];
 
   try {
     const ext = originalname.toLowerCase().substring(originalname.lastIndexOf('.'));
@@ -443,6 +436,7 @@ router.post('/bulk', authenticate, upload.single('file'), asyncHandler(async (re
         });
 
         console.log(`🎉 Created DID: ${phoneNumber}`);
+        createdPhones.push(phoneNumber.replace(/\D/g, '').replace(/^1(\d{10})$/, '$1'));
         results.created++;
       } catch (error) {
         console.error(`❌ Error processing row ${i + 1}:`, error);
@@ -452,7 +446,14 @@ router.post('/bulk', authenticate, upload.single('file'), asyncHandler(async (re
     }
 
     console.log('🎉 Bulk upload completed:', results);
-    
+
+    // Immediately enqueue new DIDs for reputation check (high priority)
+    if (createdPhones.length > 0) {
+      enqueueReputationCheck(createdPhones, 'high').catch(err =>
+        console.error('Failed to enqueue reputation check:', err.message)
+      );
+    }
+
     res.json({
       success: true,
       message: `Bulk upload completed. Created: ${results.created}, Skipped: ${results.skipped}`,
@@ -545,8 +546,8 @@ router.delete('/:id', authenticate, asyncHandler(async (req, res) => {
 router.post('/bulk-action', authenticate, [
   body('action')
     .notEmpty()
-    .isIn(['delete', 'activate', 'deactivate', 'update-status'])
-    .withMessage('Action must be one of: delete, activate, deactivate, update-status'),
+    .isIn(['delete', 'activate', 'deactivate', 'update-status', 'recheck'])
+    .withMessage('Action must be one of: delete, activate, deactivate, update-status, recheck'),
   body('didIds')
     .isArray({ min: 1 })
     .withMessage('didIds must be a non-empty array'),
@@ -632,11 +633,46 @@ router.post('/bulk-action', authenticate, [
       result.message = `Updated ${updateResult.modifiedCount} DIDs to ${newStatus}`;
       break;
 
+    case 'recheck':
+      const phoneNumbers = dids.map(did => {
+        const cleaned = (did.phoneNumber || '').replace(/\D/g, '');
+        return cleaned.startsWith('1') && cleaned.length === 11 ? cleaned.slice(1) : cleaned;
+      }).filter(Boolean);
+      await enqueueReputationCheck(phoneNumbers, 'high');
+      result.processed = phoneNumbers.length;
+      result.message = `Queued ${phoneNumbers.length} DIDs for reputation recheck`;
+      break;
+
     default:
       throw createError.badRequest('Invalid action');
   }
 
   res.json(result);
+}));
+
+// @desc    Trigger reputation recheck for a single DID
+// @route   POST /api/v1/dids/:id/recheck
+// @access  Private
+router.post('/:id/recheck', authenticate, asyncHandler(async (req, res) => {
+  const did = await DID.findOne({
+    _id: req.params.id,
+    tenantId: req.user.tenant._id
+  });
+
+  if (!did) {
+    throw createError.notFound('DID not found');
+  }
+
+  const cleaned = (did.phoneNumber || '').replace(/\D/g, '');
+  const phone = cleaned.startsWith('1') && cleaned.length === 11 ? cleaned.slice(1) : cleaned;
+
+  await enqueueReputationCheck([phone], 'high');
+
+  res.json({
+    success: true,
+    message: `Queued ${did.phoneNumber} for reputation recheck`,
+    phoneNumber: did.phoneNumber
+  });
 }));
 
 // @desc    Get next available DID for VICIdial (API key auth)
@@ -657,47 +693,137 @@ router.get('/next', validateApiKey, asyncHandler(async (req, res) => {
     customer_phone
   } = req.query;
 
-  // Find an available DID for this tenant
-  // Simple implementation - you can make this more sophisticated
-  const did = await DID.findOne({
-    tenantId: req.tenant._id,
-    status: 'active',
-    $or: [
-      { lastUsed: null },
-      { lastUsed: { $lt: new Date(Date.now() - 60 * 60 * 1000) } } // Not used in last hour
-    ]
-  }).sort({ lastUsed: 1 });
+  let selectedDID = null;
+  let selectionSource = 'tenant_pool';
+  let poolId = null;
+  let campaignPool = null;
 
-  if (!did) {
-    // Return fallback DID if no DIDs available
+  // Try to find campaign-specific DID pool first
+  if (campaign_id) {
+    console.log('🔍 Looking for campaign DID pool:', campaign_id);
+    
+    const pool = await CampaignDIDPool.findByCampaign(req.tenant._id, campaign_id);
+    
+    if (pool && pool.status.type === 'active') {
+      console.log('✅ Found campaign DID pool:', pool.campaignName);
+      
+      // Get next DID from campaign pool
+      const customerInfo = {
+        customerState,
+        customerAreaCode: customer_area_code,
+        customerPhone: customer_phone
+      };
+      
+      selectedDID = await pool.getNextDID(customerInfo);
+
+      if (selectedDID) {
+        selectionSource = 'campaign_pool';
+        poolId = pool._id;
+        campaignPool = pool;
+        console.log('🎯 Selected DID from campaign pool:', selectedDID.phoneNumber);
+      } else if (pool.fallback.enabled) {
+        console.log('⚠️ Campaign pool exhausted, checking fallback');
+        campaignPool = pool;
+        poolId = pool._id;
+
+        if (pool.fallback.fallbackToTenantPool) {
+          selectionSource = 'tenant_pool_fallback';
+          console.log('🔄 Falling back to tenant pool');
+        } else if (pool.fallback.fallbackDid) {
+          selectionSource = 'campaign_fallback_did';
+          selectedDID = {
+            phoneNumber: pool.fallback.fallbackDid,
+            isFallback: true
+          };
+          console.log('🔄 Using campaign fallback DID:', selectedDID.phoneNumber);
+        }
+      }
+    }
+  }
+
+  // If no DID selected from campaign pool, use tenant pool
+  if (!selectedDID) {
+    console.log('🔍 Looking for DID in tenant pool');
+    
+    // Build query for tenant pool
+    const query = {
+      tenantId: req.tenant._id,
+      status: 'active',
+      isActive: true
+    };
+    
+    // Filter by reputation score
+    query['reputation.score'] = { $gte: 50 };
+    
+    // Find available DID
+    selectedDID = await DID.findOne(query)
+      .sort({ 'usage.lastUsed': 1 })
+      .limit(1);
+    
+    if (selectedDID) {
+      console.log('✅ Selected DID from tenant pool:', selectedDID.phoneNumber);
+    }
+  }
+
+  // If still no DID available, use global fallback
+  if (!selectedDID) {
+    console.log('⚠️ No DIDs available, using global fallback');
     return res.json({
       success: true,
       did: {
         number: process.env.FALLBACK_DID || '+18005551234',
-        is_fallback: true
+        is_fallback: true,
+        source: 'global_fallback'
+      },
+      metadata: {
+        campaign_id,
+        agent_id,
+        timestamp: new Date().toISOString(),
+        message: 'All DIDs exhausted, using fallback'
       }
     });
   }
 
-  // Update last used timestamp
-  did.lastUsed = new Date();
-  did.usageCount = (did.usageCount || 0) + 1;
-  await did.save();
+  // Update DID usage
+  if (!selectedDID.isFallback) {
+    selectedDID.usage.totalCalls = (selectedDID.usage.totalCalls || 0) + 1;
+    selectedDID.usage.lastUsed = new Date();
+    selectedDID.usage.lastCampaign = campaign_id;
+    selectedDID.usage.lastAgent = agent_id;
+    selectedDID.lastCampaignUsed = {
+      campaignId: campaign_id,
+      poolId,
+      usedAt: new Date()
+    };
+    
+    // Increment today's usage
+    selectedDID.incrementTodayUsage();
+    
+    await selectedDID.save();
+  }
+
+  // Record selection in pool if applicable
+  if (campaignPool && (selectionSource === 'campaign_pool' || selectionSource === 'tenant_pool_fallback')) {
+    const result = selectionSource === 'campaign_pool' ? 'success' : 'fallback';
+    await campaignPool.recordSelection(selectedDID, result, campaign_id, agent_id);
+  }
 
   // Return the DID in VICIdial format
   res.json({
     success: true,
     did: {
-      number: did.phoneNumber,
-      description: did.description,
-      carrier: did.carrier,
-      location: did.location,
-      is_fallback: false
+      number: selectedDID.phoneNumber,
+      description: selectedDID.description,
+      carrier: selectedDID.metadata?.carrier,
+      location: selectedDID.location,
+      is_fallback: selectedDID.isFallback || false
     },
     metadata: {
       campaign_id,
       agent_id,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      source: selectionSource,
+      pool_id: poolId ? poolId.toString() : null
     }
   });
 }));

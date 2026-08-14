@@ -1,97 +1,95 @@
-import paypal from 'paypal-rest-sdk';
 import Tenant from '../../models/Tenant.js';
 import DID from '../../models/DID.js';
 import Invoice from '../../models/Invoice.js';
 import { sendInvoiceEmail, sendPaymentSuccessEmail, sendPaymentFailedEmail, sendAccountSuspendedEmail } from '../email/billingEmails.js';
+import { chargePaymentToken } from './paypalCharging.js';
+import {
+  DIRECT_TIERS,
+  ANNUAL_PREPAY_MONTHS_BILLED,
+  ANNUAL_PREPAY_MONTHS_BILLED_ENTERPRISE,
+  calculateDirectCharge,
+  serializeTiers
+} from './pricingCurves.js';
 
-// Pricing plans configuration
+// Plan metadata. The pricing model is uniform PAYG — every tenant pays the same
+// per-DID curve. `annual` is just a billing-cycle flag (12 months prepaid for the
+// price of 10). `enterprise` is a quoted exception (used for hand-priced deals).
+// Plan definitions tied to hybrid pricing model
 export const PRICING_PLANS = {
-  basic: {
-    name: 'Basic',
-    price: 99,
-    includedDids: 250,
-    perDidCost: 1.50,
-    features: ['byo_dids', 'basic_rotation', 'geo_recommendations', 'auto_purchase'],
-    limits: { maxUsers: 5, maxDIDs: 250, maxConcurrentCalls: 10, apiCallsPerMonth: 10000 }
+  payg: {
+    name: 'Pay-as-you-go',
+    billing_cycle: 'monthly',
+    pricing: 'tiered_hybrid',
+    tiers: serializeTiers(DIRECT_TIERS),
+    features: ['byo_dids', 'rotation', 'reputation', 'analytics', 'api_access'],
+    limits: { maxUsers: 100, maxDIDs: 999999, maxConcurrentCalls: 999999, apiCallsPerMonth: 999999 }
   },
-  professional: {
-    name: 'Professional',
-    price: 299,
-    includedDids: 1000,
-    perDidCost: 1.00,
-    features: ['all_basic', 'ai_rotation', 'predictive_analytics', 'advanced_algorithms'],
-    limits: { maxUsers: 25, maxDIDs: 1000, maxConcurrentCalls: 100, apiCallsPerMonth: 100000 }
+  annual: {
+    name: 'Annual prepay',
+    billing_cycle: 'annual',
+    pricing: 'tiered_hybrid',
+    tiers: serializeTiers(DIRECT_TIERS),
+    monthsBilled: ANNUAL_PREPAY_MONTHS_BILLED,
+    monthsBilledEnterprise: ANNUAL_PREPAY_MONTHS_BILLED_ENTERPRISE,
+    features: ['all_payg', 'annual_discount'],
+    limits: { maxUsers: 100, maxDIDs: 999999, maxConcurrentCalls: 999999, apiCallsPerMonth: 999999 }
   },
   enterprise: {
-    name: 'Enterprise',
-    price: 'custom',
-    includedDids: 999999,
-    perDidCost: 'custom',
-    features: ['all_professional', 'custom_ml', 'unlimited_dids', 'white_glove'],
-    limits: { maxUsers: 100, maxDIDs: 999999, maxConcurrentCalls: 999999, apiCallsPerMonth: 999999 }
+    name: 'Enterprise (custom)',
+    billing_cycle: 'annual',
+    pricing: 'custom_quoted',
+    features: ['all_annual', 'custom_sla', 'white_glove', 'dedicated_support'],
+    limits: { maxUsers: 999, maxDIDs: 999999, maxConcurrentCalls: 999999, apiCallsPerMonth: 999999 }
   }
 };
 
 /**
- * Calculate monthly charges for a tenant
+ * Calculate monthly charges for a direct tenant using hybrid pricing (base fee + per-DID).
+ * Enterprise (custom-priced) tenants use customRate if set; otherwise use tier pricing.
  */
 export async function calculateMonthlyCharges(tenant) {
-  console.log('🔵 calculateMonthlyCharges called for tenant:', tenant.name);
-  console.log('🔵 Subscription plan:', tenant.subscription?.plan);
-  console.log('🔵 Has perDidPricing:', !!tenant.subscription?.perDidPricing);
-
-  const plan = PRICING_PLANS[tenant.subscription.plan];
-
-  if (!plan || plan.price === 'custom') {
-    console.error('🔴 Invalid plan:', tenant.subscription.plan);
-    throw new Error('Cannot calculate charges for custom plan');
-  }
-
-  // Count active DIDs
   const didCount = await DID.countDocuments({
     tenantId: tenant._id,
     isActive: true
   });
 
-  // Calculate base fee
-  const baseFee = plan.price;
+  // Enterprise custom pricing
+  const customRate = tenant.subscription?.perDidPricing?.customRate;
+  const isCustom = tenant.subscription?.plan === 'enterprise' && customRate != null;
 
-  // Calculate per-DID charges
-  console.log('🔵 Accessing perDidPricing...');
+  let tierName, baseFee, didFee, breakdown, totalDidFee;
 
-  // Ensure perDidPricing exists with safe defaults
-  const perDidPricing = tenant.subscription.perDidPricing || { enabled: true, customRate: null };
+  if (isCustom) {
+    tierName = 'Enterprise (custom)';
+    baseFee = 0;
+    didFee = +(didCount * customRate).toFixed(2);
+    totalDidFee = didFee;
+    breakdown = [{ from: 1, to: didCount, rate: customRate, didsInTier: didCount, subtotal: didFee }];
+  } else {
+    // Hybrid pricing (base fee + per-DID tiers)
+    const chargeData = calculateDirectCharge(didCount);
+    tierName = chargeData.tierName;
+    baseFee = chargeData.baseFee;
+    didFee = chargeData.didCharges;
+    totalDidFee = chargeData.totalMonthlyCharge;
+    breakdown = chargeData.breakdown;
+  }
 
-  const includedDids = perDidPricing.customRate !== null
-    ? plan.includedDids // Use standard for enterprise with custom rate
-    : plan.includedDids;
-
-  const extraDids = Math.max(0, didCount - includedDids);
-
-  const perDidRate = perDidPricing.customRate !== null
-    ? perDidPricing.customRate
-    : plan.perDidCost;
-
-  console.log('🔵 Charges calculated:', { baseFee, didCount, includedDids, extraDids, perDidRate });
-
-  const totalDidFee = extraDids * perDidRate;
-
-  // Calculate subtotal
-  const subtotal = baseFee + totalDidFee;
-
-  // Calculate tax (simplified - you may want to integrate with a tax service)
-  const tax = calculateTax(subtotal, tenant.billing.address);
-
-  // Calculate total
-  const total = subtotal + tax;
+  const tax = calculateTax(totalDidFee, tenant.billing?.address);
+  const subtotal = totalDidFee;
+  const total = +(subtotal + tax).toFixed(2);
 
   return {
-    baseFee,
     didCount,
-    includedDids,
-    extraDids,
-    perDidRate,
+    tier: tierName,
+    baseFee,
+    didCharges: didFee,
+    tierBreakdown: breakdown,
     totalDidFee,
+    // legacy-compat fields
+    includedDids: 0,
+    extraDids: didCount,
+    perDidRate: didCount > 0 ? +(didFee / didCount).toFixed(4) : 0,
     subtotal,
     tax,
     total
@@ -150,6 +148,7 @@ export async function generateInvoice(tenant) {
       perDidRate: charges.perDidRate,
       totalDidFee: charges.totalDidFee
     },
+    tierBreakdown: charges.tierBreakdown,
     amounts: {
       subtotal: charges.subtotal,
       tax: charges.tax,
@@ -263,49 +262,15 @@ async function chargePayPalAccount(invoice, tenant) {
 }
 
 /**
- * Charge vaulted credit card
+ * Charge vaulted credit card using PayPal vault token
  */
 async function chargeVaultedCard(vaultId, invoice) {
-  const paymentData = {
-    intent: 'sale',
-    payer: {
-      payment_method: 'credit_card',
-      funding_instruments: [{
-        credit_card_token: {
-          credit_card_id: vaultId
-        }
-      }]
-    },
-    transactions: [{
-      amount: {
-        total: invoice.amounts.total.toFixed(2),
-        currency: 'USD',
-        details: {
-          subtotal: invoice.amounts.subtotal.toFixed(2),
-          tax: invoice.amounts.tax.toFixed(2)
-        }
-      },
-      description: `Invoice ${invoice.invoiceNumber} - ${invoice.subscription.plan} Plan`,
-      invoice_number: invoice.invoiceNumber,
-      custom: invoice.tenantId.toString()
-    }]
-  };
-
-  return new Promise((resolve, reject) => {
-    paypal.payment.create(paymentData, (error, payment) => {
-      if (error) {
-        reject(error);
-      } else {
-        // Payment successful
-        const sale = payment.transactions[0].related_resources[0].sale;
-        resolve({
-          transactionId: sale.id,
-          status: sale.state,
-          amount: sale.amount.total
-        });
-      }
-    });
-  });
+  return await chargePaymentToken(
+    vaultId,
+    invoice.amounts.total,
+    'USD',
+    `Invoice ${invoice.invoiceNumber} - ${invoice.subscription.plan} Plan`
+  );
 }
 
 /**
@@ -372,40 +337,33 @@ export async function retryPayment(invoice) {
 }
 
 /**
- * Calculate estimated cost for a plan with specific DID count
+ * Cost estimate for a given DID count + billing cycle. PAYG returns the
+ * monthly charge from the stepped curve; annual prepay returns the same curve
+ * × ANNUAL_PREPAY_MONTHS_BILLED (10), giving 2 months free.
  */
-export function calculateEstimate(plan, didCount, billingCycle = 'monthly', customRate = null) {
-  const planConfig = PRICING_PLANS[plan];
+export function calculateEstimate(didCount, billingCycle = 'monthly') {
+  const charge = calculateDirectCharge(didCount);
+  const monthly = charge.total;
 
-  if (!planConfig || planConfig.price === 'custom') {
-    throw new Error('Cannot calculate estimate for custom plan');
+  if (billingCycle === 'yearly') {
+    const annualTotal = +(monthly * ANNUAL_PREPAY_MONTHS_BILLED).toFixed(2);
+    return {
+      billingCycle: 'yearly',
+      didCount,
+      tierBreakdown: charge.breakdown,
+      monthlyEquivalent: monthly,
+      monthsBilled: ANNUAL_PREPAY_MONTHS_BILLED,
+      annualTotal,
+      annualSavings: +(monthly * 12 - annualTotal).toFixed(2),
+      total: annualTotal
+    };
   }
 
-  const baseFee = billingCycle === 'yearly'
-    ? planConfig.price * 10 // 2 months free
-    : planConfig.price;
-
-  const includedDids = planConfig.includedDids;
-  const extraDids = Math.max(0, didCount - includedDids);
-  const perDidRate = customRate || planConfig.perDidCost;
-  const totalDidFee = extraDids * perDidRate;
-
-  const subtotal = baseFee + totalDidFee;
-  const tax = 0; // Simplified for estimate
-  const total = subtotal + tax;
-
   return {
-    plan,
-    billingCycle,
-    baseFee,
+    billingCycle: 'monthly',
     didCount,
-    includedDids,
-    extraDids,
-    perDidRate,
-    totalDidFee,
-    subtotal,
-    tax,
-    total
+    tierBreakdown: charge.breakdown,
+    total: monthly
   };
 }
 

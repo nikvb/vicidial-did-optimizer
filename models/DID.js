@@ -167,7 +167,70 @@ const didSchema = new mongoose.Schema({
     lineType: String,
     portedDate: Date,
     notes: String
-  }
+  },
+
+  // Campaign associations for campaign-specific DID pools
+  campaignAssociations: [{
+    campaignId: {
+      type: String,
+      required: true,
+      trim: true
+    },
+    poolId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'CampaignDIDPool'
+    },
+    addedAt: {
+      type: Date,
+      default: Date.now
+    },
+    addedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
+    priority: {
+      type: Number,
+      default: 5,
+      min: 1,
+      max: 10
+    }
+  }],
+
+  // Track last campaign used
+  lastCampaignUsed: {
+    campaignId: String,
+    poolId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'CampaignDIDPool'
+    },
+    usedAt: Date
+  },
+
+  // ── Free Caller Registry (FCR) tracking ────────────────────────────────
+  // Per-DID submission status with the carrier-side reputation engines
+  // (First Orion / Hiya / TNS) via freecallerregistry.com. We track these
+  // at the top level (not in metadata) so they're cheap to query/filter.
+  fcrStatus: {
+    type: String,
+    enum: ['not_submitted', 'submitted', 'approved', 'rejected', 'expired'],
+    default: 'not_submitted',
+    index: true
+  },
+  fcrSubmittedAt: Date,
+  fcrApprovedAt: Date,
+  fcrBatchId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'FCRBatch'
+  },
+  fcrNotes: String,
+
+  // ── Upload batch identifier ────────────────────────────────────────────
+  // Human-readable label stamped on a DID when it's uploaded (Bulk Upload,
+  // Advanced Loader, or single Add DID) so the customer can find and review
+  // "the batch I uploaded on <date>". Top-level for cheap query/filter.
+  // Custom label the user types, or an auto BATCH-YYYY-MM-DD-NNN if left blank.
+  uploadLabel: { type: String, trim: true, index: true, default: null },
+  uploadedAt: { type: Date, default: null }
 }, {
   timestamps: true,
   strict: false // Allow flexibility for existing data
@@ -179,6 +242,7 @@ didSchema.index({ phoneNumber: 1, tenantId: 1 }, { unique: true });
 didSchema.index({ tenantId: 1, 'location.state': 1 });
 didSchema.index({ tenantId: 1, 'location.areaCode': 1 });
 didSchema.index({ tenantId: 1, 'usage.lastUsed': 1 });
+didSchema.index({ tenantId: 1, uploadLabel: 1 });
 didSchema.index({ 'location.latitude': 1, 'location.longitude': 1 });
 
 // Critical indexes for DID rotation and selection (for /api/v1/dids/next endpoint)
@@ -193,6 +257,11 @@ didSchema.index({ 'usage.dailyUsage.date': 1 });
 didSchema.index({ npanxx: 1 });
 didSchema.index({ tenantId: 1, npanxx: 1, status: 1, 'reputation.score': -1 });
 didSchema.index({ tenantId: 1, 'location.areaCode': 1, status: 1, 'reputation.score': -1 });
+
+// Campaign-specific indexes for campaign DID pools
+didSchema.index({ tenantId: 1, 'campaignAssociations.campaignId': 1 });
+didSchema.index({ tenantId: 1, 'campaignAssociations.poolId': 1 });
+didSchema.index({ 'campaignAssociations.poolId': 1, status: 1 });
 
 // Method to get today's usage count
 didSchema.methods.getTodayUsage = function() {

@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import reputationService from './reputation-service.js';
 import crawl4aiService from './crawl4ai-service.js';
 import DID from '../models/DID.js';
+import { enqueueReputationCheck, getQueueStatus } from './reputation-queue.js';
 
 class BackgroundScraperService {
   constructor() {
@@ -18,20 +19,8 @@ class BackgroundScraperService {
       errors: []
     };
 
-    // Configuration
-    this.config = {
-      // Run every 4 hours: 0 */4 * * *
-      // For testing, run every 15 minutes: */15 * * * *
-      schedule: process.env.SCRAPER_SCHEDULE || '0 */4 * * *',
-      batchSize: parseInt(process.env.SCRAPER_BATCH_SIZE) || 5,
-      delayBetweenBatches: parseInt(process.env.SCRAPER_DELAY_MS) || 3000,
-      maxConcurrentJobs: parseInt(process.env.SCRAPER_MAX_CONCURRENT) || 1,
-      enabledInDevelopment: process.env.ENABLE_SCRAPER_DEV === 'true',
-      maxDidsPerRun: parseInt(process.env.SCRAPER_MAX_DIDS) || 50,
-      retryFailedAfterHours: parseInt(process.env.SCRAPER_RETRY_HOURS) || 24
-    };
-
-    console.log('📡 Background Scraper Service initialized with config:', this.config);
+    // Config is read lazily in start() after dotenv has loaded
+    this.config = null;
   }
 
   /**
@@ -42,6 +31,18 @@ class BackgroundScraperService {
       console.log('⚠️ Background scraper is already running');
       return;
     }
+
+    // Read config now — dotenv is loaded by this point
+    this.config = {
+      schedule: process.env.SCRAPER_SCHEDULE || '*/20 * * * *',
+      batchSize: parseInt(process.env.SCRAPER_BATCH_SIZE) || 20,
+      delayBetweenBatches: parseInt(process.env.SCRAPER_DELAY_MS) || 500,
+      maxConcurrentJobs: parseInt(process.env.SCRAPER_MAX_CONCURRENT) || 1,
+      enabledInDevelopment: process.env.ENABLE_SCRAPER_DEV === 'true',
+      maxDidsPerRun: parseInt(process.env.SCRAPER_MAX_DIDS) || 2000,
+      retryFailedAfterHours: parseInt(process.env.SCRAPER_RETRY_HOURS) || 24
+    };
+    console.log('📡 Background Scraper Service config:', this.config);
 
     const isDevelopment = process.env.NODE_ENV === 'development';
 
@@ -124,56 +125,18 @@ class BackgroundScraperService {
         console.log(`⚡ Limited to ${limitedDids.length} DIDs for this run (max: ${this.config.maxDidsPerRun})`);
       }
 
-      // Extract phone numbers and format for RoboKiller
+      // Extract phone numbers and push to the queue (workers do the scraping)
       const phoneNumbers = limitedDids.map(did => this.formatPhoneNumber(did.phoneNumber));
+      await enqueueReputationCheck(phoneNumbers, 'normal');
 
-      console.log(`🕷️ Starting Crawl4AI batch scraping for ${phoneNumbers.length} numbers`);
-
-      // Use reputation service bulk update with Crawl4AI
-      const results = await reputationService.bulkUpdateReputation(phoneNumbers, {
-        batchSize: this.config.batchSize,
-        delayMs: this.config.delayBetweenBatches,
-        useCrawl4AI: true
-      });
-
-      // Process results
-      const successful = results.filter(r => r.success).length;
-      const failed = results.filter(r => !r.success).length;
-
-      this.stats.totalProcessed += results.length;
-      this.stats.successfulScrapes += successful;
-      this.stats.failedScrapes += failed;
-
+      this.stats.totalProcessed += phoneNumbers.length;
       const processingTime = Date.now() - startTime;
       this.stats.averageProcessingTime = Math.round(
         (this.stats.averageProcessingTime + processingTime) / 2
       );
 
-      // Log failures for monitoring
-      const failures = results.filter(r => !r.success);
-      if (failures.length > 0) {
-        console.log(`⚠️ Failed to scrape ${failures.length} DIDs:`);
-        failures.forEach(failure => {
-          console.log(`   ${failure.phoneNumber}: ${failure.error}`);
-          this.stats.errors.push({
-            phoneNumber: failure.phoneNumber,
-            error: failure.error,
-            timestamp: new Date()
-          });
-        });
-
-        // Keep only last 100 errors
-        if (this.stats.errors.length > 100) {
-          this.stats.errors = this.stats.errors.slice(-100);
-        }
-      }
-
-      console.log(`✅ Scraping cycle completed in ${Math.round(processingTime / 1000)}s`);
-      console.log(`📊 Results: ${successful} successful, ${failed} failed`);
-
-      // Update proxy stats
-      const proxyStats = await crawl4aiService.getProxyStats();
-      console.log(`🌐 Proxy Status: ${proxyStats.healthyProxies}/${proxyStats.totalProxies} healthy`);
+      const queueStatus = await getQueueStatus();
+      console.log(`✅ Enqueued ${phoneNumbers.length} DIDs in ${Date.now() - startTime}ms — queue: waiting=${queueStatus.waiting} active=${queueStatus.active}`);
 
     } catch (error) {
       console.error('❌ Error in scraping cycle:', error);
@@ -187,60 +150,77 @@ class BackgroundScraperService {
   }
 
   /**
-   * Get DIDs that need reputation checking
+   * Get DIDs that need reputation checking.
+   * Priority: never-checked DIDs first, then oldest-checked. This keeps
+   * new DIDs from getting starved when the active-DID count exceeds
+   * maxDidsPerRun.
    */
   async getDIDsNeedingCheck() {
     try {
-      // Get DIDs that haven't been checked recently or never checked
-      const cutoffTime = new Date();
-      cutoffTime.setHours(cutoffTime.getHours() - this.config.retryFailedAfterHours);
+      const DIDReputation = mongoose.model('DIDReputation');
 
-      // Find DIDs from the DID collection
-      const dids = await DID.find({
-        isActive: true,
-        status: 'active'
-      }).limit(this.config.maxDidsPerRun * 2); // Get more than we need for filtering
+      // Build a blacklist set in one projection query. Used to filter the
+      // DID candidates in-memory — can't push this into the DID query because
+      // phone formats differ (10-digit DIDReputation vs "1..." / "+1..." DID).
+      const blacklisted = await DIDReputation.find(
+        { isBlacklisted: true },
+        { phoneNumber: 1, _id: 0 }
+      ).lean();
+      const blacklistedSet = new Set(blacklisted.map(r => r.phoneNumber));
 
-      if (dids.length === 0) {
+      // Only scrape DIDs owned by PAYING tenants (subscription.status === 'active').
+      // Trial / suspended / cancelled tenants are excluded so we don't burn proxy
+      // and scraping budget on accounts that haven't paid.
+      const Tenant = mongoose.model('Tenant');
+      const paidTenants = await Tenant.find(
+        { 'subscription.status': 'active' },
+        { _id: 1 }
+      ).lean();
+      const paidTenantIds = paidTenants.map(t => t._id);
+      if (paidTenantIds.length === 0) {
+        console.log('💤 No paying tenants — skipping reputation scrape cycle');
         return [];
       }
 
-      // Check which ones need reputation updates
-      const DIDReputation = mongoose.model('DIDReputation');
-      const phoneNumbers = dids.map(did => did.phoneNumber);
+      // Pull a much larger candidate pool so when we skip blacklisted zombies
+      // we still have enough non-blacklisted DIDs left to fill the batch.
+      const poolSize = Math.max(this.config.maxDidsPerRun * 10, 1000);
+      const dids = await DID.find({ isActive: true, status: 'active', tenantId: { $in: paidTenantIds } })
+        .sort({ 'reputation.lastChecked': 1 })
+        .limit(poolSize);
+
+      if (dids.length === 0) return [];
+
+      const normalizedPhones = dids
+        .map(did => this.formatPhoneNumber(did.phoneNumber))
+        .filter(p => !blacklistedSet.has(p));
 
       const existingReputations = await DIDReputation.find({
-        phoneNumber: { $in: phoneNumbers }
+        phoneNumber: { $in: normalizedPhones }
       });
-
       const reputationMap = new Map();
       existingReputations.forEach(rep => {
-        reputationMap.set(rep.phoneNumber, rep);
+        reputationMap.set(this.formatPhoneNumber(rep.phoneNumber), rep);
       });
 
-      // Filter DIDs that need checking
-      const didsNeedingCheck = dids.filter(did => {
-        const reputation = reputationMap.get(did.phoneNumber);
+      const didsNeedingCheck = [];
+      for (const did of dids) {
+        const phone = this.formatPhoneNumber(did.phoneNumber);
+        const reputation = reputationMap.get(phone);
 
-        if (!reputation) {
-          // Never checked before
-          return true;
-        }
+        // For BLACKLISTED DIDs: re-check only if nextCheckDue is in the past
+        // (defaults to 7 days). This lets recovered DIDs get unblacklisted
+        // while preventing constant rechecks of known-bad numbers.
+        // For NON-BLACKLISTED: original logic — refresh when due or missing.
+        const hasFreshDue = reputation && reputation.nextCheckDue
+                          && reputation.nextCheckDue > new Date();
+        if (hasFreshDue) continue;
 
-        if (reputation.isBlacklisted) {
-          // Skip blacklisted DIDs
-          return false;
-        }
-
-        if (!reputation.nextCheckDue) {
-          // No scheduled check time, probably needs checking
-          return true;
-        }
-
-        // Check if it's time for the next check
-        return reputation.nextCheckDue <= new Date();
-      });
-
+        // If blacklisted with no nextCheckDue at all (legacy data), schedule
+        // it for re-check now (we want to know if it has recovered).
+        didsNeedingCheck.push(did);
+        if (didsNeedingCheck.length >= this.config.maxDidsPerRun) break;
+      }
       return didsNeedingCheck;
 
     } catch (error) {
@@ -297,12 +277,12 @@ class BackgroundScraperService {
   /**
    * Get service statistics
    */
-  getStats() {
+  async getStats() {
     return {
       ...this.stats,
       isRunning: this.isRunning,
       config: this.config,
-      proxyService: crawl4aiService.getProxyStats()
+      proxyService: await crawl4aiService.getProxyStats()
     };
   }
 

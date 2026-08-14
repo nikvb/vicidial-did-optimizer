@@ -29,13 +29,20 @@ const userSchema = new mongoose.Schema({
   },
   role: {
     type: String,
-    enum: ['ADMIN', 'CLIENT'],
+    enum: ['ADMIN', 'RESELLER', 'CLIENT'],
     default: 'CLIENT'
   },
   tenant: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Tenant',
-    required: true
+    // RESELLER users belong to a Reseller, not a single Tenant.
+    required: function() { return this.role !== 'RESELLER'; }
+  },
+  resellerId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Reseller',
+    default: null,
+    index: true
   },
   googleId: {
     type: String,

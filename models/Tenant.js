@@ -26,11 +26,21 @@ const tenantSchema = new mongoose.Schema({
     type: Boolean,
     default: true
   },
+  resellerId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Reseller',
+    default: null,
+    index: true
+  },
   subscription: {
     plan: {
+      // payg = pay-as-you-go (stepped curve, default for everyone)
+      // annual = curve charged 12 months upfront for the price of 10
+      // enterprise = hand-priced (uses subscription.perDidPricing.customRate)
+      // basic/professional kept for legacy DB rows; treated as 'payg' at billing time.
       type: String,
-      enum: ['basic', 'professional', 'enterprise'],
-      default: 'basic'
+      enum: ['payg', 'annual', 'enterprise', 'basic', 'professional'],
+      default: 'payg'
     },
     status: {
       type: String,
@@ -154,6 +164,60 @@ const tenantSchema = new mongoose.Schema({
       default: 100,
       min: 1,
       max: 10000
+    },
+    mlSelector: {
+      enabled: {
+        type: Boolean,
+        default: false
+      },
+      controlBucketPct: {
+        type: Number,
+        default: 5,
+        min: 0,
+        max: 100
+      },
+      modelVersion: {
+        type: String,
+        default: null
+      },
+      shadowOnly: {
+        type: Boolean,
+        default: true
+      }
+    },
+    // ── FAS Probe Budget ─────────────────────────────────────────────────
+    // After a DID's 7-day FAS rest expires, the graduation cron moves it
+    // into probation: the selector can pick it but is capped to this budget
+    // over the probe window (24h). The grad cron then measures the resulting
+    // FAS rate and either releases the DID or re-rests with an escalating
+    // window. After `maxProbeAttempts` failed cycles the DID is permanently
+    // burned (set to a 100-year rest).
+    probeBudget: {
+      enabled: {
+        type: Boolean,
+        default: true
+      },
+      callsPerWindow: {
+        type: Number,
+        default: 30,
+        min: 10,
+        max: 200
+      },
+      maxProbeAttempts: {
+        type: Number,
+        default: 3,
+        min: 1,
+        max: 10
+      },
+      // FAS rate (0..1) above which probe fails. If null, the grad cron
+      // falls back to the tenant's MAX(p90*1.5, 0.02) baseline (same rule
+      // as fas_rest_tagger).
+      failThreshold: {
+        type: Number,
+        default: null,
+        min: 0,
+        max: 1
+      }
     }
   },
   apiKeys: [{
@@ -273,6 +337,31 @@ const tenantSchema = new mongoose.Schema({
     usedDidsInCycle: [{
       type: String
     }]
+  },
+  // ── Free Caller Registry (FCR) profile ────────────────────────────────
+  // Business profile a customer pastes into the FCR submission form at
+  // https://www.freecallerregistry.com. We store it once so they don't
+  // re-enter it every batch. We never submit on their behalf — the customer
+  // copies these fields into the FCR HTML form along with the .txt file we
+  // generate.
+  fcrProfile: {
+    businessName: String,
+    address: {
+      street: String,
+      city: String,
+      state: String,
+      zip: String
+    },
+    website: String,
+    contact: {
+      name: String,
+      phone: String,
+      email: String
+    },
+    callPurpose: String,
+    monthlyCallVolume: Number,
+    configuredAt: Date,
+    updatedAt: Date
   }
 }, {
   timestamps: true,
@@ -354,18 +443,15 @@ tenantSchema.statics.findByDomain = function(domain) {
   return this.findOne({ domain, isActive: true });
 };
 
-// Pre-save middleware to update limits based on plan
+// Pre-save: PAYG/annual/enterprise all share generous limits — pricing is
+// per-DID, not gated by plan tier. We only auto-bump limits if migrating off
+// a legacy basic/professional plan, never auto-shrink.
 tenantSchema.pre('save', function(next) {
   if (this.isModified('subscription.plan')) {
-    const limits = {
-      basic: { maxUsers: 5, maxDIDs: 250, maxConcurrentCalls: 10, apiCallsPerMonth: 10000 },
-      professional: { maxUsers: 25, maxDIDs: 1000, maxConcurrentCalls: 100, apiCallsPerMonth: 100000 },
-      enterprise: { maxUsers: 100, maxDIDs: 999999, maxConcurrentCalls: 999999, apiCallsPerMonth: 999999 }
-    };
-
-    const planLimits = limits[this.subscription.plan];
-    if (planLimits) {
-      Object.assign(this.limits, planLimits);
+    const newPlanLimits = { maxUsers: 100, maxDIDs: 999999, maxConcurrentCalls: 999999, apiCallsPerMonth: 999999 };
+    const newPlans = ['payg', 'annual', 'enterprise'];
+    if (newPlans.includes(this.subscription.plan)) {
+      Object.assign(this.limits, newPlanLimits);
     }
   }
   next();

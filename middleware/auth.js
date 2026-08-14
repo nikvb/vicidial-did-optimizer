@@ -44,18 +44,9 @@ export const authenticate = async (req, res, next) => {
       });
     }
 
-    // Check if email is verified
-    if (!user.isEmailVerified) {
-      console.log('🔐 AUTH MIDDLEWARE - Email not verified');
-      return res.status(403).json({
-        success: false,
-        message: 'Email verification required. Please check your email and verify your account before accessing the dashboard.',
-        requiresEmailVerification: true
-      });
-    }
-
-    // Check if tenant is active
-    if (!user.tenant || !user.tenant.isActive) {
+    // Check if tenant is active. RESELLER users aren't bound to a single tenant —
+    // their scope is the Reseller record (and the client tenants under it).
+    if (user.role !== 'RESELLER' && (!user.tenant || !user.tenant.isActive)) {
       console.log('🔐 AUTH MIDDLEWARE - Tenant not found or inactive');
       return res.status(403).json({
         success: false,
@@ -90,6 +81,24 @@ export const authenticate = async (req, res, next) => {
       message: 'Authentication error'
     });
   }
+};
+
+// Middleware to check if user has reseller role. Attaches req.resellerId
+// (string) and req.resellerScope (a Mongo filter that limits queries to the
+// caller's client tenants).
+export const requireReseller = (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({ success: false, message: 'Authentication required' });
+  }
+  if (req.user.role !== 'RESELLER') {
+    return res.status(403).json({ success: false, message: 'Reseller access required' });
+  }
+  if (!req.user.resellerId) {
+    return res.status(403).json({ success: false, message: 'No reseller association on user' });
+  }
+  req.resellerId = req.user.resellerId.toString();
+  req.resellerScope = { resellerId: req.user.resellerId };
+  next();
 };
 
 // Middleware to check if user has admin role
@@ -294,7 +303,7 @@ export const optionalAuth = async (req, res, next) => {
       .populate('tenant')
       .select('-password');
 
-    if (user && user.isActive && user.isEmailVerified && user.tenant && user.tenant.isActive) {
+    if (user && user.isActive && user.tenant && user.tenant.isActive) {
       req.user = user;
     }
 

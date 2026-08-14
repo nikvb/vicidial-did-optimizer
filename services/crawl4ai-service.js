@@ -9,7 +9,7 @@ const __dirname = path.dirname(__filename);
 
 class Crawl4AIService {
   constructor() {
-    this.pythonScript = path.join(__dirname, '..', 'scripts', 'enhanced_openrouter_scraper.py');
+    this.pythonScript = path.join(__dirname, '..', 'scripts', 'fast_robokiller_scraper.py');
     this.isReady = false;
     this.init();
   }
@@ -227,15 +227,15 @@ if __name__ == "__main__":
     await fs.chmod(this.pythonScript, '755');
   }
 
-  async scrapeRoboKillerData(phoneNumber, useProxy = true) {
+  async scrapeRoboKillerData(phoneNumber, useProxy = true, proxyOverride = null) {
     if (!this.isReady) {
       throw new Error('Crawl4AI service not ready');
     }
 
-    let proxy = null;
-    let proxyId = null;
+    let proxy = proxyOverride || null;
+    let proxyId = proxy ? proxy.id : null;
 
-    if (useProxy) {
+    if (useProxy && !proxy) {
       try {
         proxy = await webshareProxyService.getRandomProxy();
         proxyId = proxy.id;
@@ -408,45 +408,94 @@ if __name__ == "__main__":
   }
 
   async batchScrape(phoneNumbers, options = {}) {
-    const { batchSize = 3, delayMs = 2000, maxRetries = 2 } = options;
+    const { batchSize = 20, delayMs = 500, maxRetries = 2 } = options;
     const results = [];
 
     for (let i = 0; i < phoneNumbers.length; i += batchSize) {
       const batch = phoneNumbers.slice(i, i + batchSize);
-      console.log(`🔄 Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(phoneNumbers.length/batchSize)}`);
+      const batchNum = Math.floor(i/batchSize) + 1;
+      const totalBatches = Math.ceil(phoneNumbers.length/batchSize);
+      console.log(`🔄 Processing batch ${batchNum}/${totalBatches} (${batch.length} DIDs)`);
 
-      const batchPromises = batch.map(async (phoneNumber) => {
-        let lastError;
+      // Get one proxy for the whole batch
+      let batchProxy = null;
+      try {
+        batchProxy = await webshareProxyService.getRandomProxy();
+        console.log(`🌐 Batch proxy: ${batchProxy.country}/${batchProxy.city} - ${batchProxy.host}:${batchProxy.port}`);
+      } catch (error) {
+        console.warn('⚠️ No proxy available for batch, running direct');
+      }
 
-        for (let retry = 0; retry <= maxRetries; retry++) {
-          try {
-            if (retry > 0) {
-              console.log(`🔄 Retry ${retry}/${maxRetries} for ${phoneNumber}`);
-              await new Promise(resolve => setTimeout(resolve, 1000 * retry));
-            }
+      let batchResults = await this.runBatchProcess(batch, batchProxy);
 
-            const result = await this.scrapeRoboKillerData(phoneNumber);
-            return { phoneNumber, success: true, data: result, retry };
-          } catch (error) {
-            lastError = error;
-            console.warn(`⚠️ Attempt ${retry + 1} failed for ${phoneNumber}:`, error.message);
-          }
+      // Check for blocked results and retry with new proxy
+      const blocked = batchResults.filter(r => r.data?.is_blocked);
+      if (blocked.length > 0 && maxRetries > 0) {
+        console.warn(`🚫 ${blocked.length} DIDs blocked, switching proxy and retrying`);
+        if (batchProxy) webshareProxyService.markProxyError(batchProxy.id);
+        let retryProxy = null;
+        try { retryProxy = await webshareProxyService.getRandomProxy(); } catch {}
+        const blockedNumbers = blocked.map(r => r.phoneNumber);
+        const retryResults = await this.runBatchProcess(blockedNumbers, retryProxy);
+        // Merge: replace blocked results with retry results
+        for (const retry of retryResults) {
+          const idx = batchResults.findIndex(r => r.phoneNumber === retry.phoneNumber);
+          if (idx !== -1) batchResults[idx] = retry;
         }
+      }
 
-        return { phoneNumber, success: false, error: lastError.message, retry: maxRetries };
-      });
-
-      const batchResults = await Promise.all(batchPromises);
       results.push(...batchResults);
 
-      // Add delay between batches to avoid rate limiting
       if (i + batchSize < phoneNumbers.length) {
-        console.log(`⏳ Waiting ${delayMs}ms before next batch...`);
         await new Promise(resolve => setTimeout(resolve, delayMs));
       }
     }
 
     return results;
+  }
+
+  async runBatchProcess(phoneNumbers, proxy = null) {
+    return new Promise((resolve) => {
+      const args = [this.pythonScript, `--numbers=${phoneNumbers.join(',')}`, `--concurrency=${phoneNumbers.length}`];
+      if (proxy) args.push(`--proxy=${proxy.proxyUrl}`);
+
+      let stdout = '';
+      let stderr = '';
+      let resolved = false;
+
+      const python = spawn('python3', args, { env: { ...process.env } });
+
+      python.stdout.on('data', d => { stdout += d.toString(); });
+      python.stderr.on('data', d => { stderr += d.toString(); });
+
+      const timeoutId = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        python.kill('SIGTERM');
+        console.warn(`⚠️ Batch timeout for ${phoneNumbers.length} DIDs`);
+        resolve(phoneNumbers.map(p => ({ phoneNumber: p, success: false, data: { success: false, error: 'timeout' } })));
+      }, 60000);
+
+      python.on('close', () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeoutId);
+        try {
+          const lines = stdout.split('\n');
+          const jsonLine = lines.find(l => l.startsWith('{') && l.includes('"batch"'));
+          if (!jsonLine) throw new Error('No batch JSON in output');
+          const parsed = JSON.parse(jsonLine);
+          resolve(parsed.results.map(r => ({
+            phoneNumber: r.phone,
+            success: r.success,
+            data: r
+          })));
+        } catch (e) {
+          console.error('Batch parse error:', e.message, stdout.substring(0, 200));
+          resolve(phoneNumbers.map(p => ({ phoneNumber: p, success: false, data: { success: false, error: e.message } })));
+        }
+      });
+    });
   }
 
   async healthCheck() {

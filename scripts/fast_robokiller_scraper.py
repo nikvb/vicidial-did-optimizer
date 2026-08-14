@@ -278,13 +278,28 @@ async def main():
         print(json.dumps({"success": False, "error": "Phone number required"}))
         return
 
-    phone_number = sys.argv[1]
     proxy_url = None
+    concurrency = 20
 
-    for arg in sys.argv[2:]:
+    for arg in sys.argv[1:]:
         if arg.startswith('--proxy='):
             proxy_url = arg.split('=', 1)[1]
-            break
+        elif arg.startswith('--concurrency='):
+            concurrency = int(arg.split('=', 1)[1])
+
+    # Batch mode: --numbers=num1,num2,num3,...
+    numbers_arg = next((a for a in sys.argv[1:] if a.startswith('--numbers=')), None)
+    if numbers_arg:
+        phone_numbers = [n.strip() for n in numbers_arg.split('=', 1)[1].split(',') if n.strip()]
+        results = await scrape_batch(phone_numbers, proxy=proxy_url, concurrency=concurrency)
+        print(json.dumps({"batch": True, "results": results, "count": len(results)}))
+        return
+
+    # Single mode
+    phone_number = sys.argv[1]
+    if phone_number.startswith('--'):
+        print(json.dumps({"success": False, "error": "Phone number required"}))
+        return
 
     connector = aiohttp.TCPConnector(limit=1)
     timeout = aiohttp.ClientTimeout(total=15)

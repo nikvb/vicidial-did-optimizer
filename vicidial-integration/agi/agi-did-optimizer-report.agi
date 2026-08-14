@@ -39,36 +39,144 @@ my %vici_db = read_astguiclient_conf();
 
 ##############################################################################
 # Step 1: Collect Asterisk channel data
+#
+# We prefer dialplan-supplied args (ARGV) over channel variable lookups.
+# Asterisk evaluates ${CALLERID(num)}/${DIALSTATUS}/etc. in the dialplan on
+# the hanging-up channel and passes them into the AGI — this sidesteps the
+# channel variable inheritance problem on Local/;1 vs ;2 channels that
+# VICIdial's own FastAGI_log.pl also avoids.
+#
+# Expected dialplan line (10 args):
+#   exten => h,n,AGI(agi-did-optimizer-report.agi,
+#     ${CALLERID(num)},${DIALSTATUS},${ANSWEREDTIME},${HANGUPCAUSE},
+#     ${CHANNEL(uniqueid)},${EXTEN},
+#     ${CAMPCUST},${DIALEDTIME},${CHANNEL(hangupsource)},${CHANNEL(linkedid)})
 ##############################################################################
+
+my (
+    $arg_did,         # 1. ${CALLERID(num)}               — selected DID
+    $arg_dialstatus,  # 2. ${DIALSTATUS}                  — ANSWER|BUSY|NOANSWER|...
+    $arg_answered,    # 3. ${ANSWEREDTIME}                — seconds talked
+    $arg_hangup,      # 4. ${HANGUPCAUSE}                 — Q.850 code
+    $arg_uniqueid,    # 5. ${CHANNEL(uniqueid)}           — correlation key
+    $arg_exten,       # 6. ${EXTEN}                       — dialed extension ("h" inside h)
+    $arg_campcust,    # 7. ${CAMPCUST}                    — VICIdial campaign
+    $arg_dialedtime,  # 8. ${DIALEDTIME}                  — ring + talk seconds
+    $arg_hupsource,   # 9. ${CHANNEL(hangupsource)}       — caller | dialplan | peer
+    $arg_linkedid,    #10. ${CHANNEL(linkedid)}           — bridged-call uniqueid
+    $arg_cdrdst,      #11. ${CDR(dst)}                    — CDR destination (customer phone!)
+    $arg_dnid,        #12. ${CALLERID(dnid)}              — dialed number ID
+    $arg_peernumber,  #13. ${CHANNEL(dialedpeernumber)}   — what Dial() dialed
+    $arg_amdstatus,   #14. ${AMDSTATUS}                   — HUMAN|MACHINE|NOTSURE|HANGUP
+    $arg_amdcause,    #15. ${AMDCAUSE}                    — "<class>-<silence>-<voice>-<duration>"
+    $arg_channel,     #16. ${CHANNEL}                     — e.g. Local/93241NNNNNNNNNN@default-xxx;2
+) = @ARGV;
+
+# Normalize: Asterisk passes empty unset vars as "" but some surfaces produce
+# "(null)" or literal "unknown". Treat all of those as absent.
+sub _clean {
+    my $v = shift;
+    return '' unless defined $v;
+    return '' if $v =~ /^\s*$|^\(null\)$|^unknown$/i;
+    return $v;
+}
+$_ = _clean($_) for ($arg_did, $arg_dialstatus, $arg_answered, $arg_hangup,
+                     $arg_uniqueid, $arg_exten, $arg_campcust, $arg_dialedtime,
+                     $arg_hupsource, $arg_linkedid, $arg_cdrdst, $arg_dnid,
+                     $arg_peernumber, $arg_amdstatus, $arg_amdcause, $arg_channel);
+
+# Parse AMD timing out of AMDCAUSE. Format per Asterisk docs:
+#   "<CLASS>-<silenceDuration>-<voiceDuration>-<totalDuration>"
+# e.g. "HUMAN-1200-2500-3700" → 3.7s decision made after detecting 2.5s voice.
+my ($amd_silence_ms, $amd_voice_ms, $amd_total_ms) = (0, 0, 0);
+if (defined $arg_amdcause && $arg_amdcause =~ /^[A-Z]+-(\d+)-(\d+)-(\d+)/i) {
+    ($amd_silence_ms, $amd_voice_ms, $amd_total_ms) = ($1, $2, $3);
+}
+
+# Find the customer phone without depending on a vicidial_log row. In the
+# outbound leg the original dialed number is preserved in several places that
+# survive to `h`; try each in order. Reject non-numeric junk (e.g. "h").
+sub _looks_like_phone {
+    my $v = shift;
+    return 0 unless defined $v && length $v;
+    my $d = $v; $d =~ s/\D//g;
+    return length($d) >= 7;
+}
+my $channel_customer_phone = '';
+for my $candidate ($arg_cdrdst, $arg_peernumber, $arg_dnid) {
+    next unless _looks_like_phone($candidate);
+    my $digits = $candidate; $digits =~ s/\D//g;
+    $digits =~ s/^1// if length($digits) == 11;
+    $channel_customer_phone = $digits;
+    last;
+}
+
+# Last-resort fallback: parse customer phone from the channel name itself.
+# VICIdial outbound Local channels look like
+#   "Local/93241NNNNNNNNNN@default-xxxxx;2" or
+#   "Local/93241NNNNNNNNNN@default-xxxxx;1"
+# where "9" is the dial prefix, "324" is a VICIdial code, and the rest is the
+# customer number (10 or 11 digit NANP). Pull the trailing 10 digits.
+if (!$channel_customer_phone && $arg_channel && $arg_channel =~ m{^Local/9\d{3}(1?\d{10})}) {
+    my $extracted = $1;
+    $extracted =~ s/^1// if length($extracted) == 11;
+    $channel_customer_phone = $extracted;
+}
 
 my %call_data;
 
-$call_data{uniqueid}     = $input{uniqueid}  || '';
-$call_data{channel}      = $input{channel}   || '';
-$call_data{extension}    = $input{extension} || '';
-$call_data{callerid}     = $input{callerid}  || '';
-$call_data{dialStatus}   = $AGI->get_variable('DIALSTATUS')   || 'UNKNOWN';
-$call_data{answeredTime} = $AGI->get_variable('ANSWEREDTIME') || '0';
-$call_data{dialedTime}   = $AGI->get_variable('DIALEDTIME')   || '0';
-$call_data{hangupCause}  = $AGI->get_variable('HANGUPCAUSE')  || '';
-$call_data{optimizerDid} = $AGI->get_variable('OPTIMIZER_DID')    || '';
-$call_data{campaignId}   = $AGI->get_variable('CAMPAIGN_ID') || $AGI->get_variable('CAMPAIGN') || 'DEFAULT';
+$call_data{uniqueid}     = $arg_uniqueid   || $input{uniqueid}  || '';
+$call_data{linkedid}     = $arg_linkedid   || '';
+$call_data{channel}      = $input{channel} || '';
+$call_data{extension}    = $arg_exten      || $input{extension} || '';
+$call_data{callerid}     = $input{callerid} || '';
+$call_data{dialStatus}   = $arg_dialstatus || $AGI->get_variable('DIALSTATUS')   || 'UNKNOWN';
+$call_data{answeredTime} = $arg_answered   || $AGI->get_variable('ANSWEREDTIME') || '0';
+$call_data{dialedTime}   = $arg_dialedtime || $AGI->get_variable('DIALEDTIME')   || '0';
+$call_data{ringTime}     = ($call_data{dialedTime} || 0) - ($call_data{answeredTime} || 0);
+$call_data{ringTime}     = 0 if $call_data{ringTime} < 0;
+$call_data{hangupCause}  = $arg_hangup     || $AGI->get_variable('HANGUPCAUSE')  || '';
+$call_data{hangupSource} = $arg_hupsource  || '';
+$call_data{optimizerDid} = $arg_did        || $AGI->get_variable('OPTIMIZER_DID') || '';
+$call_data{campaignId}   = $arg_campcust
+                         || $AGI->get_variable('CAMPCUST')
+                         || $AGI->get_variable('CAMPAIGN_ID')
+                         || $AGI->get_variable('CAMPAIGN')
+                         || 'DEFAULT';
 
-# Clean dialed number (strip prefix)
+# In the 'h' (hangup) extension, ${EXTEN} is literally "h" — not a phone
+# number. Only treat ${EXTEN} as a dialed number if it's mostly digits and
+# at least 7 chars long. Otherwise leave customerPhone empty and rely on
+# the vicidial_log/vicidial_list DB lookup below.
 my $dialed = $call_data{extension};
-if ($config{dial_prefixes}) {
-    my @prefixes = split(/\s*,\s*/, $config{dial_prefixes});
-    for my $prefix (sort { length($b) <=> length($a) } @prefixes) {
-        if ($dialed =~ s/^$prefix//) { last; }
+if (defined $dialed && $dialed =~ /^[\d+\*\#]{7,}$/) {
+    if ($config{dial_prefixes}) {
+        my @prefixes = split(/\s*,\s*/, $config{dial_prefixes});
+        for my $prefix (sort { length($b) <=> length($a) } @prefixes) {
+            if ($dialed =~ s/^$prefix//) { last; }
+        }
+    } else {
+        $dialed =~ s/^9//;
     }
+    $call_data{customerPhone} = $dialed;
 } else {
-    $dialed =~ s/^9//;
+    $call_data{customerPhone} = '';
 }
-$call_data{customerPhone} = $dialed;
 
 ##############################################################################
 # Step 2: Fast VICIdial DB lookup (uniqueid = PK, <1ms)
+#
+# We only report legs that used an optimizer DID — filters out agent-leg / IVR
+# / internal hangups that would otherwise double-count every call.
 ##############################################################################
+
+if ($call_data{dialStatus} eq 'UNKNOWN') {
+    # No Dial() ran on this channel — it's the ;1 side of a Local channel,
+    # an agent leg, or an IVR/internal leg. Skipping these prevents every
+    # call from double-reporting (agent leg + outbound leg).
+    log_msg("SKIP uniqueid=$call_data{uniqueid} — DIALSTATUS=UNKNOWN (non-outbound leg)");
+    exit 0;
+}
 
 my %vici_data;
 
@@ -84,8 +192,9 @@ if ($call_data{uniqueid} && $vici_db{db_host}) {
         });
 
         if ($dbh) {
-            # Query vicidial_log by uniqueid (PRIMARY KEY — instant)
-            # Only today's partition to be safe
+            # Query vicidial_log by uniqueid (PRIMARY KEY — instant).
+            # Retry once after 500ms since VICIdial's post-dial process may
+            # still be writing this row when we hit the h extension.
             my $sth = $dbh->prepare(
                 "SELECT user, lead_id, list_id, campaign_id, length_in_sec, "
               . "phone_number, called_count, term_reason "
@@ -95,6 +204,11 @@ if ($call_data{uniqueid} && $vici_db{db_host}) {
             );
             $sth->execute($call_data{uniqueid});
             my $row = $sth->fetchrow_hashref;
+            if (!$row) {
+                select(undef, undef, undef, 0.5);   # 500ms pause
+                $sth->execute($call_data{uniqueid});
+                $row = $sth->fetchrow_hashref;
+            }
 
             if ($row) {
                 $vici_data{agentId}       = $row->{user}          || '';
@@ -131,8 +245,187 @@ if ($call_data{uniqueid} && $vici_db{db_host}) {
             } else {
                 log_msg("DB: no vicidial_log row for uniqueid=$call_data{uniqueid}");
             }
-
             $sth->finish;
+
+            # Enrichment fallback: if we don't have a vicidial_log row but we
+            # do have a customer phone from the channel (CDR/dnid/peernumber),
+            # look up state/city/zip directly in vicidial_list by phone_number.
+            # Also try vicidial_closer_log for agent-handled calls.
+            if (!$vici_data{customerState} && $channel_customer_phone) {
+                my $sth3 = $dbh->prepare(
+                    "SELECT state, city, postal_code, lead_id, list_id "
+                  . "FROM vicidial_list "
+                  . "WHERE phone_number = ? "
+                  . "ORDER BY modify_date DESC LIMIT 1"
+                );
+                $sth3->execute($channel_customer_phone);
+                my $lead = $sth3->fetchrow_hashref;
+                if ($lead) {
+                    $vici_data{customerState} ||= $lead->{state}       || '';
+                    $vici_data{customerCity}  ||= $lead->{city}        || '';
+                    $vici_data{customerZip}   ||= $lead->{postal_code} || '';
+                    $vici_data{leadId}        ||= $lead->{lead_id}     || '';
+                    $vici_data{listId}        ||= $lead->{list_id}     || '';
+                    log_msg("LIST: phone=$channel_customer_phone state=$vici_data{customerState} city=$vici_data{customerCity} lead=$vici_data{leadId}");
+                }
+                $sth3->finish;
+            }
+
+            # Also try vicidial_closer_log by uniqueid for agent-handled calls.
+            if (!$vici_data{agentId} || !$vici_data{talkTime}) {
+                my $sth4 = $dbh->prepare(
+                    "SELECT user, lead_id, list_id, campaign_id, length_in_sec, "
+                  . "phone_number, called_count, term_reason "
+                  . "FROM vicidial_closer_log "
+                  . "WHERE uniqueid = ? AND call_date >= CURDATE() LIMIT 1"
+                );
+                $sth4->execute($call_data{uniqueid});
+                my $row = $sth4->fetchrow_hashref;
+                if ($row) {
+                    $vici_data{agentId}       ||= $row->{user}          || '';
+                    $vici_data{leadId}        ||= $row->{lead_id}       || '';
+                    $vici_data{listId}        ||= $row->{list_id}       || '';
+                    $vici_data{campaignId}    ||= $row->{campaign_id}   || '';
+                    $vici_data{talkTime}      ||= $row->{length_in_sec} || 0;
+                    $vici_data{customerPhone} ||= $row->{phone_number}  || '';
+                    $vici_data{calledCount}   ||= $row->{called_count}  || 0;
+                    $vici_data{termReason}    ||= $row->{term_reason}   || '';
+                    log_msg("CLOSER: uniqueid=$call_data{uniqueid} agent=$vici_data{agentId} talk=$vici_data{talkTime}s");
+                }
+                $sth4->finish;
+            }
+
+            # vicidial_carrier_log (PK on uniqueid) — SIP-level disposition
+            # data that's always populated even when vicidial_log isn't: real
+            # dial/answer timings, SIP hangup cause + reason string, DID, lead.
+            my $sth5 = $dbh->prepare(
+                "SELECT dial_time, answered_time, sip_hangup_cause, "
+              . "sip_hangup_reason, hangup_cause, dialstatus, caller_code, "
+              . "lead_id, channel "
+              . "FROM vicidial_carrier_log WHERE uniqueid = ? LIMIT 1"
+            );
+            $sth5->execute($call_data{uniqueid});
+            my $cl = $sth5->fetchrow_hashref;
+            if ($cl) {
+                $vici_data{dialTime}        = $cl->{dial_time}        // 0;
+                $vici_data{answeredTime2}   = $cl->{answered_time}    // 0;
+                $vici_data{sipHangupCause}  = $cl->{sip_hangup_cause} // 0;
+                $vici_data{sipHangupReason} = $cl->{sip_hangup_reason} || '';
+                $vici_data{dialstatus}      = $cl->{dialstatus}       || '';
+                $vici_data{leadId}          ||= $cl->{lead_id}        || '';
+                $vici_data{callerCode}      = $cl->{caller_code}      || '';
+                log_msg("CARRIER: sip_cause=$vici_data{sipHangupCause} reason=$vici_data{sipHangupReason} dial=${\ ($vici_data{dialTime} // 0)}s");
+            }
+            $sth5->finish;
+
+            # === KEY FIX ===
+            # vicidial_log/closer_log are PK'd on the ANSWER-leg uniqueid (channel
+            # +4 from our outbound). Direct uniqueid lookup above almost always
+            # misses. But vicidial_carrier_log IS PK'd on our outbound uniqueid,
+            # so we have a reliable lead_id from it. Use lead_id + recent-call
+            # window to find the answer-leg vicidial_log row.
+            if ($vici_data{leadId} && (!$vici_data{talkTime} || !$vici_data{termReason})) {
+                my $sth_vl = $dbh->prepare(
+                    "SELECT uniqueid AS answer_uid, user, list_id, campaign_id, "
+                  . "length_in_sec, called_count, term_reason "
+                  . "FROM vicidial_log "
+                  . "WHERE lead_id = ? AND call_date >= NOW() - INTERVAL 2 MINUTE "
+                  . "ORDER BY call_date DESC LIMIT 1"
+                );
+                $sth_vl->execute($vici_data{leadId});
+                my $vl = $sth_vl->fetchrow_hashref;
+                $sth_vl->finish;
+                if ($vl) {
+                    $vici_data{answerUid}    = $vl->{answer_uid}    || '';
+                    $vici_data{agentId}      ||= $vl->{user}        || '';
+                    $vici_data{listId}       ||= $vl->{list_id}     || '';
+                    $vici_data{campaignId}   ||= $vl->{campaign_id} || '';
+                    $vici_data{talkTime}     ||= $vl->{length_in_sec} || 0;
+                    $vici_data{calledCount}  ||= $vl->{called_count}  || 0;
+                    $vici_data{termReason}   ||= $vl->{term_reason}   || '';
+                    log_msg("VLOG-BY-LEAD: answer_uid=$vici_data{answerUid} talk=$vici_data{talkTime}s term=$vici_data{termReason}");
+                }
+            }
+
+            # vicidial_amd_log (indexed on lead_id) — AI AMD from extension
+            # 8370's EAGI fires when the call connects, long before h. Single
+            # query, no retry needed. The 2-minute call_date bound makes sure
+            # we don't pick up a stale AMD row from a previous call to this
+            # same lead.
+            if ($vici_data{leadId}) {
+                my $sth_amd = $dbh->prepare(
+                    "SELECT AMDSTATUS, AMDCAUSE, AMDRESPONSE, run_time, AMDSTATS "
+                  . "FROM vicidial_amd_log "
+                  . "WHERE lead_id = ? AND call_date >= NOW() - INTERVAL 2 MINUTE "
+                  . "ORDER BY call_date DESC LIMIT 1"
+                );
+                $sth_amd->execute($vici_data{leadId});
+                my $amd = $sth_amd->fetchrow_hashref;
+                $sth_amd->finish;
+                if ($amd) {
+                    $vici_data{amdStatus}    = $amd->{AMDSTATUS}    || '';
+                    $vici_data{amdCause}     = $amd->{AMDCAUSE}     || '';
+                    $vici_data{amdResponse}  = $amd->{AMDRESPONSE}  || '';
+                    $vici_data{amdRunTime}   = $amd->{run_time}     || '';
+                    $vici_data{amdStats}     = $amd->{AMDSTATS}     || '';
+                    # Substatus = first hyphen token of AMDCAUSE (e.g. VOICEMAILAMD,
+                    # GVOICEAMD, FASV2AMD). Critical sub-category for ML training.
+                    my $cause = $vici_data{amdCause} || '';
+                    my ($sub) = split /-/, $cause, 2;
+                    $vici_data{amdSubstatus} = $sub || '';
+                    log_msg("AMD-DB: status=$vici_data{amdStatus} sub=$vici_data{amdSubstatus} cause=$vici_data{amdCause}");
+                }
+            }
+
+            # If carrier_log gave us a lead_id but we still don't have customer
+            # phone/state, hit vicidial_list by lead_id. This recovers the ~15%
+            # of answered calls where vicidial_log isn't finalized, carrier_log
+            # has lead_id, but the dialplan channel fallbacks all came up empty.
+            if ($vici_data{leadId} && !$vici_data{customerPhone}) {
+                my $sth_lead = $dbh->prepare(
+                    "SELECT state, city, postal_code, phone_number "
+                  . "FROM vicidial_list WHERE lead_id = ? LIMIT 1"
+                );
+                $sth_lead->execute($vici_data{leadId});
+                my $ld = $sth_lead->fetchrow_hashref;
+                if ($ld) {
+                    $vici_data{customerPhone} ||= $ld->{phone_number} || '';
+                    $vici_data{customerState} ||= $ld->{state}        || '';
+                    $vici_data{customerCity}  ||= $ld->{city}         || '';
+                    $vici_data{customerZip}   ||= $ld->{postal_code}  || '';
+                    log_msg("LEAD-BY-ID: lead=$vici_data{leadId} phone=$vici_data{customerPhone}");
+                }
+                $sth_lead->finish;
+            }
+
+            # call_log (PK on uniqueid) — Asterisk CEL-style channel data.
+            # number_dialed often contains the customer number even when
+            # vicidial_log hasn't been written yet.
+            my $sth6 = $dbh->prepare(
+                "SELECT number_dialed, start_epoch, end_epoch, length_in_sec, "
+              . "channel, type, caller_code "
+              . "FROM call_log WHERE uniqueid = ? LIMIT 1"
+            );
+            $sth6->execute($call_data{uniqueid});
+            my $cg = $sth6->fetchrow_hashref;
+            if ($cg) {
+                $vici_data{startEpoch}    = $cg->{start_epoch}    // 0;
+                $vici_data{endEpoch}      = $cg->{end_epoch}      // 0;
+                $vici_data{channelType}   = $cg->{type}           || '';
+                # Parse customer phone out of number_dialed if channel fallbacks missed.
+                # VICIdial pattern: "9<3-digit prefix><10-or-11-digit number>".
+                if (!$vici_data{customerPhone} && !$channel_customer_phone) {
+                    my $nd = $cg->{number_dialed} || '';
+                    if ($nd =~ /^9\d{3}(1?\d{10})$/) {
+                        my $extracted = $1;
+                        $extracted =~ s/^1// if length($extracted) == 11;
+                        $channel_customer_phone = $extracted;
+                        log_msg("NUMDIAL: parsed customer=$extracted from number_dialed=$nd");
+                    }
+                }
+            }
+            $sth6->finish;
+
             $dbh->disconnect;
         } else {
             log_msg("DB: connect failed — " . (DBI->errstr || 'unknown error'));
@@ -163,27 +456,63 @@ my $result = $status_map{uc($call_data{dialStatus})} || 'no_answer';
 
 my $payload = {
     uniqueid      => $call_data{uniqueid},
+    linkedid      => $call_data{linkedid},
+    answerUid     => $vici_data{answerUid} || '',
     phoneNumber   => $call_data{optimizerDid} || $call_data{callerid},
-    customerPhone => $vici_data{customerPhone} || $call_data{customerPhone},
+    customerPhone => $vici_data{customerPhone}
+                   || $channel_customer_phone
+                   || $call_data{customerPhone},
     campaignId    => $vici_data{campaignId}    || $call_data{campaignId},
     disposition   => $call_data{dialStatus},
     duration      => int($call_data{answeredTime}),
     dialStatus    => $call_data{dialStatus},
+    dialedTime    => int($call_data{dialedTime} || 0),
+    ringTime      => int($call_data{ringTime}   || 0),
     hangupCause   => int($call_data{hangupCause} || 0),
+    hangupSource  => $call_data{hangupSource}  || '',
     agentId       => $vici_data{agentId}       || '0',
     leadId        => $vici_data{leadId}        || '',
     listId        => $vici_data{listId}        || '',
     customerState => $vici_data{customerState} || '',
     customerCity  => $vici_data{customerCity}  || '',
-    customerZip   => $vici_data{customerZip}   || '',
+    customerZip   => (($vici_data{customerZip} || '') =~ /^(\d{5})(?:-\d{4})?$/ ? $1 : ''),
     calledCount   => int($vici_data{calledCount} || $call_data{calledCount} || 0),
     talkTime      => int($vici_data{talkTime}  || 0),
+
+    # AMD signals. Prefer vicidial_amd_log DB data (AI AMD from extension
+    # 8370's EAGI script) over the outbound-leg channel vars — the EAGI runs
+    # on the Local/;2 leg, so ${AMDSTATUS} on our outbound leg is usually
+    # empty even when the AI AMD has classified the call.
+    amdStatus     => $vici_data{amdStatus}   || $arg_amdstatus || '',
+    amdSubstatus  => $vici_data{amdSubstatus} || '',
+    amdCause      => $vici_data{amdCause}    || $arg_amdcause  || '',
+    amdResponse   => $vici_data{amdResponse} || '',
+    amdRunTimeMs  => int($vici_data{amdRunTime} || 0),
+    amdStats      => $vici_data{amdStats}    || '',
+    amdSilenceMs  => int($amd_silence_ms || 0),
+    amdVoiceMs    => int($amd_voice_ms   || 0),
+    amdTotalMs    => int($amd_total_ms   || 0),
+
+    # Carrier / SIP-level data (from vicidial_carrier_log PK lookup).
+    sipHangupCause    => int($vici_data{sipHangupCause}  || 0),
+    sipHangupReason   => $vici_data{sipHangupReason}     || '',
+    dialTimeSec       => int($vici_data{dialTime}        || 0),
+    carrierAnsweredSec => int($vici_data{answeredTime2}  || 0),
+    carrierDialStatus => $vici_data{dialstatus}          || '',
+
+    # Channel name (useful for debugging leg attribution).
+    channelName   => $arg_channel || '',
+
     termReason    => $vici_data{termReason}     || '',
     timestamp     => time(),
-    source        => 'h-extension-agi-v3',
+    source        => 'h-extension-agi-v9',
 };
 
-log_msg("CALL $call_data{uniqueid}: DID=$call_data{optimizerDid} DIAL=$call_data{dialStatus} DUR=$call_data{answeredTime}s AGENT=$payload->{agentId} CAMPAIGN=$payload->{campaignId}");
+my $phone_src = $vici_data{customerPhone} ? 'db'
+              : $channel_customer_phone    ? 'chan'
+              : $call_data{customerPhone}  ? 'exten'
+              : 'none';
+log_msg("CALL $call_data{uniqueid}: DID=$call_data{optimizerDid} DIAL=$call_data{dialStatus} DUR=$call_data{answeredTime}s AGENT=$payload->{agentId} CAMPAIGN=$payload->{campaignId} CUST=$payload->{customerPhone}($phone_src)");
 
 my $api_url = $config{api_base_url};
 my $api_key = $config{api_key};

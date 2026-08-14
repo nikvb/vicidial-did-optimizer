@@ -5,7 +5,6 @@ const CampaignSchema = new mongoose.Schema({
   campaignId: {
     type: String,
     required: true,
-    unique: true,
     index: true,
     trim: true,
   },
@@ -62,12 +61,46 @@ const CampaignSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Mixed,
     default: {},
   },
+
+  // DID Pool Configuration
+  didPool: {
+    enabled: {
+      type: Boolean,
+      default: false
+    },
+    poolId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'CampaignDIDPool'
+    },
+    rotationStrategy: {
+      type: {
+        type: String,
+        enum: ['round-robin', 'least-used', 'performance-based', 'geographic'],
+        default: 'round-robin'
+      },
+      config: mongoose.Schema.Types.Mixed
+    },
+    fallback: {
+      enabled: {
+        type: Boolean,
+        default: true
+      },
+      fallbackToTenantPool: {
+        type: Boolean,
+        default: true
+      },
+      fallbackDid: {
+        type: String,
+        trim: true
+      }
+    }
+  }
 }, {
   timestamps: true,
 });
 
-// Index for tenant-specific queries
-CampaignSchema.index({ tenantId: 1, campaignId: 1 });
+// Index for tenant-specific queries (compound unique — one campaignId per tenant)
+CampaignSchema.index({ tenantId: 1, campaignId: 1 }, { unique: true });
 CampaignSchema.index({ tenantId: 1, active: 1 });
 
 const Campaign = mongoose.model('Campaign', CampaignSchema);
