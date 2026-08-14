@@ -134,7 +134,7 @@ install_system_deps() {
         # report success while installing outside @INC, which then breaks
         # "use JSON;" at AGI runtime — the exact failure this branch prevents.
         zypper --non-interactive --gpg-auto-import-keys refresh 2>/dev/null || true
-        zypper --non-interactive install --no-recommends --auto-agree-with-licenses \
+        zypper --non-interactive --gpg-auto-import-keys install --no-recommends --auto-agree-with-licenses \
             gcc make libopenssl-devel \
             perl-JSON perl-Cache-Cache perl-libwww-perl perl-LWP-Protocol-https \
             perl-IO-Socket-SSL perl-Net-SSLeay perl-URI perl-HTTP-Message \
@@ -189,7 +189,7 @@ install_perl_modules() {
         elif command -v apt-get &> /dev/null; then
             apt-get install -y cpanminus 2>/dev/null
         elif command -v zypper &> /dev/null; then
-            zypper --non-interactive install perl-App-cpanminus 2>/dev/null || \
+            zypper --non-interactive --gpg-auto-import-keys install perl-App-cpanminus 2>/dev/null || \
                 curl -L https://cpanmin.us | perl - --self-upgrade 2>/dev/null
         fi
     fi
