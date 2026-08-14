@@ -9,7 +9,11 @@
 # Usage: sudo ./install-agi.sh
 ################################################################################
 
-set -e
+# Fail-open installer: do NOT abort the whole run on a single failed command.
+# One flaky Perl module, a package-manager hiccup, or a non-zero grep should not
+# leave a VICIdial box half-installed. Each step guards its own critical errors
+# explicitly; everything else continues so the operator sees the full picture.
+set +e
 
 # Colors for output
 RED='\033[0;31m'
@@ -124,6 +128,22 @@ install_system_deps() {
         apt-get install -y build-essential libssl-dev \
             libwww-perl libnet-ssleay-perl libio-socket-ssl-perl \
             libmozilla-ca-perl cpanminus ca-certificates 2>/dev/null || true
+    elif command -v zypper &> /dev/null; then
+        # openSUSE / VICIbox (7, 11, ...). Install the Perl modules straight from
+        # OS packages so they land in the system perl @INC. cpanm on VICIbox can
+        # report success while installing outside @INC, which then breaks
+        # "use JSON;" at AGI runtime — the exact failure this branch prevents.
+        zypper --non-interactive --gpg-auto-import-keys refresh 2>/dev/null || true
+        zypper --non-interactive install --no-recommends --auto-agree-with-licenses \
+            gcc make libopenssl-devel \
+            perl-JSON perl-Cache-Cache perl-libwww-perl perl-LWP-Protocol-https \
+            perl-IO-Socket-SSL perl-Net-SSLeay perl-URI perl-HTTP-Message \
+            perl-TimeDate perl-App-cpanminus \
+            ca-certificates ca-certificates-mozilla 2>&1 \
+            | grep -viE "already installed|Nothing to do|is already" || true
+        # Mozilla::CA and Asterisk::AGI are not packaged on openSUSE; the Perl
+        # module loop below installs them via cpanm (Asterisk::AGI is normally
+        # already present from the VICIdial install).
     fi
 
     # Update CA certificates
@@ -168,13 +188,18 @@ install_perl_modules() {
                 curl -L https://cpanmin.us | perl - --self-upgrade 2>/dev/null
         elif command -v apt-get &> /dev/null; then
             apt-get install -y cpanminus 2>/dev/null
+        elif command -v zypper &> /dev/null; then
+            zypper --non-interactive install perl-App-cpanminus 2>/dev/null || \
+                curl -L https://cpanmin.us | perl - --self-upgrade 2>/dev/null
         fi
     fi
 
     for module in "${missing_modules[@]}"; do
         print_info "Installing $module..."
         if command -v cpanm &> /dev/null; then
-            if ! cpanm --notest --quiet "$module"; then
+            # Clear any local::lib env so cpanm installs into the system perl's
+            # @INC (not ~/perl5), otherwise the AGI can't load it at runtime.
+            if ! env PERL_MM_OPT= PERL_MB_OPT= cpanm --notest --quiet "$module"; then
                 print_error "Failed to install $module"
                 return 1
             fi
@@ -187,7 +212,24 @@ install_perl_modules() {
         print_step "$module installed"
     done
 
-    print_step "All Perl modules installed successfully"
+    # Final verification — every module must be loadable by the SAME perl the
+    # AGI runs under. Catches the classic VICIbox failure where a module reports
+    # "installed" but sits outside @INC (e.g. JSON.pm not found at AGI runtime).
+    local still_missing=()
+    for module in "${PERL_MODULES[@]}"; do
+        perl -M"$module" -e 1 2>/dev/null || still_missing+=("$module")
+    done
+    if [ ${#still_missing[@]} -ne 0 ]; then
+        print_error "Perl modules still not loadable by $(command -v perl): ${still_missing[*]}"
+        if command -v zypper &> /dev/null; then
+            print_info "Fix: sudo zypper install perl-JSON perl-Cache-Cache perl-libwww-perl perl-IO-Socket-SSL perl-Net-SSLeay perl-URI perl-HTTP-Message   (and: sudo cpanm ${still_missing[*]})"
+        else
+            print_info "Fix: sudo cpanm ${still_missing[*]}"
+        fi
+        return 1
+    fi
+
+    print_step "All Perl modules installed and loadable"
 }
 
 download_agi_script() {
@@ -536,9 +578,11 @@ print_next_steps() {
     echo -e "2. ${YELLOW}Configure Dialplan in VICIdial Admin${NC}"
     echo -e "   ${RED}⚠️  DO NOT edit /etc/asterisk/extensions.conf directly!${NC}"
     echo -e "   Use VICIdial Admin → Carriers → Dialplan Entry:\n"
-    echo -e "   ${BLUE}; BEFORE your Dial() command:${NC}"
+    echo -e "   ${BLUE}; BEFORE your Dial() command — sets caller ID ONLY on a real, non-default DID.${NC}"
+    echo -e "   ${BLUE}; If the optimizer returns nothing or the default, it leaves CALLERID alone${NC}"
+    echo -e "   ${BLUE}; so VICIdial's own DID selection rolls over. Fail-open, never blocks a call.${NC}"
     echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,AGI(vicidial-did-optimizer.agi)${NC}"
-    echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,Set(CALLERID(num)=\${OPTIMIZER_DID})${NC}\n"
+    echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,ExecIf(\$[\"\${OPTIMIZER_STATUS}\" = \"SUCCESS\" & \"\${OPTIMIZER_FALLBACK}\" != \"YES\"]?Set(CALLERID(num)=\${OPTIMIZER_DID}))${NC}\n"
     echo -e "   ${BLUE}; AFTER all extensions (reports call result at hangup):${NC}"
     echo -e "   ${BLUE}exten => h,1,AGI(agi-did-optimizer-report.agi)${NC}\n"
     echo -e "   Paste these into the Dialplan Entry and click Submit.\n"
@@ -564,7 +608,7 @@ main() {
     check_vicidial
     check_perl
     install_system_deps
-    install_perl_modules || { print_error "Perl module installation failed"; exit 1; }
+    install_perl_modules || print_warning "Some Perl modules failed to install — continuing; the AGI will report any missing ones at runtime. Install them manually if calls fail."
     download_agi_script
     download_report_agi
     set_permissions
