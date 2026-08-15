@@ -507,19 +507,19 @@ setup_hangup_handler() {
         FIRST_PRI_NOTE="(first h handler in this context)"
     fi
 
-    local FULL_BLOCK="; ── DID Optimizer — report call result at hangup ──\\
-exten => h,${H_PRIORITY},AGI(${REPORT_AGI},${H_ARGS})"
+    # Both insert paths write these same two lines. The comment marker must stay
+    # in sync with the safe-reinstall cleanup pattern above.
+    local H_COMMENT="; ── DID Optimizer — report call result at hangup ──"
+    local H_INSTALL_LINE="exten => h,${H_PRIORITY},AGI(${REPORT_AGI},${H_ARGS})"
 
     if [ "$INSERT_AT" -gt "$(wc -l < "$EXTENSIONS_CONF")" ]; then
         # [default] is the file's last context — append at EOF
-        printf '\n%s\n%s\n' \
-            "; ── DID Optimizer — report call result at hangup ──" \
-            "exten => h,${H_PRIORITY},AGI(${REPORT_AGI},${H_ARGS})" \
-            >> "$EXTENSIONS_CONF"
+        printf '\n%s\n%s\n' "$H_COMMENT" "$H_INSTALL_LINE" >> "$EXTENSIONS_CONF"
     else
         # Insert immediately BEFORE the next context header
         sed -i "${INSERT_AT}i\\
-${FULL_BLOCK}" "$EXTENSIONS_CONF"
+${H_COMMENT}\\
+${H_INSTALL_LINE}" "$EXTENSIONS_CONF"
     fi
     print_step "Added h-extension handler in [default] context ${FIRST_PRI_NOTE}"
 
