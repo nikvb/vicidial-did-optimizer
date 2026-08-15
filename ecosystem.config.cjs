@@ -7,7 +7,9 @@ module.exports = {
   apps: [{
     name: 'did-optimizer',
     script: 'server-full.js',
-    interpreter: '/root/.nvm/versions/node/v24.19.0/bin/node',
+    // Stable symlink -> the current Node 24 install (managed via nvm).
+    // On a Node 24.x bump: ln -sfn "$(~/.nvm/nvm-exec which 24 2>/dev/null || nvm which 24)" /usr/local/bin/node24
+    interpreter: '/usr/local/bin/node24',
 
     // Environment variables
     env: {

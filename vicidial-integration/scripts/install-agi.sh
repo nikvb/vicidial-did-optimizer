@@ -584,9 +584,9 @@ print_next_steps() {
     echo -e "   ${BLUE}; so VICIdial's own DID selection rolls over. Fail-open, never blocks a call.${NC}"
     echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,AGI(vicidial-did-optimizer.agi)${NC}"
     echo -e "   ${BLUE}exten => _91NXXNXXXXXX,n,ExecIf(\$[\"\${OPTIMIZER_STATUS}\" = \"SUCCESS\" & \"\${OPTIMIZER_FALLBACK}\" != \"YES\"]?Set(CALLERID(num)=\${OPTIMIZER_DID}))${NC}\n"
-    echo -e "   ${BLUE}; AFTER all extensions (reports call result at hangup):${NC}"
-    echo -e "   ${BLUE}exten => h,1,AGI(agi-did-optimizer-report.agi)${NC}\n"
     echo -e "   Paste these into the Dialplan Entry and click Submit.\n"
+    echo -e "   (The hangup call-result reporter was already installed automatically"
+    echo -e "    into the [default] context — no manual h-extension needed.)\n"
 
     echo -e "3. ${YELLOW}Test Integration${NC}"
     echo -e "   - Make a test call"
