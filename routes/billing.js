@@ -8,7 +8,6 @@ import { authenticate, requireAdmin } from '../middleware/auth.js';
 import { PRICING_PLANS, calculateMonthlyCharges, calculateEstimate, chargeInvoice, retryPayment } from '../services/billing/billingService.js';
 import { vaultCreditCard, deletePaymentToken, getPaymentToken } from '../services/billing/paypalVault.js';
 import { chargePaymentToken, verifyPaymentToken } from '../services/billing/paypalCharging.js';
-import fs from 'fs';
 
 const router = express.Router();
 
@@ -35,22 +34,8 @@ router.get('/pricing', asyncHandler(async (req, res) => {
   });
 }));
 
-// @desc    Test PayPal configuration
-// @route   GET /api/v1/billing/test-paypal-config
-// @access  Private
-router.get('/test-paypal-config', asyncHandler(async (req, res) => {
-  res.json({
-    success: true,
-    data: {
-      clientId: process.env.PAYPAL_CLIENT_ID?.substring(0, 30) + '...',
-      clientIdLength: process.env.PAYPAL_CLIENT_ID?.length,
-      secretConfigured: !!process.env.PAYPAL_CLIENT_SECRET,
-      secretLength: process.env.PAYPAL_CLIENT_SECRET?.length,
-      secretFirst20: process.env.PAYPAL_CLIENT_SECRET?.substring(0, 20) + '...',
-      mode: process.env.PAYPAL_MODE
-    }
-  });
-}));
+// (test-paypal-config endpoint removed — it leaked partial live credentials
+// to any authenticated user. Admins can verify config via env on the host.)
 
 // @desc    Calculate cost estimate (curve-based — plan no longer affects price)
 // @route   POST /api/v1/billing/estimate
@@ -90,11 +75,17 @@ router.get('/subscription', asyncHandler(async (req, res) => {
 
   const didCount = await DID.countDocuments({
     tenantId: tenant._id,
+    status: 'active',
     isActive: true
   });
 
   const pricingModule = await import('../services/billing/pricingCurves.js');
-  const charge = pricingModule.calculateDirectCharge(didCount);
+  const { getEffectiveRate } = await import('../services/billing/billingService.js');
+  const didSource = tenant.subscription?.didSource || 'byo';
+  const customRate = tenant.subscription?.perDidPricing?.customRate ?? null;
+  const eff = getEffectiveRate(tenant);
+  const rate = eff.rate;
+  const charge = pricingModule.calculateFlatCharge(didCount, rate);
   const tiers = pricingModule.serializeTiers(pricingModule.DIRECT_TIERS);
   const currentPlan = PRICING_PLANS[tenant.subscription.plan] || PRICING_PLANS.payg;
 
@@ -109,8 +100,16 @@ router.get('/subscription', asyncHandler(async (req, res) => {
         currentMonthCharge: charge.totalMonthlyCharge,
         tierBreakdown: charge.breakdown,
         tier: charge.tierName,
-        baseFee: charge.baseFee,
+        baseFee: 0,
         didCharges: charge.didCharges
+      },
+      rateInfo: {
+        didSource,
+        customRate,
+        effectiveRate: rate,
+        rateSource: eff.source,
+        promo: eff.promo,
+        rates: pricingModule.FLAT_RATES
       },
       currentPlan,
       pricingTiers: tiers
@@ -225,59 +224,21 @@ router.post('/payment-methods/vault', [
   body('cvv').notEmpty().withMessage('CVV is required'),
   body('billingAddress').notEmpty().withMessage('Billing address is required')
 ], asyncHandler(async (req, res) => {
-  // Log at the VERY START
-  try {
-    const startLog = `ROUTE HIT: ${new Date().toISOString()}\nClient ID: ${process.env.PAYPAL_CLIENT_ID?.substring(0,30)}\nSecret: ${process.env.PAYPAL_CLIENT_SECRET?.substring(0,20)}\n\n`;
-    fs.writeFileSync('/tmp/route-start.log', startLog, { flag: 'a' });
-  } catch (e) { /* ignore */ }
-
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     throw createError.badRequest(errors.array()[0].msg);
   }
 
-  const envLog = `
-===== VAULT ENDPOINT HIT (${new Date().toISOString()}) =====
-PayPal Client ID: ${process.env.PAYPAL_CLIENT_ID?.substring(0, 30)}... (length: ${process.env.PAYPAL_CLIENT_ID?.length})
-PayPal Secret: ${process.env.PAYPAL_CLIENT_SECRET?.substring(0, 20)}... (length: ${process.env.PAYPAL_CLIENT_SECRET?.length})
-PayPal Mode: ${process.env.PAYPAL_MODE}
-User: ${req.user.email}
-=====================================
-`;
-  fs.writeFileSync('/tmp/vault-endpoint-debug.log', envLog, { flag: 'a' });
-
   const { cardNumber, expiryMonth, expiryYear, cvv, billingAddress } = req.body;
 
-  console.log('\n📋 Parsed request data:');
-  console.log('  - Card Number:', cardNumber ? '****' + cardNumber.slice(-4) : 'MISSING');
-  console.log('  - Expiry Month:', expiryMonth);
-  console.log('  - Expiry Year:', expiryYear);
-  console.log('  - CVV:', cvv ? '***' : 'MISSING');
-  console.log('  - Billing Address:', billingAddress ? 'Present' : 'MISSING');
-  if (billingAddress) {
-    console.log('    • First Name:', billingAddress.firstName);
-    console.log('    • Last Name:', billingAddress.lastName);
-    console.log('    • Street:', billingAddress.street);
-    console.log('    • City:', billingAddress.city);
-    console.log('    • State:', billingAddress.state);
-    console.log('    • ZIP:', billingAddress.zipCode);
-    console.log('    • Country:', billingAddress.country);
-  }
-
-  console.log('\n🔍 Fetching tenant from database...');
   const tenant = await Tenant.findById(req.user.tenant._id);
-
   if (!tenant) {
-    console.error('❌ Tenant not found!');
     throw createError.notFound('Tenant not found');
   }
 
-  console.log('✅ Tenant found:', tenant.name);
-  console.log('  - Tenant ID:', tenant._id);
-  console.log('  - Current payment methods:', tenant.billing?.paymentMethods?.length || 0);
+  console.log(`💳 Vaulting payment method for ${tenant.name} (card ****${cardNumber ? cardNumber.slice(-4) : '????'})`);
 
   try {
-    console.log('\n💳 Calling vaultCreditCard function...');
 
     // Vault the card using new PayPal Payment Token API
     const vaultResult = await vaultCreditCard({
@@ -319,9 +280,25 @@ User: ${req.user.email}
     tenant.billing.paymentMethods.push(paymentMethod);
     await tenant.save();
 
+    // ── ACTIVATION: a trial tenant that adds a payment method becomes a
+    // paying customer. Prorated charge for the rest of this month, then the
+    // monthly cycle takes over on the 1st. (This was the missing trial→active
+    // conversion — without it no organic signup was ever billed.)
+    let activation = null;
+    if (tenant.subscription.status === 'trial') {
+      const savedMethod = tenant.billing.paymentMethods[tenant.billing.paymentMethods.length - 1];
+      const { activateTenantWithProratedCharge } = await import('../services/billing/billingService.js');
+      activation = await activateTenantWithProratedCharge(tenant, savedMethod);
+      console.log(`🚀 ${tenant.name}: trial → active (charged=${activation.charged}, amount=$${activation.amount})`);
+    }
+
     res.json({
       success: true,
-      message: 'Payment method added successfully',
+      message: activation?.activated
+        ? (activation.charged
+            ? `Payment method added — subscription activated (charged $${activation.amount.toFixed(2)} for the rest of this month)`
+            : 'Payment method added — subscription activated')
+        : 'Payment method added successfully',
       data: {
         paymentMethod: {
           id: paymentMethod._id,
@@ -331,27 +308,22 @@ User: ${req.user.email}
           cardType: paymentMethod.cardType,
           expiryMonth: paymentMethod.expiryMonth,
           expiryYear: paymentMethod.expiryYear
-        }
+        },
+        activation: activation ? {
+          activated: activation.activated,
+          charged: activation.charged,
+          amount: activation.amount,
+          invoiceNumber: activation.invoice?.invoiceNumber || null
+        } : null
       }
     });
 
   } catch (error) {
-    const errorLog = `
-❌ BILLING ROUTE ERROR (${new Date().toISOString()})
-Error type: ${error.constructor.name}
-Error message: ${error.message}
-Error stack: ${error.stack}
-PayPal Client ID in env: ${process.env.PAYPAL_CLIENT_ID?.substring(0, 30)}... (${process.env.PAYPAL_CLIENT_ID?.length})
-PayPal Secret in env: ${process.env.PAYPAL_CLIENT_SECRET?.substring(0, 20)}... (${process.env.PAYPAL_CLIENT_SECRET?.length})
-=====================================
-`;
-    fs.writeFileSync('/tmp/vault-error-debug.log', errorLog, { flag: 'a' });
-
+    console.error(`❌ Vault payment method failed for ${tenant.name}: ${error.message}`);
     res.status(500).json({
       success: false,
       message: 'Failed to add payment method',
       error: error.message,
-      details: error.toString(),
       timestamp: new Date().toISOString()
     });
   }
@@ -379,9 +351,9 @@ router.put('/payment-methods/:id/primary', asyncHandler(async (req, res) => {
 
 // @desc    Test charge a payment method
 // @route   POST /api/v1/billing/payment-methods/:id/test-charge
-// @access  Private (for testing purposes)
-router.post('/payment-methods/:id/test-charge', [
-  body('amount').isFloat({ min: 0.01, max: 10000 }).withMessage('Amount must be between $0.01 and $10,000')
+// @access  Admin only — this moves REAL money; capped at $1.00
+router.post('/payment-methods/:id/test-charge', requireAdmin, [
+  body('amount').isFloat({ min: 0.01, max: 1.00 }).withMessage('Test amount must be between $0.01 and $1.00')
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -699,7 +671,8 @@ router.post('/admin/trigger-billing', requireAdmin, [
     throw createError.notFound('Tenant not found');
   }
 
-  if (!tenant.subscription.status === 'active') {
+  // (was `!status === 'active'`, which always evaluated false and never guarded)
+  if (tenant.subscription.status !== 'active') {
     throw createError.badRequest('Tenant subscription is not active');
   }
 
@@ -834,18 +807,106 @@ router.post('/reactivate', asyncHandler(async (req, res) => {
 }));
 
 // =====================================================
-// WEBHOOKS
+// SELF-SERVICE: PAY AN OPEN INVOICE
 // =====================================================
 
-// @desc    PayPal webhook handler
-// @route   POST /api/v1/billing/webhook/paypal
-// @access  Public (but verified)
-router.post('/webhook/paypal', express.raw({ type: 'application/json' }), asyncHandler(async (req, res) => {
-  // PayPal IPN verification and event handling would go here
-  console.log('📨 PayPal webhook received:', req.body);
+// @desc    Pay a pending/failed invoice with the tenant's primary method
+// @route   POST /api/v1/billing/invoices/:id/pay
+// @access  Private (tenant pays their own invoice)
+router.post('/invoices/:id/pay', asyncHandler(async (req, res) => {
+  const tenant = await Tenant.findById(req.user.tenant._id);
+  const invoice = await Invoice.findOne({ _id: req.params.id, tenantId: tenant._id });
 
-  // For now, just acknowledge receipt
-  res.status(200).json({ received: true });
+  if (!invoice) throw createError.notFound('Invoice not found');
+  if (invoice.status === 'paid') {
+    return res.json({ success: true, message: 'Invoice is already paid', data: { status: 'paid' } });
+  }
+  if (!['pending', 'failed'].includes(invoice.status)) {
+    throw createError.badRequest(`Invoice status '${invoice.status}' is not payable`);
+  }
+
+  const paymentMethod = tenant.getPrimaryPaymentMethod();
+  if (!paymentMethod) throw createError.badRequest('No payment method on file — add one first');
+
+  const { chargeInvoice: doCharge, chargesEnabled: enabled } = await import('../services/billing/billingService.js');
+  if (!enabled()) {
+    throw createError.badRequest('Payments are temporarily disabled — please try again later');
+  }
+
+  await doCharge(invoice, tenant, paymentMethod);
+
+  res.json({
+    success: true,
+    message: `Invoice ${invoice.invoiceNumber} paid`,
+    data: { invoiceNumber: invoice.invoiceNumber, status: 'paid', amount: invoice.amounts.total }
+  });
 }));
+
+// =====================================================
+// ADMIN: DID SOURCE (RATE CLASS) ASSIGNMENT
+// =====================================================
+
+// @desc    List tenants with billing rate class (for per-tenant assignment)
+// @route   GET /api/v1/billing/admin/tenants
+// @access  Admin only
+router.get('/admin/tenants', requireAdmin, asyncHandler(async (req, res) => {
+  const { rateFor } = await import('../services/billing/pricingCurves.js');
+  const tenants = await Tenant.find({}, 'name subscription.status subscription.didSource subscription.perDidPricing.customRate billing.paymentMethods').lean();
+
+  const rows = await Promise.all(tenants.map(async (t) => {
+    const didCount = await DID.countDocuments({ tenantId: t._id, status: 'active', isActive: true });
+    const didSource = t.subscription?.didSource || 'byo';
+    const customRate = t.subscription?.perDidPricing?.customRate ?? null;
+    const rate = rateFor(didSource, customRate);
+    return {
+      tenantId: t._id,
+      name: t.name,
+      status: t.subscription?.status,
+      didSource,
+      customRate,
+      effectiveRate: rate,
+      billableDids: didCount,
+      projectedMonthly: +(didCount * rate).toFixed(2),
+      hasPaymentMethod: (t.billing?.paymentMethods || []).some(pm => pm.isActive)
+    };
+  }));
+
+  res.json({ success: true, data: { tenants: rows } });
+}));
+
+// @desc    Set a tenant's rate class (provided $0.15 / byo $0.10) or custom rate
+// @route   PUT /api/v1/billing/admin/tenants/:id/did-source
+// @access  Admin only
+router.put('/admin/tenants/:id/did-source', requireAdmin, [
+  body('didSource').optional().isIn(['provided', 'byo']).withMessage("didSource must be 'provided' or 'byo'"),
+  body('customRate').optional({ nullable: true }).isFloat({ min: 0 }).withMessage('customRate must be >= 0')
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) throw createError.badRequest(errors.array()[0].msg);
+
+  const tenant = await Tenant.findById(req.params.id);
+  if (!tenant) throw createError.notFound('Tenant not found');
+
+  const { didSource, customRate } = req.body;
+  if (didSource !== undefined) tenant.subscription.didSource = didSource;
+  if (customRate !== undefined) tenant.subscription.perDidPricing.customRate = customRate; // null clears
+  await tenant.save();
+
+  const { rateFor } = await import('../services/billing/pricingCurves.js');
+  res.json({
+    success: true,
+    message: `${tenant.name}: rate class updated`,
+    data: {
+      tenantId: tenant._id,
+      didSource: tenant.subscription.didSource,
+      customRate: tenant.subscription.perDidPricing.customRate ?? null,
+      effectiveRate: rateFor(tenant.subscription.didSource, tenant.subscription.perDidPricing.customRate)
+    }
+  });
+}));
+
+// NOTE: The PayPal webhook lives in routes/paypal-webhook.js and is mounted in
+// server-full.js BEFORE authentication — PayPal's unauthenticated POSTs were
+// getting 401 from this router's authenticate middleware and never processed.
 
 export default router;

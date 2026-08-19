@@ -4,7 +4,8 @@ import Invoice from '../../models/Invoice.js';
 import Reseller from '../../models/Reseller.js';
 import ResellerInvoice from '../../models/ResellerInvoice.js';
 import DID from '../../models/DID.js';
-import { processMonthlyBilling, retryPayment } from './billingService.js';
+import { processMonthlyBilling, retryPayment, chargesEnabled } from './billingService.js';
+import { chargePaymentToken } from './paypalCharging.js';
 import { calculateResellerCharge } from './resellerPricing.js';
 
 /**
@@ -88,18 +89,32 @@ export async function generateResellerInvoices(now = new Date()) {
 
   for (const reseller of resellers) {
     try {
+      // Idempotency: one reseller invoice per period
+      const existing = await ResellerInvoice.findOne({
+        resellerId: reseller._id,
+        'billingPeriod.start': start,
+        status: { $in: ['pending', 'paid'] }
+      });
+      if (existing) {
+        console.log(`↩️ ResellerInvoice ${existing.invoiceNumber} already exists for ${reseller.name} — skipping`);
+        results.skipped++;
+        continue;
+      }
+
       const tenants = await Tenant.find({ resellerId: reseller._id }, '_id name').lean();
       if (!tenants.length) { results.skipped++; continue; }
 
       const clientBreakdown = await Promise.all(tenants.map(async (t) => {
-        const didCount = await DID.countDocuments({ tenantId: t._id, status: 'active' });
+        // Same billable definition as direct tenants: both flags must agree
+        const didCount = await DID.countDocuments({ tenantId: t._id, status: 'active', isActive: true });
         return { tenantId: t._id, tenantName: t.name, didCount };
       }));
 
       const totalDids = clientBreakdown.reduce((s, x) => s + x.didCount, 0);
       if (totalDids === 0) { results.skipped++; continue; }
 
-      const charge = calculateResellerCharge(totalDids);
+      const charge = calculateResellerCharge(totalDids, reseller.customRate ?? null);
+      const total = charge.totalMonthlyCharge;
 
       const invoice = await ResellerInvoice.create({
         resellerId: reseller._id,
@@ -107,14 +122,36 @@ export async function generateResellerInvoices(now = new Date()) {
         clientBreakdown,
         tierBreakdown: charge.breakdown,
         totalDids,
-        amounts: { subtotal: charge.total, tax: 0, total: charge.total },
+        amounts: { subtotal: total, tax: 0, total },
         status: 'pending',
         metadata: { dueDate }
       });
 
       results.generated++;
-      results.invoices.push({ id: invoice._id, resellerId: reseller._id, total: charge.total });
-      console.log(`✅ ResellerInvoice ${invoice.invoiceNumber} for ${reseller.name}: $${charge.total} (${totalDids} DIDs)`);
+      results.invoices.push({ id: invoice._id, resellerId: reseller._id, total });
+      console.log(`✅ ResellerInvoice ${invoice.invoiceNumber} for ${reseller.name}: $${total} (${totalDids} DIDs)`);
+
+      // Charge the reseller's primary payment method (previously: never charged).
+      if (chargesEnabled()) {
+        try {
+          const resellerDoc = await Reseller.findById(reseller._id);
+          const pm = resellerDoc?.getPrimaryPaymentMethod?.();
+          if (pm?.vaultId) {
+            const chargeResult = await chargePaymentToken(
+              pm.vaultId, total, 'USD',
+              `Reseller invoice ${invoice.invoiceNumber} — ${totalDids} DIDs`,
+              { invoiceId: invoice.invoiceNumber, customId: `didopt-reseller-${reseller._id}-${invoice.invoiceNumber}` }
+            );
+            await invoice.markAsPaid(chargeResult.transactionId, pm._id);
+            console.log(`💰 ResellerInvoice ${invoice.invoiceNumber} charged: $${total}`);
+          } else {
+            console.log(`⚠️ ${reseller.name} has no payment method — invoice left pending`);
+          }
+        } catch (chargeErr) {
+          await invoice.markAsFailed(chargeErr.message || 'Reseller charge failed');
+          console.error(`❌ Reseller charge failed for ${reseller.name}: ${chargeErr.message}`);
+        }
+      }
     } catch (err) {
       console.error(`❌ Failed reseller invoice for ${reseller.name}:`, err.message);
       results.errored++;
@@ -149,6 +186,10 @@ export function startPaymentRetryJob() {
     console.log(`📅 Date: ${new Date().toISOString()}`);
 
     try {
+      if (!chargesEnabled()) {
+        console.log('⚠️ BILLING_CHARGES_ENABLED not set — retry job skipped (no real charges)');
+        return;
+      }
       const failedInvoices = await Invoice.getDueForRetry();
 
       console.log(`📊 Found ${failedInvoices.length} invoices to retry`);
@@ -157,25 +198,21 @@ export function startPaymentRetryJob() {
       let failureCount = 0;
 
       for (const invoice of failedInvoices) {
-        const tenant = invoice.tenantId;
-        const daysSinceFailed = Math.floor(
-          (Date.now() - invoice.paymentDetails.failedAt) / (24 * 60 * 60 * 1000)
-        );
+        // getDueForRetry already gates on: failed status, retryCount < 3, and
+        // last failure >= 24h ago. markAsFailed refreshes failedAt on each
+        // attempt, so retries naturally space ~daily. No extra day-gate here —
+        // the old [1,3,7]-day filter combined with a 24h query window meant no
+        // invoice could ever match, which silently disabled all retries.
+        console.log(`🔄 Retrying payment for invoice ${invoice.invoiceNumber} (Attempt ${invoice.paymentDetails.retryCount + 1}/3)`);
 
-        // Retry logic: Day 1, 3, 7
-        if ([1, 3, 7].includes(daysSinceFailed)) {
-          console.log(`🔄 Retrying payment for invoice ${invoice.invoiceNumber} (Attempt ${invoice.paymentDetails.retryCount + 1}/3)`);
-
-          try {
-            await retryPayment(invoice);
-            successCount++;
-            console.log(`✅ Retry successful for invoice ${invoice.invoiceNumber}`);
-          } catch (error) {
-            console.error(`❌ Retry failed for invoice ${invoice.invoiceNumber}:`, error.message);
-            failureCount++;
-
-            // Suspend after 3 failed attempts (handled in retryPayment/billingService)
-          }
+        try {
+          await retryPayment(invoice);
+          successCount++;
+          console.log(`✅ Retry successful for invoice ${invoice.invoiceNumber}`);
+        } catch (error) {
+          console.error(`❌ Retry failed for invoice ${invoice.invoiceNumber}:`, error.message);
+          failureCount++;
+          // Suspension after 3 total failures is handled in billingService
         }
       }
 

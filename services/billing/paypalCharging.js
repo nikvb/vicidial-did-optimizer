@@ -1,5 +1,4 @@
-import { Client, Environment, OrdersController, LogLevel } from '@paypal/paypal-server-sdk';
-import fs from 'fs';
+import { Client, Environment, OrdersController, PaymentsController, LogLevel } from '@paypal/paypal-server-sdk';
 
 // Lazy initialization - create client only when needed (after env vars are loaded)
 let client = null;
@@ -32,8 +31,9 @@ function initializePayPalClient() {
     environment: paypalMode === 'live' ? Environment.Production : Environment.Sandbox,
     logging: {
       logLevel: LogLevel.Info,
-      logRequest: { logBody: true },
-      logResponse: { logBody: true },
+      // Never log request/response bodies — they can contain payment payloads.
+      logRequest: { logBody: false },
+      logResponse: { logBody: false },
     },
   });
 
@@ -52,11 +52,12 @@ function initializePayPalClient() {
  * @param {string} description - Payment description
  * @returns {Promise<Object>} Charge result with transaction details
  */
-export async function chargePaymentToken(paymentTokenId, amount, currency = 'USD', description = 'DID Optimizer Service') {
+export async function chargePaymentToken(paymentTokenId, amount, currency = 'USD', description = 'DID Optimizer Service', opts = {}) {
   console.log('\n💳 ===== CHARGING PAYMENT TOKEN =====');
   console.log('📝 Token ID:', paymentTokenId);
   console.log('💰 Amount:', amount, currency);
   console.log('📄 Description:', description);
+  if (opts.invoiceId) console.log('🧾 Invoice ID (idempotency):', opts.invoiceId);
   console.log('⏰ Timestamp:', new Date().toISOString());
 
   const orders = initializePayPalClient();
@@ -66,18 +67,24 @@ export async function chargePaymentToken(paymentTokenId, amount, currency = 'USD
     // Step 1: Create order with payment token
     console.log('\n📤 ===== STEP 1: CREATING ORDER =====');
 
+    const purchaseUnit = {
+      amount: {
+        currencyCode: currency,
+        value: amount.toFixed(2)
+      },
+      description: description
+    };
+    // Idempotency layer 1: PayPal rejects duplicate invoice_id server-side,
+    // so a re-fired cron or double-click cannot produce a second charge.
+    if (opts.invoiceId) {
+      purchaseUnit.invoiceId = opts.invoiceId;
+      if (opts.customId) purchaseUnit.customId = opts.customId;
+    }
+
     const createOrderRequest = {
       body: {
         intent: 'CAPTURE',
-        purchaseUnits: [
-          {
-            amount: {
-              currencyCode: currency,
-              value: amount.toFixed(2)
-            },
-            description: description
-          }
-        ],
+        purchaseUnits: [purchaseUnit],
         paymentSource: {
           token: {
             id: paymentTokenId,
@@ -86,8 +93,11 @@ export async function chargePaymentToken(paymentTokenId, amount, currency = 'USD
         }
       }
     };
+    // Idempotency layer 2: PayPal-Request-Id dedupes the create call itself.
+    if (opts.invoiceId) {
+      createOrderRequest.paypalRequestId = `didopt-${opts.invoiceId}`;
+    }
 
-    console.log('📤 Full Request Body:\n', JSON.stringify(createOrderRequest.body, null, 2));
     console.log('🔑 Using Token ID:', paymentTokenId);
     console.log('💵 Charging Amount:', amount.toFixed(2), currency);
 
@@ -168,6 +178,14 @@ export async function chargePaymentToken(paymentTokenId, amount, currency = 'USD
 
       capture = captureResult.purchaseUnits[0].payments.captures[0];
       console.log('✅ Capture extracted:', JSON.stringify(capture, null, 2));
+    }
+
+    // CRITICAL: an order can report COMPLETED while the individual capture is
+    // DECLINED/PENDING/FAILED. Only capture.status === 'COMPLETED' proves the
+    // money actually moved. Anything else is a failed charge.
+    if (capture.status !== 'COMPLETED') {
+      const reason = capture.processorResponse?.responseCode || capture.status;
+      throw new Error(`Capture not completed (capture.status=${capture.status}, reason=${reason}) — payment NOT collected`);
     }
 
     console.log('\n✅ ===== BUILDING CHARGE RESULT =====');
@@ -300,11 +318,20 @@ export async function verifyPaymentToken(paymentTokenId) {
     console.log('✅ Payment token is valid');
     console.log('📊 Status:', result.status);
     console.log('🔢 Status Code:', statusCode);
-    console.log('📦 Full Verification Response:', JSON.stringify(result, null, 2));
     console.log('=======================================\n');
 
-    // Void the authorization immediately (don't capture)
-    // Note: In production, you might want to capture and refund, or just not authorize at all
+    // Void the authorization so no hold lingers on the customer's card.
+    try {
+      const authId = result.purchaseUnits?.[0]?.payments?.authorizations?.[0]?.id;
+      if (authId) {
+        const payments = new PaymentsController(client);
+        await payments.authorizationsVoid(authId);
+        console.log(`✅ Verification authorization ${authId} voided`);
+      }
+    } catch (voidErr) {
+      // Non-fatal: the tiny auth expires on its own, but log it.
+      console.warn(`⚠️ Could not void verification authorization: ${voidErr.message}`);
+    }
 
     return {
       valid: true,
