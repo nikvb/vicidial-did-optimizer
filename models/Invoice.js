@@ -191,13 +191,17 @@ invoiceSchema.statics.getUnpaidForTenant = function(tenantId) {
   }).sort({ 'metadata.dueDate': 1 });
 };
 
-// Static method to get invoices due for retry
+// Static method to get invoices due for retry.
+// A failed invoice becomes retryable 24h after its LAST failure (markAsFailed
+// refreshes failedAt, so attempts space themselves ~daily up to 3 retries).
+// The 30-day floor keeps ancient invoices from being resurrected.
 invoiceSchema.statics.getDueForRetry = function() {
   const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   return this.find({
     status: 'failed',
     'paymentDetails.retryCount': { $lt: 3 },
-    'paymentDetails.failedAt': { $gte: oneDayAgo }
+    'paymentDetails.failedAt': { $lte: oneDayAgo, $gte: thirtyDaysAgo }
   }).populate('tenantId');
 };
 

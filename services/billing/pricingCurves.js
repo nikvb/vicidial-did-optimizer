@@ -1,124 +1,95 @@
-// Hybrid pricing model: base fee + per-DID marginal pricing.
-// Tiers are selected based on active DID count; base fee + per-DID rate apply.
-//
-// Direct customer tiers:
-// - Startup (0-2K DIDs): $99/mo base + $0.015/DID
-// - Growth (2K-10K DIDs): $299/mo base + $0.010/DID
-// - Enterprise (10K+ DIDs): $799/mo base + $0.005/DID
-//
-// Reseller tiers (wholesale, ~40-50% of direct per-DID rate):
-// - Startup: $49/mo base + $0.010/DID
-// - Growth: $149/mo base + $0.007/DID
-// - Enterprise: $399/mo base + $0.003/DID
+// Flat per-DID pricing — the single source of truth for what we charge.
+// This MUST match the landing page (temp_clone/frontend/src/pages/LandingPage.js):
+//   - $0.15/DID/month when we provide the DIDs
+//   - $0.10/DID/month when the tenant brings their own (BYO — service only)
+// No base fee, no volume tiers. A tenant's rate class comes from
+// tenant.subscription.didSource ('provided' | 'byo'), and
+// tenant.subscription.perDidPricing.customRate overrides it (hand-priced deals).
 
-export const DIRECT_TIERS = [
-  { name: 'Startup', minDIDs: 0, maxDIDs: 2000, baseFee: 99, rates: [
-    { upTo: 2000, rate: 0.015 }
-  ]},
-  { name: 'Growth', minDIDs: 2001, maxDIDs: 10000, baseFee: 299, rates: [
-    { upTo: 2000, rate: 0.015 },
-    { upTo: 10000, rate: 0.010 }
-  ]},
-  { name: 'Enterprise', minDIDs: 10001, maxDIDs: Infinity, baseFee: 799, rates: [
-    { upTo: 2000, rate: 0.015 },
-    { upTo: 10000, rate: 0.010 },
-    { upTo: Infinity, rate: 0.005 }
-  ]}
-];
+export const FLAT_RATES = {
+  provided: 0.15, // we source/provision the numbers
+  byo: 0.10       // tenant brings their own DIDs — optimization service only
+};
 
-export const RESELLER_TIERS = [
-  { name: 'Startup', minDIDs: 0, maxDIDs: 2000, baseFee: 49, rates: [
-    { upTo: 2000, rate: 0.010 }
-  ]},
-  { name: 'Growth', minDIDs: 2001, maxDIDs: 10000, baseFee: 149, rates: [
-    { upTo: 2000, rate: 0.010 },
-    { upTo: 10000, rate: 0.007 }
-  ]},
-  { name: 'Enterprise', minDIDs: 10001, maxDIDs: Infinity, baseFee: 399, rates: [
-    { upTo: 2000, rate: 0.010 },
-    { upTo: 10000, rate: 0.007 },
-    { upTo: Infinity, rate: 0.003 }
-  ]}
-];
+// Reseller wholesale service rate (per client DID). Resellers bring their
+// clients' own DIDs, so this mirrors the BYO service rate. Adjust when a
+// wholesale discount is negotiated (Reseller.customRate overrides per reseller).
+export const RESELLER_RATE = 0.10;
 
-// Annual prepay: 12 months for the price of 10 (16.67% off).
-// Enterprise gets better discount: 12 months for price of 9 (25% off).
+// Annual prepay: 12 months for the price of 10 (matches the landing page).
 export const ANNUAL_PREPAY_MONTHS_BILLED = 10;
 export const ANNUAL_PREPAY_MONTHS_BILLED_ENTERPRISE = 9;
 
+// Early-adopter promo: the first N clients to activate get a launch rate on
+// their BYO DIDs for the first M months, then roll to the standard flat rate.
+export const EARLY_ADOPTER_PROMO = {
+  label: 'early10',
+  rate: 0.03,      // $/DID/mo during the promo
+  months: 3,
+  maxClients: 10,
+  appliesTo: 'byo' // BYO (DIY) DIDs only
+};
+
 /**
- * Calculate per-DID charges for a given DID count within a tier's rate structure.
- * Applies marginal pricing (each rate bracket applies only to DIDs within that bracket).
+ * Resolve the per-DID rate for a rate class, with optional custom override.
  */
-function calculateDidCharges(rates, totalDids) {
-  const dids = Math.max(0, Math.floor(totalDids || 0));
-  const breakdown = [];
-  let remaining = dids;
-  let prevCap = 0;
-  let total = 0;
-
-  for (const rate of rates) {
-    if (remaining <= 0) break;
-    const tierSize = rate.upTo - prevCap;
-    const inTier = Math.min(remaining, tierSize);
-    const subtotal = +(inTier * rate.rate).toFixed(4);
-    breakdown.push({
-      from: prevCap + 1,
-      to: prevCap + inTier,
-      rate: rate.rate,
-      didsInTier: inTier,
-      subtotal
-    });
-    total += subtotal;
-    remaining -= inTier;
-    prevCap = rate.upTo;
+export function rateFor(didSource = 'byo', customRate = null) {
+  if (customRate != null && Number.isFinite(+customRate) && +customRate >= 0) {
+    return +customRate;
   }
-
-  return { total: +total.toFixed(2), breakdown };
+  return FLAT_RATES[didSource] ?? FLAT_RATES.byo;
 }
 
 /**
- * Select the appropriate tier based on DID count and calculate charges.
- * Returns { tier, baseFee, didCharges, totalCharge, breakdown }.
+ * Flat charge for a DID count at a given rate.
+ * Return shape is compatible with the old selectTierAndCharge() consumers:
+ * { tierName, baseFee, didCharges, totalMonthlyCharge, breakdown }.
  */
-export function selectTierAndCharge(tiers, totalDids) {
+export function calculateFlatCharge(totalDids, rate) {
   const dids = Math.max(0, Math.floor(totalDids || 0));
-  const tier = tiers.find(t => dids >= t.minDIDs && dids <= t.maxDIDs);
-
-  if (!tier) {
-    throw new Error(`No tier found for ${dids} DIDs`);
-  }
-
-  const { total: didTotal, breakdown: didBreakdown } = calculateDidCharges(tier.rates, dids);
-  const baseFee = tier.baseFee;
-  const totalCharge = +(baseFee + didTotal).toFixed(2);
-
+  const total = +(dids * rate).toFixed(2);
   return {
-    tierName: tier.name,
-    baseFee,
-    didCharges: didTotal,
-    totalMonthlyCharge: totalCharge,
-    breakdown: [
-      { label: 'Base fee', amount: baseFee },
-      ...didBreakdown.map(b => ({
-        ...b,
-        label: `DIDs ${b.from}-${b.to} @ $${b.rate.toFixed(3)}`
-      }))
-    ]
+    tierName: 'Flat',
+    baseFee: 0,
+    didCharges: total,
+    totalMonthlyCharge: total,
+    total, // alias — some consumers read .total
+    breakdown: dids > 0
+      ? [{ from: 1, to: dids, rate, didsInTier: dids, subtotal: total, label: `${dids} DIDs @ $${rate.toFixed(2)}/mo` }]
+      : []
   };
 }
 
-export function calculateDirectCharge(totalDids) {
-  return selectTierAndCharge(DIRECT_TIERS, totalDids);
-}
-
-export function calculateResellerCharge(totalDids) {
-  return selectTierAndCharge(RESELLER_TIERS, totalDids);
+/**
+ * Direct tenant charge. didSource: 'provided' | 'byo'; customRate overrides.
+ */
+export function calculateDirectCharge(totalDids, didSource = 'byo', customRate = null) {
+  return calculateFlatCharge(totalDids, rateFor(didSource, customRate));
 }
 
 /**
- * Serialize tiers for API responses (includes base fee, tier name).
+ * Reseller wholesale charge across all client DIDs.
  */
+export function calculateResellerCharge(totalDids, customRate = null) {
+  const rate = (customRate != null && Number.isFinite(+customRate) && +customRate >= 0)
+    ? +customRate
+    : RESELLER_RATE;
+  return calculateFlatCharge(totalDids, rate);
+}
+
+// ── Legacy-compat exports ────────────────────────────────────────────────────
+// Old consumers serialized tier tables for API responses. The flat model is
+// expressed as one open-ended "tier" per rate class so those responses stay
+// well-formed without a base fee.
+export const DIRECT_TIERS = [
+  { name: 'Flat — we provide DIDs', minDIDs: 0, maxDIDs: Infinity, baseFee: 0, rates: [{ upTo: Infinity, rate: FLAT_RATES.provided }] },
+  { name: 'Flat — bring your own DIDs', minDIDs: 0, maxDIDs: Infinity, baseFee: 0, rates: [{ upTo: Infinity, rate: FLAT_RATES.byo }] }
+];
+
+export const RESELLER_TIERS = [
+  { name: 'Flat — reseller wholesale', minDIDs: 0, maxDIDs: Infinity, baseFee: 0, rates: [{ upTo: Infinity, rate: RESELLER_RATE }] }
+];
+
 export function serializeTiers(tiers) {
   return tiers.map(t => ({
     name: t.name,

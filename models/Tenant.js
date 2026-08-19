@@ -47,6 +47,23 @@ const tenantSchema = new mongoose.Schema({
       enum: ['active', 'cancelled', 'suspended', 'trial'],
       default: 'trial'
     },
+    // Rate class for flat per-DID pricing (pricingCurves.FLAT_RATES):
+    // 'provided' = we source the DIDs ($0.15/DID/mo)
+    // 'byo'      = tenant brings their own DIDs, service only ($0.10/DID/mo)
+    // Assigned per tenant by an admin; perDidPricing.customRate overrides both.
+    didSource: {
+      type: String,
+      enum: ['provided', 'byo'],
+      default: 'byo'
+    },
+    // Time-boxed promotional rate (e.g. early-adopter: first 10 activated
+    // clients get $0.03/BYO-DID for 3 months). Ignored once endsAt passes.
+    // Precedence at billing time: perDidPricing.customRate > active promo > flat rate.
+    promo: {
+      rate: { type: Number, default: null },
+      endsAt: { type: Date, default: null },
+      label: { type: String, default: null }
+    },
     trialEndsAt: {
       type: Date,
       default: () => new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) // 14 days trial

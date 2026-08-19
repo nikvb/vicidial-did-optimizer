@@ -27,6 +27,11 @@ const resellerSchema = new mongoose.Schema({
     default: 'active',
     index: true
   },
+  // Negotiated wholesale per-DID rate; null = pricingCurves.RESELLER_RATE
+  customRate: {
+    type: Number,
+    default: null
+  },
   brandingConfig: {
     logoUrl: { type: String, default: null },
     primaryColor: { type: String, default: '#06b6d4' },

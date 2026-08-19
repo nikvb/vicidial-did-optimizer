@@ -1,5 +1,4 @@
 import { Client, Environment, VaultController, LogLevel } from '@paypal/paypal-server-sdk';
-import fs from 'fs';
 
 // Lazy initialization - create client only when needed (after env vars are loaded)
 let client = null;
@@ -10,34 +9,14 @@ function initializePayPalClient() {
     return vaultController; // Already initialized
   }
 
-  // Log PayPal configuration at first use
   const paypalMode = process.env.PAYPAL_MODE;
   const clientId = process.env.PAYPAL_CLIENT_ID;
   const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
 
-  // Write debug info to file
-  try {
-    const debugInfo = `
-===== PAYPAL SDK INITIALIZATION =====
-Timestamp: ${new Date().toISOString()}
-PayPal Mode: ${paypalMode}
-Environment: ${paypalMode === 'live' ? 'PRODUCTION' : 'SANDBOX'}
-Client ID: ${clientId?.substring(0, 30)}... (length: ${clientId?.length})
-Secret configured: ${clientSecret ? 'YES (length: ' + clientSecret.length + ')' : 'NO'}
-Secret first 20 chars: ${clientSecret?.substring(0, 20)}...
-=====================================
-`;
-    fs.writeFileSync('/tmp/paypal-config-debug.log', debugInfo, { flag: 'a' });
-  } catch (e) {
-    // Ignore file write errors
-  }
+  console.log(`🔧 PayPal Vault SDK init — mode=${paypalMode || 'sandbox'}, credentials=${clientId && clientSecret ? 'present' : 'MISSING'}`);
 
   if (!clientId || !clientSecret) {
-    const errorMsg = `Missing PayPal credentials - ClientID: ${!!clientId}, Secret: ${!!clientSecret}`;
-    try {
-      fs.writeFileSync('/tmp/paypal-config-debug.log', `ERROR: ${errorMsg}\n`, { flag: 'a' });
-    } catch (e) {}
-    throw new Error(errorMsg);
+    throw new Error(`Missing PayPal credentials - ClientID: ${!!clientId}, Secret: ${!!clientSecret}`);
   }
 
   // Initialize PayPal client with OAuth 2.0
@@ -49,9 +28,10 @@ Secret first 20 chars: ${clientSecret?.substring(0, 20)}...
     timeout: 60000, // 60 second timeout
     environment: process.env.PAYPAL_MODE === 'live' ? Environment.Production : Environment.Sandbox,
     logging: {
-      logLevel: LogLevel.Debug, // Changed to Debug for maximum logging
-      logRequest: { logBody: true, logHeaders: true },
-      logResponse: { logHeaders: true, logBody: true },
+      logLevel: LogLevel.Info,
+      // NEVER log bodies here — vault requests contain full card numbers.
+      logRequest: { logBody: false, logHeaders: false },
+      logResponse: { logBody: false, logHeaders: false },
     },
   });
 
@@ -154,7 +134,6 @@ export async function vaultCreditCard(cardData) {
     console.log('📊 Status Code:', statusCode);
 
     console.log('🎉 PayPal Payment Token created:', result.id);
-    console.log('📋 Full response:', JSON.stringify(result, null, 2));
 
     // Extract card details from response
     const cardInfo = result.paymentSource?.card || {};
