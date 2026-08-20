@@ -222,7 +222,8 @@ router.post('/payment-methods/vault', [
   body('expiryMonth').isInt({ min: 1, max: 12 }).withMessage('Invalid expiry month'),
   body('expiryYear').isInt({ min: new Date().getFullYear() }).withMessage('Invalid expiry year'),
   body('cvv').notEmpty().withMessage('CVV is required'),
-  body('billingAddress').notEmpty().withMessage('Billing address is required')
+  // Link-style minimal capture: only ZIP is required for AVS; everything else optional
+  body('billingAddress.zipCode').notEmpty().withMessage('ZIP / postal code is required')
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -266,7 +267,7 @@ router.post('/payment-methods/vault', [
       expiryMonth,
       expiryYear,
       billingAddress: {
-        name: `${billingAddress.firstName} ${billingAddress.lastName}`,
+        name: `${billingAddress.firstName || ''} ${billingAddress.lastName || ''}`.trim() || undefined,
         street: billingAddress.street,
         city: billingAddress.city,
         state: billingAddress.state,
