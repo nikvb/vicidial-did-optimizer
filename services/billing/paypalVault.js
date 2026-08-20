@@ -88,27 +88,26 @@ export async function vaultCreditCard(cardData) {
     const expiry = `${expYear}-${expMonth.toString().padStart(2, '0')}`;
     console.log('📅 Formatted expiry:', expiry);
 
-    // Prepare request object
-    const request = {
-      body: {
-        paymentSource: {
-          card: {
-            name: `${firstName} ${lastName}`.trim(),
-            number: number.replace(/\s/g, ''), // Remove spaces
-            expiry: expiry,
-            securityCode: cvv,
-            billingAddress: {
-              addressLine1: addressLine1,
-              addressLine2: addressLine2 || undefined,
-              adminArea2: city, // City
-              adminArea1: state, // State
-              postalCode: postalCode,
-              countryCode: countryCode || 'US'
-            }
-          }
-        }
+    // Prepare request object. Minimal Link-style capture: only postal code +
+    // country are required for AVS — name/street/city/state are included only
+    // when provided.
+    const card = {
+      number: number.replace(/\s/g, ''), // Remove spaces
+      expiry: expiry,
+      securityCode: cvv,
+      billingAddress: {
+        postalCode: postalCode,
+        countryCode: countryCode || 'US'
       }
     };
+    const holderName = `${firstName || ''} ${lastName || ''}`.trim();
+    if (holderName) card.name = holderName;
+    if (addressLine1) card.billingAddress.addressLine1 = addressLine1;
+    if (addressLine2) card.billingAddress.addressLine2 = addressLine2;
+    if (city) card.billingAddress.adminArea2 = city;
+    if (state) card.billingAddress.adminArea1 = state;
+
+    const request = { body: { paymentSource: { card } } };
 
     console.log('\n📤 REQUEST TO PAYPAL API:');
     console.log('🔹 Endpoint: POST /v1/vault/payment-tokens');
