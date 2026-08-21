@@ -293,6 +293,38 @@ download_report_agi() {
     print_step "Report AGI installed to $AGI_DIR/$REPORT_SCRIPT"
 }
 
+download_config_pl() {
+    # The [did-optimizer] dialplan context this installer writes calls
+    # /usr/share/astguiclient/vicidial-did-optimizer-config.pl via System().
+    # Without it, selection silently does nothing (fail-open keeps calls alive).
+    print_info "Installing DID selection script (vicidial-did-optimizer-config.pl)..."
+
+    CONFIG_PL_DIR="/usr/share/astguiclient"
+    CONFIG_PL="vicidial-did-optimizer-config.pl"
+    CONFIG_PL_SOURCE="https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-did-optimizer-config.pl"
+
+    mkdir -p "$CONFIG_PL_DIR"
+
+    if [ -f "./$CONFIG_PL" ]; then
+        cp "./$CONFIG_PL" "$CONFIG_PL_DIR/$CONFIG_PL"
+    else
+        if command -v curl &> /dev/null; then
+            curl -fsSL -o "$CONFIG_PL_DIR/$CONFIG_PL" "${CONFIG_PL_SOURCE}?$(date +%s)" || {
+                print_warning "Failed to download $CONFIG_PL — DID selection dialplan will be inert until installed"
+                return 0
+            }
+        elif command -v wget &> /dev/null; then
+            wget -q -O "$CONFIG_PL_DIR/$CONFIG_PL" "$CONFIG_PL_SOURCE" || {
+                print_warning "Failed to download $CONFIG_PL — DID selection dialplan will be inert until installed"
+                return 0
+            }
+        fi
+    fi
+
+    chmod 755 "$CONFIG_PL_DIR/$CONFIG_PL"
+    print_step "DID selection script installed to $CONFIG_PL_DIR/$CONFIG_PL"
+}
+
 set_permissions() {
     print_info "Setting file permissions..."
     chmod 755 "$AGI_DIR/$AGI_SCRIPT"
@@ -612,6 +644,7 @@ main() {
     install_perl_modules || print_warning "Some Perl modules failed to install — continuing; the AGI will report any missing ones at runtime. Install them manually if calls fail."
     download_agi_script
     download_report_agi
+    download_config_pl
     set_permissions
     create_log_directory
     install_logrotate

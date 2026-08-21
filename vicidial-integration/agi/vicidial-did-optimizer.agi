@@ -560,7 +560,10 @@ sub read_config {
     # Validate required configuration
     die "Missing api_key in configuration" unless $config{api_key};
     die "Missing api_base_url in configuration" unless $config{api_base_url};
-    die "Missing fallback_did in configuration" unless $config{fallback_did};
+    # fallback_did is OPTIONAL (deliberately empty in served configs — toll-free
+    # CID gets rejected by carriers). Empty = fail-open: no DID selected means
+    # the dialplan leaves CALLERID alone and VICIdial's own selection applies.
+    $config{fallback_did} = $config{fallback_did} || '';
 
     # Set privacy mode default (OFF by default for backward compatibility)
     $config{privacy_mode} = $config{privacy_mode} || 0;
