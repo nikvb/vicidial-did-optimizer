@@ -177,20 +177,37 @@ install_perl_modules() {
     print_warning "Missing Perl modules: ${missing_modules[*]}"
     print_info "Installing missing modules..."
 
-    # Install cpanminus if not available
-    if ! command -v cpanm &> /dev/null; then
-        print_info "Installing cpanminus..."
+    # Bootstrap a CPAN installer if none is available. Order of preference:
+    #   1. OS package (cpanminus) via the native package manager
+    #   2. Fatpacked cpm/cpanm from download.amdy.io — self-contained perl
+    #      scripts (perl >= 5.8), our own mirror, so this works on EVERY
+    #      VICIbox from 7 (Leap 42.3, repos long dead) through 12.
+    #   3. cpanmin.us as a last resort
+    if ! command -v cpanm &> /dev/null && ! command -v cpm &> /dev/null; then
+        print_info "Installing a CPAN tool (cpanminus/cpm)..."
         if command -v dnf &> /dev/null; then
-            dnf install -y perl-App-cpanminus 2>/dev/null || \
-                curl -L https://cpanmin.us | perl - --self-upgrade 2>/dev/null
+            dnf install -y perl-App-cpanminus 2>/dev/null || true
         elif command -v yum &> /dev/null; then
-            yum install -y perl-App-cpanminus 2>/dev/null || \
-                curl -L https://cpanmin.us | perl - --self-upgrade 2>/dev/null
+            yum install -y perl-App-cpanminus 2>/dev/null || true
         elif command -v apt-get &> /dev/null; then
-            apt-get install -y cpanminus 2>/dev/null
+            apt-get install -y cpanminus 2>/dev/null || true
         elif command -v zypper &> /dev/null; then
-            zypper --non-interactive --gpg-auto-import-keys install perl-App-cpanminus 2>/dev/null || \
-                curl -L https://cpanmin.us | perl - --self-upgrade 2>/dev/null
+            zypper --non-interactive --gpg-auto-import-keys install perl-App-cpanminus 2>/dev/null || true
+        fi
+    fi
+    if ! command -v cpanm &> /dev/null && ! command -v cpm &> /dev/null; then
+        # Self-contained fatpack from our mirror — no OS repos needed
+        if curl -fsSL https://download.amdy.io/cpm -o /usr/local/bin/cpm 2>/dev/null && \
+           perl -c /usr/local/bin/cpm >/dev/null 2>&1; then
+            chmod 755 /usr/local/bin/cpm
+            print_step "cpm (fatpack) installed from download.amdy.io"
+        elif curl -fsSL https://download.amdy.io/cpanm -o /usr/local/bin/cpanm 2>/dev/null && \
+             perl -c /usr/local/bin/cpanm >/dev/null 2>&1; then
+            chmod 755 /usr/local/bin/cpanm
+            print_step "cpanm (fatpack) installed from download.amdy.io"
+        else
+            curl -L https://cpanmin.us 2>/dev/null | perl - --self-upgrade 2>/dev/null || \
+                print_warning "No CPAN tool could be bootstrapped — module installs may fail"
         fi
     fi
 
@@ -301,12 +318,14 @@ download_config_pl() {
 
     CONFIG_PL_DIR="/usr/share/astguiclient"
     CONFIG_PL="vicidial-did-optimizer-config.pl"
-    CONFIG_PL_SOURCE="https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-did-optimizer-config.pl"
+    CONFIG_PL_SOURCE="https://raw.githubusercontent.com/nikvb/vicidial-did-optimizer/main/vicidial-integration/scripts/vicidial-did-optimizer-config.pl"
 
     mkdir -p "$CONFIG_PL_DIR"
 
     if [ -f "./$CONFIG_PL" ]; then
         cp "./$CONFIG_PL" "$CONFIG_PL_DIR/$CONFIG_PL"
+    elif [ -f "./vicidial-integration/scripts/$CONFIG_PL" ]; then
+        cp "./vicidial-integration/scripts/$CONFIG_PL" "$CONFIG_PL_DIR/$CONFIG_PL"
     else
         if command -v curl &> /dev/null; then
             curl -fsSL -o "$CONFIG_PL_DIR/$CONFIG_PL" "${CONFIG_PL_SOURCE}?$(date +%s)" || {
