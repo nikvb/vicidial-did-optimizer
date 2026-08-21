@@ -129,21 +129,22 @@ install_system_deps() {
             libwww-perl libnet-ssleay-perl libio-socket-ssl-perl \
             libmozilla-ca-perl cpanminus ca-certificates 2>/dev/null || true
     elif command -v zypper &> /dev/null; then
-        # openSUSE / VICIbox (7, 11, ...). Install the Perl modules straight from
-        # OS packages so they land in the system perl @INC. cpanm on VICIbox can
-        # report success while installing outside @INC, which then breaks
-        # "use JSON;" at AGI runtime — the exact failure this branch prevents.
-        zypper --non-interactive --gpg-auto-import-keys refresh 2>/dev/null || true
-        zypper --non-interactive --gpg-auto-import-keys install --no-recommends --auto-agree-with-licenses \
-            gcc make libopenssl-devel \
-            perl-JSON perl-Cache-Cache perl-libwww-perl perl-LWP-Protocol-https \
-            perl-IO-Socket-SSL perl-Net-SSLeay perl-URI perl-HTTP-Message \
-            perl-TimeDate perl-App-cpanminus \
-            ca-certificates ca-certificates-mozilla 2>&1 \
-            | grep -viE "already installed|Nothing to do|is already" || true
-        # Mozilla::CA and Asterisk::AGI are not packaged on openSUSE; the Perl
-        # module loop below installs them via cpanm (Asterisk::AGI is normally
-        # already present from the VICIdial install).
+        # openSUSE / VICIbox (7-12). Do NOT use zypper by default — repos are
+        # dead/broken on most VICIbox 7-9 installs and zypper hangs or fails.
+        # Missing modules are installed by the self-contained cpm/cpanm fatpack
+        # from download.amdy.io in the module loop below (installed into the
+        # system perl @INC). Set FORCE_ZYPPER=1 to attempt OS packages anyway.
+        if [ "${FORCE_ZYPPER:-0}" = "1" ]; then
+            print_info "FORCE_ZYPPER=1 — attempting zypper packages (120s cap)..."
+            timeout 120 zypper --non-interactive --gpg-auto-import-keys install --no-recommends --auto-agree-with-licenses \
+                gcc make libopenssl-devel \
+                perl-JSON perl-Cache-Cache perl-libwww-perl perl-LWP-Protocol-https \
+                perl-IO-Socket-SSL perl-Net-SSLeay perl-URI perl-HTTP-Message \
+                perl-TimeDate ca-certificates ca-certificates-mozilla 2>&1 \
+                | grep -viE "already installed|Nothing to do|is already" || true
+        else
+            print_info "VICIbox/openSUSE detected — skipping zypper (repos often dead); missing Perl modules install via self-contained cpm fatpack"
+        fi
     fi
 
     # Update CA certificates
@@ -177,57 +178,43 @@ install_perl_modules() {
     print_warning "Missing Perl modules: ${missing_modules[*]}"
     print_info "Installing missing modules..."
 
-    # Bootstrap a CPAN installer if none is available. Order of preference:
-    #   1. OS package (cpanminus) via the native package manager
-    #   2. Fatpacked cpm/cpanm from download.amdy.io — self-contained perl
-    #      scripts (perl >= 5.8), our own mirror, so this works on EVERY
-    #      VICIbox from 7 (Leap 42.3, repos long dead) through 12.
-    #   3. cpanmin.us as a last resort
-    if ! command -v cpanm &> /dev/null && ! command -v cpm &> /dev/null; then
-        print_info "Installing a CPAN tool (cpanminus/cpm)..."
-        if command -v dnf &> /dev/null; then
-            dnf install -y perl-App-cpanminus 2>/dev/null || true
-        elif command -v yum &> /dev/null; then
-            yum install -y perl-App-cpanminus 2>/dev/null || true
-        elif command -v apt-get &> /dev/null; then
-            apt-get install -y cpanminus 2>/dev/null || true
-        elif command -v zypper &> /dev/null; then
-            zypper --non-interactive --gpg-auto-import-keys install perl-App-cpanminus 2>/dev/null || true
-        fi
-    fi
-    if ! command -v cpanm &> /dev/null && ! command -v cpm &> /dev/null; then
-        # Self-contained fatpack from our mirror — no OS repos needed
+    # Bootstrap cpm — the primary CPAN tool. Self-contained fatpack (perl >= 5.8)
+    # from OUR mirror, so it works on every VICIbox 7-12 regardless of OS repo
+    # health. cpanm/cpan are only fallbacks if the mirror is unreachable.
+    if ! command -v cpm &> /dev/null; then
+        print_info "Installing cpm (self-contained CPAN tool)..."
         if curl -fsSL https://download.amdy.io/cpm -o /usr/local/bin/cpm 2>/dev/null && \
            perl -c /usr/local/bin/cpm >/dev/null 2>&1; then
             chmod 755 /usr/local/bin/cpm
-            print_step "cpm (fatpack) installed from download.amdy.io"
+            print_step "cpm installed from download.amdy.io"
         elif curl -fsSL https://download.amdy.io/cpanm -o /usr/local/bin/cpanm 2>/dev/null && \
              perl -c /usr/local/bin/cpanm >/dev/null 2>&1; then
             chmod 755 /usr/local/bin/cpanm
-            print_step "cpanm (fatpack) installed from download.amdy.io"
-        else
+            print_step "cpanm (fallback) installed from download.amdy.io"
+        elif ! command -v cpanm &> /dev/null; then
             curl -L https://cpanmin.us 2>/dev/null | perl - --self-upgrade 2>/dev/null || \
                 print_warning "No CPAN tool could be bootstrapped — module installs may fail"
         fi
     fi
 
-    # Install whatever the OS packages didn't cover. Prefer cpm (fast parallel
-    # installer; -g installs into the system perl @INC) when it is present, then
-    # cpanm, then legacy cpan. Clear local::lib env so modules land in system
-    # @INC (not ~/perl5). Never abort the loop on one failure — the loadability
-    # check below is the real gate and reports exactly what is still missing.
+    # Install whatever is missing. cpm is the primary tool (-g installs into
+    # the system perl @INC); on failure cascade to cpanm, then legacy cpan.
+    # Clear local::lib env so modules land in system @INC (not ~/perl5).
+    # Never abort the loop on one failure — the loadability check below is the
+    # real gate and reports exactly what is still missing.
     for module in "${missing_modules[@]}"; do
         print_info "Installing $module..."
+        installed=0
         if command -v cpm &> /dev/null; then
-            env PERL_MM_OPT= PERL_MB_OPT= cpm install -g --no-test "$module" 2>/dev/null \
-                || print_warning "cpm could not install $module (re-checked below)"
-        elif command -v cpanm &> /dev/null; then
-            env PERL_MM_OPT= PERL_MB_OPT= cpanm --notest --quiet "$module" \
-                || print_warning "cpanm could not install $module (re-checked below)"
-        else
-            yes '' | cpan -T "$module" >/dev/null 2>&1 \
-                || print_warning "cpan could not install $module (re-checked below)"
+            env PERL_MM_OPT= PERL_MB_OPT= cpm install -g --no-test "$module" 2>/dev/null && installed=1
         fi
+        if [ "$installed" = "0" ] && command -v cpanm &> /dev/null; then
+            env PERL_MM_OPT= PERL_MB_OPT= cpanm --notest --quiet "$module" && installed=1
+        fi
+        if [ "$installed" = "0" ] && command -v cpan &> /dev/null; then
+            yes '' | cpan -T "$module" >/dev/null 2>&1 && installed=1
+        fi
+        [ "$installed" = "0" ] && print_warning "Could not install $module (re-checked below)"
     done
 
     # Final verification — every module must be loadable by the SAME perl the
