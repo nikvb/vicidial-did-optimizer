@@ -67,12 +67,17 @@ export async function chargePaymentToken(paymentTokenId, amount, currency = 'USD
     // Step 1: Create order with payment token
     console.log('\n📤 ===== STEP 1: CREATING ORDER =====');
 
+    // Differentiate this service from other products on the shared PayPal
+    // account (amdy.io): every charge carries the DID Optimizer identity in
+    // the description (PayPal activity view), the soft descriptor (customer's
+    // card statement, max 22 chars), and the didopt-* custom_id.
     const purchaseUnit = {
       amount: {
         currencyCode: currency,
         value: amount.toFixed(2)
       },
-      description: description
+      description: description.startsWith('DID Optimizer') ? description : `DID Optimizer — ${description}`,
+      softDescriptor: 'DIDOPTIMIZER'
     };
     // Idempotency layer 1: PayPal rejects duplicate invoice_id server-side,
     // so a re-fired cron or double-click cannot produce a second charge.
