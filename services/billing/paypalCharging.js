@@ -86,14 +86,29 @@ export async function chargePaymentToken(paymentTokenId, amount, currency = 'USD
       if (opts.customId) purchaseUnit.customId = opts.customId;
     }
 
+    // Charge shape ported from the battle-tested amdy.io integration:
+    // payment_source.card.vault_id + stored_credential. PayPal requires the
+    // CIT/MIT framing — charging a vaulted card without it gets declines like
+    // PAYER_CANNOT_PAY. Rules:
+    //   customer-initiated (test charge, pay-now, activation): CUSTOMER/ONE_TIME,
+    //     usage FIRST on the card's first-ever charge, else SUBSEQUENT
+    //   merchant-initiated (monthly cron, retries): MERCHANT/RECURRING/SUBSEQUENT
+    const initiator = (opts.initiatedBy === 'customer') ? 'CUSTOMER' : 'MERCHANT';
+    const storedCredential = {
+      paymentInitiator: initiator,
+      paymentType: initiator === 'MERCHANT' ? 'RECURRING' : 'ONE_TIME',
+      usage: (initiator === 'CUSTOMER' && opts.firstUse) ? 'FIRST' : 'SUBSEQUENT'
+    };
+    console.log('🔖 stored_credential:', JSON.stringify(storedCredential));
+
     const createOrderRequest = {
       body: {
         intent: 'CAPTURE',
         purchaseUnits: [purchaseUnit],
         paymentSource: {
-          token: {
-            id: paymentTokenId,
-            type: 'PAYMENT_METHOD_TOKEN'
+          card: {
+            vaultId: paymentTokenId,
+            storedCredential
           }
         }
       }
