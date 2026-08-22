@@ -7,7 +7,7 @@ import { asyncHandler, createError } from '../middleware/errorHandler.js';
 import { authenticate, requireAdmin } from '../middleware/auth.js';
 import { PRICING_PLANS, calculateMonthlyCharges, calculateEstimate, chargeInvoice, retryPayment } from '../services/billing/billingService.js';
 import { vaultCreditCard, deletePaymentToken, getPaymentToken } from '../services/billing/paypalVault.js';
-import { chargePaymentToken, verifyPaymentToken } from '../services/billing/paypalCharging.js';
+import { chargePaymentToken } from '../services/billing/paypalCharging.js';
 
 const router = express.Router();
 
@@ -484,13 +484,17 @@ router.post('/payment-methods/:id/verify', asyncHandler(async (req, res) => {
   }
 
   try {
-    console.log('\n🔍 ===== VERIFY ENDPOINT CALLED =====');
-    console.log('📝 Payment Method ID:', id);
-    console.log('📝 Vault ID:', paymentMethod.vaultId);
-    console.log('📝 Tenant:', tenant.name);
-    console.log('=======================================\n');
+    console.log(`🔍 Verifying payment method ${id} (vault ${paymentMethod.vaultId?.slice(0, 8)}...) for ${tenant.name}`);
 
-    const verification = await verifyPaymentToken(paymentMethod.vaultId);
+    // Verify by looking the token up in PayPal's vault — no authorization
+    // order, no card hold, nothing for the card network to decline.
+    let verification;
+    try {
+      const tokenInfo = await getPaymentToken(paymentMethod.vaultId);
+      verification = { valid: true, status: tokenInfo?.status || 'VAULTED', tokenId: paymentMethod.vaultId };
+    } catch (lookupErr) {
+      verification = { valid: false, error: `Vault token not found or revoked: ${lookupErr.message}`, tokenId: paymentMethod.vaultId };
+    }
 
     console.log('\n✅ ===== VERIFICATION COMPLETE =====');
     console.log('📊 Valid:', verification.valid);
