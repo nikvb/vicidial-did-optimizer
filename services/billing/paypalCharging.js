@@ -113,10 +113,12 @@ export async function chargePaymentToken(paymentTokenId, amount, currency = 'USD
         }
       }
     };
-    // Idempotency layer 2: PayPal-Request-Id dedupes the create call itself.
-    if (opts.invoiceId) {
-      createOrderRequest.paypalRequestId = `didopt-${opts.invoiceId}`;
-    }
+    // PayPal-Request-Id is REQUIRED whenever payment_source is specified
+    // (PAYPAL_REQUEST_ID_REQUIRED otherwise). With an invoiceId it doubles as
+    // the idempotency key; without one (test charges) it's a unique id.
+    createOrderRequest.paypalRequestId = opts.invoiceId
+      ? `didopt-${opts.invoiceId}`
+      : `didopt-adhoc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
     console.log('🔑 Using Token ID:', paymentTokenId);
     console.log('💵 Charging Amount:', amount.toFixed(2), currency);
