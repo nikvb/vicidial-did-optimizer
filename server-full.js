@@ -271,6 +271,14 @@ app.get('/test-api', (req, res) => {
   res.set('Cache-Control', 'no-cache');
   res.sendFile(path.join(__dirname, 'vicidial-integration', 'scripts', 'test-vicidial-integration.pl'));
 });
+// Legal pages (required by payment/identity providers, linked from footers)
+app.get('/privacy', (req, res) => {
+  res.sendFile(path.join(__dirname, 'legal', 'privacy.html'));
+});
+app.get('/terms', (req, res) => {
+  res.sendFile(path.join(__dirname, 'legal', 'terms.html'));
+});
+
 app.get('/install', (req, res) => {
   const scriptPath = path.join(__dirname, 'vicidial-integration', 'scripts', 'install-agi.sh');
   res.set('Content-Type', 'text/plain');
