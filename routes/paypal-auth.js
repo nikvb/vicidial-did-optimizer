@@ -51,7 +51,10 @@ router.get('/', (req, res) => {
     flowEntry: 'static',
     client_id: process.env.PAYPAL_CLIENT_ID,
     response_type: 'code',
-    scope: 'openid email profile',
+    // Minimal scope: 'profile' requires extra app-level approval and causes
+    // PayPal to bounce back without a code when not granted. Name fields are
+    // nice-to-have; email is what we key accounts on.
+    scope: 'openid email',
     redirect_uri: callbackUrl(),
     state: makeState()
   });
@@ -67,7 +70,10 @@ router.get('/callback', async (req, res) => {
 
   try {
     const { code, state } = req.query;
-    if (!code) return fail('no code in callback');
+    if (!code) {
+      // PayPal reports WHY via query params — log them so failures are diagnosable
+      return fail(`no code in callback — query: ${JSON.stringify(req.query)}`);
+    }
     if (!state || !verifyState(state)) return fail('bad state (CSRF check)');
 
     // 1) Exchange authorization code for tokens

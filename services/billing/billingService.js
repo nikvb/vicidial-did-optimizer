@@ -311,7 +311,8 @@ export async function activateTenantWithProratedCharge(tenant, paymentMethod) {
   }
 
   try {
-    await chargeInvoice(invoice, tenant, paymentMethod);
+    // Activation is customer-initiated: the user just added this card
+    await chargeInvoice(invoice, tenant, paymentMethod, { initiatedBy: 'customer', firstUse: !paymentMethod.lastUsedAt });
     return { activated: true, invoice, charged: true, amount: proratedTotal };
   } catch (err) {
     // Activation stands; the failed invoice enters the normal retry/dunning path.
@@ -364,7 +365,7 @@ export async function processMonthlyBilling(tenant) {
 /**
  * Charge invoice using payment method
  */
-export async function chargeInvoice(invoice, tenant, paymentMethod) {
+export async function chargeInvoice(invoice, tenant, paymentMethod, chargeOpts = {}) {
   console.log(`💰 Charging invoice ${invoice.invoiceNumber} using ${paymentMethod.type}...`);
 
   try {
@@ -373,7 +374,10 @@ export async function chargeInvoice(invoice, tenant, paymentMethod) {
     if (paymentMethod.type === 'paypal_account') {
       result = await chargePayPalAccount(invoice, tenant);
     } else if (paymentMethod.type === 'credit_card' || paymentMethod.type === 'debit_card') {
-      result = await chargeVaultedCard(paymentMethod.vaultId, invoice);
+      result = await chargeVaultedCard(paymentMethod.vaultId, invoice, {
+        initiatedBy: chargeOpts.initiatedBy || 'merchant',
+        firstUse: chargeOpts.firstUse ?? !paymentMethod.lastUsedAt
+      });
     } else {
       throw new Error(`Unsupported payment method type: ${paymentMethod.type}`);
     }
@@ -424,13 +428,14 @@ async function chargePayPalAccount(invoice, tenant) {
 /**
  * Charge vaulted credit card using PayPal vault token
  */
-async function chargeVaultedCard(vaultId, invoice) {
+async function chargeVaultedCard(vaultId, invoice, chargeOpts = {}) {
   return await chargePaymentToken(
     vaultId,
     invoice.amounts.total,
     'USD',
     `Invoice ${invoice.invoiceNumber} - ${invoice.subscription.plan} Plan`,
     {
+      ...chargeOpts,
       // Stable idempotency key: PayPal rejects a duplicate invoice_id, and the
       // PayPal-Request-Id header dedupes the create call — a re-run cannot
       // double-charge even if our DB state is stale.

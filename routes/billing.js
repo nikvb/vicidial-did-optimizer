@@ -378,13 +378,17 @@ router.post('/payment-methods/:id/test-charge', [
   }
 
   try {
-    // Charge the payment token
+    // Charge the payment token — customer-initiated (user clicked the button);
+    // FIRST usage if this card has never been charged before
     const chargeResult = await chargePaymentToken(
       paymentMethod.vaultId,
       amount,
       'USD',
-      `Test charge - ${tenant.name}`
+      `Test charge - ${tenant.name}`,
+      { initiatedBy: 'customer', firstUse: !paymentMethod.lastUsedAt }
     );
+    paymentMethod.lastUsedAt = new Date();
+    await tenant.save();
 
     // Create an invoice record for this test charge
     const now = new Date();
@@ -835,7 +839,8 @@ router.post('/invoices/:id/pay', asyncHandler(async (req, res) => {
     throw createError.badRequest('Payments are temporarily disabled — please try again later');
   }
 
-  await doCharge(invoice, tenant, paymentMethod);
+  // Pay-now is customer-initiated (user clicked the button)
+  await doCharge(invoice, tenant, paymentMethod, { initiatedBy: 'customer' });
 
   res.json({
     success: true,
