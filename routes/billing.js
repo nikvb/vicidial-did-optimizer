@@ -352,8 +352,9 @@ router.put('/payment-methods/:id/primary', asyncHandler(async (req, res) => {
 
 // @desc    Test charge a payment method
 // @route   POST /api/v1/billing/payment-methods/:id/test-charge
-// @access  Admin only — this moves REAL money; capped at $1.00
-router.post('/payment-methods/:id/test-charge', requireAdmin, [
+// @access  Private — users may verify their own card with a REAL charge,
+//          hard-capped at $1.00 (was $10,000 before the billing-golive audit)
+router.post('/payment-methods/:id/test-charge', [
   body('amount').isFloat({ min: 0.01, max: 1.00 }).withMessage('Test amount must be between $0.01 and $1.00')
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
