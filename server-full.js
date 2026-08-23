@@ -71,6 +71,7 @@ import didRoutes from './temp_clone/routes/dids.js';
 import billingRoutes from './routes/billing.js';
 import paypalWebhookRoutes from './routes/paypal-webhook.js';
 import paypalAuthRoutes from './routes/paypal-auth.js';
+import adminRoutes from './routes/admin.js';
 import tenantRoutes from './temp_clone/routes/tenants.js';
 import vicidialRoutes from './routes/vicidial.js';
 import campaignDIDPoolRoutes from './routes/campaignDIDPools.js';
@@ -244,6 +245,9 @@ app.use('/api/v1/billing/webhook/paypal', paypalWebhookRoutes);
 
 // Log in with PayPal (OAuth) — public, no auth
 app.use('/api/v1/auth/paypal', paypalAuthRoutes);
+
+// Admin management API (users + tenant billing controls) — ADMIN role only
+app.use('/api/v1/admin', adminRoutes);
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
