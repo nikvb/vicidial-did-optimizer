@@ -394,7 +394,7 @@ router.post('/payment-methods/:id/test-charge', [
     const now = new Date();
     const invoice = new Invoice({
       tenantId: tenant._id,
-      invoiceNumber: `TEST-${Date.now()}`,
+      invoiceNumber: `DIDS-AMDY-TEST-${Date.now()}`,
       status: 'paid',
       billingPeriod: {
         start: now,

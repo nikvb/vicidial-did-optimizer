@@ -146,7 +146,9 @@ invoiceSchema.pre('save', async function(next) {
       }
     });
 
-    this.invoiceNumber = `INV-${year}${month}-${String(count + 1).padStart(5, '0')}`;
+    // Branded prefix: identifies DID Optimizer charges on PayPal statements
+    // and dashboards (this number is also sent as PayPal invoice_id)
+    this.invoiceNumber = `DIDS-AMDY-${year}${month}-${String(count + 1).padStart(5, '0')}`;
   }
   next();
 });
