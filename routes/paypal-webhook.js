@@ -75,7 +75,7 @@ async function verifyWebhookSignature(headers, rawBody) {
 /** Find the invoice referenced by a capture's invoice_id / custom_id. */
 async function findInvoiceForCapture(resource) {
   const invoiceNumber = resource?.invoice_id
-    || (resource?.custom_id?.match(/INV-\d{6}-\d{5}/) || [])[0];
+    || (resource?.custom_id?.match(/(?:DIDS-AMDY(?:-R)?|INV|RINV)-\d{6}-\d{5}/) || [])[0];
   if (!invoiceNumber) return null;
   return Invoice.findOne({ invoiceNumber });
 }

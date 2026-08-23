@@ -73,7 +73,7 @@ resellerInvoiceSchema.pre('validate', async function(next) {
         $lt:  new Date(year, date.getMonth() + 1, 1)
       }
     });
-    this.invoiceNumber = `RINV-${year}${month}-${String(count + 1).padStart(5, '0')}`;
+    this.invoiceNumber = `DIDS-AMDY-R-${year}${month}-${String(count + 1).padStart(5, "0")}`;
   }
   next();
 });
