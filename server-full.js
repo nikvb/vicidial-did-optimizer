@@ -72,6 +72,7 @@ import billingRoutes from './routes/billing.js';
 import paypalWebhookRoutes from './routes/paypal-webhook.js';
 import paypalAuthRoutes from './routes/paypal-auth.js';
 import adminRoutes from './routes/admin.js';
+import creditRoutes from './routes/credit.js';
 import tenantRoutes from './temp_clone/routes/tenants.js';
 import vicidialRoutes from './routes/vicidial.js';
 import campaignDIDPoolRoutes from './routes/campaignDIDPools.js';
@@ -1164,6 +1165,7 @@ app.use('/api/v1/billing', (req, res, next) => {
 
 console.log('🔧 Mounting billing routes at /api/v1/billing...');
 app.use('/api/v1/billing', billingRoutes);
+app.use('/api/v1/billing', creditRoutes); // /credit, /topup, /crypto/*
 console.log('✅ Billing routes mounted!');
 app.use('/api/v1/tenants', tenantRoutes);
 app.use('/api/v1/settings/vicidial', vicidialRoutes);

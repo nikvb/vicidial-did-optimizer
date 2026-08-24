@@ -3,6 +3,7 @@ import DID from '../../models/DID.js';
 import Invoice from '../../models/Invoice.js';
 import { sendInvoiceEmail, sendPaymentSuccessEmail, sendPaymentFailedEmail, sendAccountSuspendedEmail } from '../email/billingEmails.js';
 import { chargePaymentToken } from './paypalCharging.js';
+import { creditTenant, deductCredit, getCreditBalanceCents } from './creditService.js';
 import {
   DIRECT_TIERS,
   FLAT_RATES,
@@ -342,6 +343,10 @@ export async function processMonthlyBilling(tenant) {
         } else {
           await chargeInvoice(invoice, tenant, paymentMethod);
         }
+      } else if (invoice.status !== 'paid' &&
+                 (await getCreditBalanceCents(tenant._id)) >= Math.round(invoice.amounts.total * 100)) {
+        // No card, but the prepaid balance covers the invoice — settle from credit
+        await chargeInvoice(invoice, tenant, null);
       } else {
         console.log(`⚠️ No payment method found for ${tenant.name}, sending invoice email`);
         await sendInvoiceEmail(invoice, tenant);
@@ -363,18 +368,37 @@ export async function processMonthlyBilling(tenant) {
 }
 
 /**
- * Charge invoice using payment method
+ * Charge invoice: prepaid credit first, card only for the remainder.
+ * `paymentMethod` may be null for a credit-only settle (throws if the balance
+ * doesn't cover the invoice). If the card charge for the remainder fails, the
+ * credit deduction is refunded — the invoice is settled all-or-nothing.
  */
 export async function chargeInvoice(invoice, tenant, paymentMethod, chargeOpts = {}) {
-  console.log(`💰 Charging invoice ${invoice.invoiceNumber} using ${paymentMethod.type}...`);
+  console.log(`💰 Charging invoice ${invoice.invoiceNumber} using ${paymentMethod?.type || 'credit balance'}...`);
+
+  // Draw from the prepaid credit balance first (atomic; takes what's available)
+  const totalCents = Math.round(invoice.amounts.total * 100);
+  const { deductedCents, balanceAfterCents } = await deductCredit(
+    tenant._id, totalCents, 'invoice_applied', invoice.invoiceNumber
+  );
+  const remainderCents = totalCents - deductedCents;
+  invoice.amounts.creditApplied = deductedCents / 100;
+  // Sync the in-memory doc so a later tenant.save() in this flow can't write
+  // a stale balance over the atomic $inc we just did.
+  if (balanceAfterCents != null) tenant.billing.creditBalanceCents = balanceAfterCents;
 
   try {
     let result;
 
-    if (paymentMethod.type === 'paypal_account') {
+    if (remainderCents === 0) {
+      result = { transactionId: `credit-${invoice.invoiceNumber}`, orderId: null };
+      console.log(`💵 Invoice ${invoice.invoiceNumber} fully covered by credit balance ($${(deductedCents / 100).toFixed(2)})`);
+    } else if (!paymentMethod) {
+      throw new Error('Insufficient credit balance and no payment method on file');
+    } else if (paymentMethod.type === 'paypal_account') {
       result = await chargePayPalAccount(invoice, tenant);
     } else if (paymentMethod.type === 'credit_card' || paymentMethod.type === 'debit_card') {
-      result = await chargeVaultedCard(paymentMethod.vaultId, invoice, {
+      result = await chargeVaultedCard(paymentMethod.vaultId, invoice, remainderCents / 100, {
         initiatedBy: chargeOpts.initiatedBy || 'merchant',
         firstUse: chargeOpts.firstUse ?? !paymentMethod.lastUsedAt
       });
@@ -383,11 +407,13 @@ export async function chargeInvoice(invoice, tenant, paymentMethod, chargeOpts =
     }
 
     // Mark invoice as paid
-    await invoice.markAsPaid(result.transactionId, paymentMethod._id);
+    await invoice.markAsPaid(result.transactionId, paymentMethod?._id);
 
-    // Update payment method last used
-    paymentMethod.lastUsedAt = new Date();
-    await tenant.save();
+    // Update payment method last used (only if the card was actually charged)
+    if (remainderCents > 0 && paymentMethod) {
+      paymentMethod.lastUsedAt = new Date();
+      await tenant.save();
+    }
 
     // Update tenant billing totals
     tenant.billing.totalPaid += invoice.amounts.total;
@@ -405,6 +431,14 @@ export async function chargeInvoice(invoice, tenant, paymentMethod, chargeOpts =
     return result;
   } catch (error) {
     console.error(`❌ Payment failed for invoice ${invoice.invoiceNumber}:`, error);
+
+    // Give back the credit we drew — the invoice settles all-or-nothing
+    if (deductedCents > 0) {
+      invoice.amounts.creditApplied = 0;
+      tenant.billing.creditBalanceCents = await creditTenant(
+        tenant._id, deductedCents, 'invoice_refund', invoice.invoiceNumber,
+        'card charge for remainder failed');
+    }
 
     // Mark invoice as failed
     await invoice.markAsFailed(error.message || 'Payment processing failed');
@@ -426,12 +460,14 @@ async function chargePayPalAccount(invoice, tenant) {
 }
 
 /**
- * Charge vaulted credit card using PayPal vault token
+ * Charge vaulted credit card using PayPal vault token.
+ * `amountUsd` may be less than the invoice total when prepaid credit
+ * covered part of it.
  */
-async function chargeVaultedCard(vaultId, invoice, chargeOpts = {}) {
+async function chargeVaultedCard(vaultId, invoice, amountUsd, chargeOpts = {}) {
   return await chargePaymentToken(
     vaultId,
-    invoice.amounts.total,
+    amountUsd,
     'USD',
     `Invoice ${invoice.invoiceNumber} - ${invoice.subscription.plan} Plan`,
     {
@@ -500,10 +536,8 @@ export async function retryPayment(invoice) {
     throw new Error('Tenant not found');
   }
 
-  const paymentMethod = tenant.getPrimaryPaymentMethod();
-  if (!paymentMethod) {
-    throw new Error('No payment method found');
-  }
+  // null is fine — chargeInvoice settles from credit balance if it covers
+  const paymentMethod = tenant.getPrimaryPaymentMethod() || null;
 
   return await chargeInvoice(invoice, tenant, paymentMethod);
 }
