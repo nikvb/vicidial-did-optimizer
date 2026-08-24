@@ -247,11 +247,12 @@ app.use('/api/v1/billing/webhook/paypal', paypalWebhookRoutes);
 // Log in with PayPal (OAuth) — public, no auth
 app.use('/api/v1/auth/paypal', paypalAuthRoutes);
 
-// Admin management API (users + tenant billing controls) — ADMIN role only
-app.use('/api/v1/admin', adminRoutes);
-
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Admin management API (users + tenant billing controls) — ADMIN role only.
+// Must come AFTER express.json(): its POST/PUT endpoints read req.body.
+app.use('/api/v1/admin', adminRoutes);
 // app.use(mongoSanitize()); // Commented out - incompatible with Express 5
 
 // Configure multer for file uploads

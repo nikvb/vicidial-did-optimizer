@@ -4,14 +4,186 @@ import express from 'express';
 import { body, validationResult } from 'express-validator';
 import User from '../models/User.js';
 import Tenant from '../models/Tenant.js';
+import Invoice from '../models/Invoice.js';
+import AuditLog from '../models/AuditLog.js';
+import DID from '../models/DID.js';
 import CryptoPayment from '../models/CryptoPayment.js';
 import { asyncHandler, createError } from '../middleware/errorHandler.js';
 import { authenticate, requireAdmin } from '../middleware/auth.js';
 import { creditTenant, deductCredit } from '../services/billing/creditService.js';
 import { getUsdtBalance, sweepTenantUsdt } from '../services/billing/tronWallet.js';
+import { getEffectiveRate } from '../services/billing/billingService.js';
 
 const router = express.Router();
 router.use(authenticate, requireAdmin);
+
+// =====================================================
+// PLATFORM OVERVIEW
+// =====================================================
+
+// @desc    Billing-focused platform overview for the admin dashboard
+// @route   GET /api/v1/admin/overview
+router.get('/overview', asyncHandler(async (req, res) => {
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  const [tenants, userCounts, invoiceAgg, monthAgg, recentTenants] = await Promise.all([
+    Tenant.find({}, 'name subscription billing.creditBalanceCents billing.paymentMethods createdAt').lean(),
+    User.aggregate([{ $group: { _id: '$isActive', n: { $sum: 1 } } }]),
+    Invoice.aggregate([
+      { $group: { _id: '$status', n: { $sum: 1 }, amount: { $sum: '$amounts.total' } } }
+    ]),
+    Invoice.aggregate([
+      { $match: { status: 'paid', 'paymentDetails.paidAt': { $gte: monthStart } } },
+      { $group: { _id: null, n: { $sum: 1 }, amount: { $sum: '$amounts.total' } } }
+    ]),
+    Tenant.find({}, 'name subscription.status createdAt').sort({ createdAt: -1 }).limit(5).lean()
+  ]);
+
+  // Billable DIDs per tenant in one aggregation (avoids N queries)
+  const didCounts = await DID.aggregate([
+    { $match: { status: 'active', isActive: true } },
+    { $group: { _id: '$tenantId', n: { $sum: 1 } } }
+  ]);
+  const didByTenant = Object.fromEntries(didCounts.map(d => [String(d._id), d.n]));
+
+  const statusCounts = { active: 0, trial: 0, suspended: 0, cancelled: 0 };
+  let projectedMrr = 0, totalBillableDids = 0, totalCreditCents = 0, withCard = 0;
+  for (const t of tenants) {
+    const status = t.subscription?.status || 'trial';
+    statusCounts[status] = (statusCounts[status] || 0) + 1;
+    totalCreditCents += t.billing?.creditBalanceCents || 0;
+    if ((t.billing?.paymentMethods || []).some(pm => pm.isActive)) withCard++;
+    const dids = didByTenant[String(t._id)] || 0;
+    totalBillableDids += dids;
+    if (status === 'active') {
+      projectedMrr += dids * getEffectiveRate(t).rate;
+    }
+  }
+
+  const invByStatus = Object.fromEntries(invoiceAgg.map(i => [i._id, { count: i.n, amount: +i.amount.toFixed(2) }]));
+
+  res.json({
+    success: true,
+    data: {
+      tenants: { total: tenants.length, ...statusCounts, withPaymentMethod: withCard },
+      users: {
+        total: userCounts.reduce((a, u) => a + u.n, 0),
+        active: userCounts.find(u => u._id === true)?.n || 0
+      },
+      dids: { billable: totalBillableDids },
+      revenue: {
+        projectedMrr: +projectedMrr.toFixed(2),
+        collectedThisMonth: +(monthAgg[0]?.amount || 0).toFixed(2),
+        paidInvoicesThisMonth: monthAgg[0]?.n || 0,
+        collectedAllTime: invByStatus.paid?.amount || 0,
+        outstanding: +((invByStatus.pending?.amount || 0) + (invByStatus.failed?.amount || 0)).toFixed(2)
+      },
+      invoices: invByStatus,
+      credit: { totalHeldUsd: +(totalCreditCents / 100).toFixed(2) },
+      recentSignups: recentTenants.map(t => ({
+        tenantId: t._id, name: t.name, status: t.subscription?.status, createdAt: t.createdAt
+      }))
+    }
+  });
+}));
+
+// =====================================================
+// INVOICES (cross-tenant)
+// =====================================================
+
+// @desc    List invoices across all tenants
+// @route   GET /api/v1/admin/invoices?status=&limit=
+router.get('/invoices', asyncHandler(async (req, res) => {
+  const { status } = req.query;
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  const query = {};
+  if (status && ['draft', 'pending', 'paid', 'failed', 'refunded', 'cancelled'].includes(status)) {
+    query.status = status;
+  }
+
+  const invoices = await Invoice.find(query)
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .populate('tenantId', 'name')
+    .lean();
+
+  res.json({
+    success: true,
+    data: {
+      invoices: invoices.map(i => ({
+        id: i._id,
+        invoiceNumber: i.invoiceNumber,
+        tenantName: i.tenantId?.name || null,
+        tenantId: i.tenantId?._id || null,
+        period: i.billingPeriod,
+        didCount: i.didCharges?.didCount || 0,
+        total: i.amounts?.total || 0,
+        creditApplied: i.amounts?.creditApplied || 0,
+        status: i.status,
+        retryCount: i.paymentDetails?.retryCount || 0,
+        failureReason: i.paymentDetails?.failureReason || null,
+        paidAt: i.paymentDetails?.paidAt || null,
+        createdAt: i.createdAt
+      }))
+    }
+  });
+}));
+
+// @desc    Manually mark an invoice paid (wire transfer, comped, etc.)
+// @route   POST /api/v1/admin/invoices/:id/mark-paid
+router.post('/invoices/:id/mark-paid', [
+  body('notes').optional().isString().isLength({ max: 200 })
+], asyncHandler(async (req, res) => {
+  const invoice = await Invoice.findById(req.params.id);
+  if (!invoice) throw createError.notFound('Invoice not found');
+  if (invoice.status === 'paid') throw createError.badRequest('Invoice is already paid');
+
+  invoice.status = 'paid';
+  invoice.paymentDetails.provider = 'manual';
+  invoice.paymentDetails.transactionId = `manual-${req.user.email}`;
+  invoice.paymentDetails.paidAt = new Date();
+  if (req.body.notes) invoice.metadata.notes = req.body.notes;
+  await invoice.save();
+
+  console.log(`🧾 Admin ${req.user.email}: invoice ${invoice.invoiceNumber} manually marked paid`);
+  res.json({ success: true, data: { invoiceNumber: invoice.invoiceNumber, status: invoice.status } });
+}));
+
+// =====================================================
+// AUDIT LOG
+// =====================================================
+
+// @desc    Recent audit log entries (filter by action / tenant)
+// @route   GET /api/v1/admin/audit?action=&tenantId=&limit=
+router.get('/audit', asyncHandler(async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  const query = {};
+  if (req.query.action) query.action = req.query.action;
+  if (req.query.tenantId) query.tenantId = req.query.tenantId;
+
+  const logs = await AuditLog.find(query)
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .populate('userId', 'email')
+    .populate('tenantId', 'name')
+    .lean();
+
+  res.json({
+    success: true,
+    data: {
+      logs: logs.map(l => ({
+        id: l._id,
+        action: l.action,
+        userEmail: l.userId?.email || null,
+        tenantName: l.tenantId?.name || null,
+        details: l.details || {},
+        ipAddress: l.ipAddress || null,
+        createdAt: l.createdAt
+      }))
+    }
+  });
+}));
 
 // =====================================================
 // USERS
