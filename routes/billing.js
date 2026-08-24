@@ -835,8 +835,15 @@ router.post('/invoices/:id/pay', asyncHandler(async (req, res) => {
     throw createError.badRequest(`Invoice status '${invoice.status}' is not payable`);
   }
 
-  const paymentMethod = tenant.getPrimaryPaymentMethod();
-  if (!paymentMethod) throw createError.badRequest('No payment method on file — add one first');
+  // Credit balance is drawn first; a card is only required if it doesn't
+  // cover the full invoice.
+  const paymentMethod = tenant.getPrimaryPaymentMethod() || null;
+  if (!paymentMethod) {
+    const balanceCents = tenant.billing.creditBalanceCents || 0;
+    if (balanceCents < Math.round(invoice.amounts.total * 100)) {
+      throw createError.badRequest('No payment method on file — add one first');
+    }
+  }
 
   const { chargeInvoice: doCharge, chargesEnabled: enabled } = await import('../services/billing/billingService.js');
   if (!enabled()) {

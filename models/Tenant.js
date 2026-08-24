@@ -265,6 +265,21 @@ const tenantSchema = new mongoose.Schema({
   }],
   billing: {
     companyName: String,
+    // Prepaid credit in cents (USD). Topped up by card or USDT; monthly
+    // invoices draw from this FIRST, card charges only the remainder.
+    // Single source of truth — never add a second balance field.
+    creditBalanceCents: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    // USDT (TRC-20) deposit address, derived from TRON_MNEMONIC at
+    // m/44'/195'/0'/0/{depositIndex}. Index assigned once per tenant from
+    // an atomic counter; address cached here for lookups.
+    tron: {
+      depositIndex: { type: Number, default: null },
+      address: { type: String, default: null }
+    },
     address: {
       street: String,
       city: String,

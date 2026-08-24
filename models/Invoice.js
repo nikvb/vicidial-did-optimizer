@@ -81,6 +81,12 @@ const invoiceSchema = new mongoose.Schema({
     total: {
       type: Number,
       required: true
+    },
+    // Portion of `total` settled from the tenant's prepaid credit balance.
+    // The card is only charged (total - creditApplied).
+    creditApplied: {
+      type: Number,
+      default: 0
     }
   },
   status: {

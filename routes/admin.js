@@ -4,8 +4,11 @@ import express from 'express';
 import { body, validationResult } from 'express-validator';
 import User from '../models/User.js';
 import Tenant from '../models/Tenant.js';
+import CryptoPayment from '../models/CryptoPayment.js';
 import { asyncHandler, createError } from '../middleware/errorHandler.js';
 import { authenticate, requireAdmin } from '../middleware/auth.js';
+import { creditTenant, deductCredit } from '../services/billing/creditService.js';
+import { getUsdtBalance, sweepTenantUsdt } from '../services/billing/tronWallet.js';
 
 const router = express.Router();
 router.use(authenticate, requireAdmin);
@@ -196,6 +199,99 @@ router.post('/tenants/:id/promo', [
 
   console.log(`🎁 Admin ${req.user.email}: promo $${rate}/DID x ${months}mo granted to ${tenant.name}`);
   res.json({ success: true, data: { tenantId: tenant._id, promo: tenant.subscription.promo } });
+}));
+
+// =====================================================
+// CREDIT / CRYPTO
+// =====================================================
+
+// @desc    Crypto overview: recent deposits, tenants holding credit, treasury balance
+// @route   GET /api/v1/admin/crypto
+router.get('/crypto', asyncHandler(async (req, res) => {
+  const treasury = process.env.TRON_TREASURY_ADDRESS || '';
+
+  const [payments, tenantsWithCredit, treasuryBalance] = await Promise.all([
+    CryptoPayment.find({}).sort({ createdAt: -1 }).limit(50)
+      .populate('tenantId', 'name').lean(),
+    Tenant.find({ 'billing.creditBalanceCents': { $gt: 0 } },
+      'name billing.creditBalanceCents billing.tron')
+      .sort({ 'billing.creditBalanceCents': -1 }).lean(),
+    treasury ? getUsdtBalance(treasury).catch(() => null) : Promise.resolve(null)
+  ]);
+
+  res.json({
+    success: true,
+    data: {
+      treasury,
+      treasuryBalanceUsdt: treasuryBalance,
+      totalCreditsUsd: tenantsWithCredit.reduce((a, t) => a + t.billing.creditBalanceCents, 0) / 100,
+      tenantsWithCredit: tenantsWithCredit.map(t => ({
+        tenantId: t._id,
+        name: t.name,
+        balanceUsd: t.billing.creditBalanceCents / 100,
+        tronAddress: t.billing.tron?.address || null
+      })),
+      payments: payments.map(p => ({
+        id: p._id,
+        tenantName: p.tenantId?.name || null,
+        tronAddress: p.tronAddress,
+        amountUsd: p.amountUsd,
+        amountUsdt: p.amountUsdt,
+        txHash: p.txHash,
+        status: p.status,
+        createdAt: p.createdAt,
+        creditedAt: p.creditedAt
+      }))
+    }
+  });
+}));
+
+// @desc    Sweep a tenant's USDT deposit address to the treasury (or a given address)
+// @route   POST /api/v1/admin/crypto/sweep  { tenantId, destination? }
+router.post('/crypto/sweep', [
+  body('tenantId').isMongoId().withMessage('tenantId required'),
+  body('destination').optional().isString()
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) throw createError.badRequest(errors.array()[0].msg);
+
+  const tenant = await Tenant.findById(req.body.tenantId);
+  if (!tenant) throw createError.notFound('Tenant not found');
+
+  const result = await sweepTenantUsdt(tenant, req.body.destination || undefined);
+  console.log(`🪙 Admin ${req.user.email}: swept ${result.amount.toFixed(2)} USDT for ${tenant.name} (${result.txHash})`);
+  res.json({ success: true, data: result });
+}));
+
+// @desc    Manually adjust a tenant's credit balance (support refunds/corrections)
+// @route   POST /api/v1/admin/tenants/:id/credit  { amountUsd (±), notes? }
+router.post('/tenants/:id/credit', [
+  body('amountUsd').isFloat().custom(v => v !== 0).withMessage('amountUsd must be non-zero'),
+  body('notes').optional().isString().isLength({ max: 200 })
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) throw createError.badRequest(errors.array()[0].msg);
+
+  const tenant = await Tenant.findById(req.params.id);
+  if (!tenant) throw createError.notFound('Tenant not found');
+
+  const cents = Math.round(Number(req.body.amountUsd) * 100);
+  let balanceAfterCents;
+  if (cents > 0) {
+    balanceAfterCents = await creditTenant(tenant._id, cents, 'admin_adjust', req.user.email, req.body.notes);
+  } else {
+    const available = tenant.billing.creditBalanceCents || 0;
+    if (available < -cents) {
+      throw createError.badRequest(`Balance too low — only $${(available / 100).toFixed(2)} available to deduct`);
+    }
+    const { balanceAfterCents: after } = await deductCredit(
+      tenant._id, -cents, 'admin_adjust', req.user.email, req.body.notes
+    );
+    balanceAfterCents = after;
+  }
+
+  console.log(`💵 Admin ${req.user.email}: ${tenant.name} credit ${cents > 0 ? '+' : ''}$${(cents / 100).toFixed(2)}`);
+  res.json({ success: true, data: { tenantId: tenant._id, balanceUsd: balanceAfterCents / 100 } });
 }));
 
 export default router;
