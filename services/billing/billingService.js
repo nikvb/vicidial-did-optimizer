@@ -12,6 +12,7 @@ import {
   ANNUAL_PREPAY_MONTHS_BILLED_ENTERPRISE,
   calculateDirectCharge,
   calculateFlatCharge,
+  calculateBundleCharge,
   rateFor,
   serializeTiers
 } from './pricingCurves.js';
@@ -114,6 +115,32 @@ export async function calculateMonthlyCharges(tenant) {
   const didCount = await countBillableDids(tenant._id);
 
   const didSource = tenant.subscription?.didSource || 'byo';
+
+  // Flat bundle takes precedence over all per-DID pricing when enabled.
+  const bundle = tenant.subscription?.bundle;
+  if (bundle?.enabled && bundle.flatPriceUsd != null && bundle.includedDids != null) {
+    const bundleData = calculateBundleCharge(didCount, bundle);
+    const tax = calculateTax(bundleData.totalMonthlyCharge, tenant.billing?.address);
+    const total = +(bundleData.totalMonthlyCharge + tax).toFixed(2);
+    return {
+      didCount,
+      tier: bundle.label || `Bundle — $${bundle.flatPriceUsd}/mo for ${bundle.includedDids.toLocaleString()} DIDs`,
+      didSource,
+      rateSource: 'bundle',
+      promo: null,
+      baseFee: 0,
+      didCharges: bundleData.totalMonthlyCharge,
+      tierBreakdown: bundleData.breakdown,
+      totalDidFee: bundleData.totalMonthlyCharge,
+      includedDids: bundle.includedDids,
+      extraDids: Math.max(0, didCount - bundle.includedDids),
+      perDidRate: bundle.overageRatePerDid || 0,
+      subtotal: bundleData.totalMonthlyCharge,
+      tax,
+      total
+    };
+  }
+
   const eff = getEffectiveRate(tenant);
   const rate = eff.rate;
   const chargeData = calculateFlatCharge(didCount, rate);

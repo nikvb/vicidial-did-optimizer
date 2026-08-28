@@ -868,14 +868,19 @@ router.post('/invoices/:id/pay', asyncHandler(async (req, res) => {
 // @route   GET /api/v1/billing/admin/tenants
 // @access  Admin only
 router.get('/admin/tenants', requireAdmin, asyncHandler(async (req, res) => {
-  const { rateFor } = await import('../services/billing/pricingCurves.js');
-  const tenants = await Tenant.find({}, 'name subscription.status subscription.didSource subscription.perDidPricing.customRate billing.paymentMethods').lean();
+  const { rateFor, calculateBundleCharge } = await import('../services/billing/pricingCurves.js');
+  const tenants = await Tenant.find({}, 'name subscription.status subscription.didSource subscription.perDidPricing.customRate subscription.bundle billing.paymentMethods').lean();
 
   const rows = await Promise.all(tenants.map(async (t) => {
     const didCount = await DID.countDocuments({ tenantId: t._id, status: 'active', isActive: true });
     const didSource = t.subscription?.didSource || 'byo';
     const customRate = t.subscription?.perDidPricing?.customRate ?? null;
     const rate = rateFor(didSource, customRate);
+    const bundle = t.subscription?.bundle;
+    const bundleActive = bundle?.enabled && bundle.flatPriceUsd != null && bundle.includedDids != null;
+    const projectedMonthly = bundleActive
+      ? calculateBundleCharge(didCount, bundle).totalMonthlyCharge
+      : +(didCount * rate).toFixed(2);
     return {
       tenantId: t._id,
       name: t.name,
@@ -883,8 +888,9 @@ router.get('/admin/tenants', requireAdmin, asyncHandler(async (req, res) => {
       didSource,
       customRate,
       effectiveRate: rate,
+      bundle: bundleActive ? { includedDids: bundle.includedDids, flatPriceUsd: bundle.flatPriceUsd, overageRatePerDid: bundle.overageRatePerDid || 0 } : null,
       billableDids: didCount,
-      projectedMonthly: +(didCount * rate).toFixed(2),
+      projectedMonthly,
       hasPaymentMethod: (t.billing?.paymentMethods || []).some(pm => pm.isActive)
     };
   }));

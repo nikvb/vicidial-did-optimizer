@@ -64,6 +64,17 @@ const tenantSchema = new mongoose.Schema({
       endsAt: { type: Date, default: null },
       label: { type: String, default: null }
     },
+    // Flat bundle: a fixed monthly price for up to `includedDids`, with optional
+    // per-DID overage beyond. When enabled it OVERRIDES per-DID pricing entirely
+    // (highest precedence: bundle > customRate > promo > flat). overageRatePerDid
+    // of 0 makes it a true flat price regardless of DID count.
+    bundle: {
+      enabled: { type: Boolean, default: false },
+      includedDids: { type: Number, default: null },
+      flatPriceUsd: { type: Number, default: null },
+      overageRatePerDid: { type: Number, default: 0 },
+      label: { type: String, default: null }
+    },
     trialEndsAt: {
       type: Date,
       default: () => new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) // 14 days trial
