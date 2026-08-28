@@ -168,19 +168,35 @@ class BackgroundScraperService {
       ).lean();
       const blacklistedSet = new Set(blacklisted.map(r => r.phoneNumber));
 
-      // Only scrape DIDs owned by PAYING tenants (subscription.status === 'active').
-      // Trial / suspended / cancelled tenants are excluded so we don't burn proxy
-      // and scraping budget on accounts that haven't paid.
+      // Scrape DIDs owned by tenants that are either PAYING (subscription.status
+      // === 'active') OR have had a user log in within the recent-login window
+      // (default 14 days, SCRAPER_LOGIN_WINDOW_DAYS). This keeps active customers
+      // covered while also refreshing anyone who has recently touched the app,
+      // without burning proxy budget on long-dormant accounts.
       const Tenant = mongoose.model('Tenant');
-      const paidTenants = await Tenant.find(
-        { 'subscription.status': 'active' },
-        { _id: 1 }
-      ).lean();
-      const paidTenantIds = paidTenants.map(t => t._id);
+      const User = mongoose.model('User');
+
+      const windowDays = parseInt(process.env.SCRAPER_LOGIN_WINDOW_DAYS) || 14;
+      const loginSince = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+
+      const [paidTenants, recentUsers] = await Promise.all([
+        Tenant.find({ 'subscription.status': 'active' }, { _id: 1 }).lean(),
+        User.find({ lastLogin: { $gte: loginSince } }, { tenant: 1, tenantId: 1 }).lean()
+      ]);
+
+      // Union tenant ids from both sources, de-duplicated by string form.
+      const tenantIdSet = new Map();
+      for (const t of paidTenants) tenantIdSet.set(String(t._id), t._id);
+      for (const u of recentUsers) {
+        const ref = u.tenant || u.tenantId;
+        if (ref) tenantIdSet.set(String(ref), ref);
+      }
+      const paidTenantIds = [...tenantIdSet.values()];
       if (paidTenantIds.length === 0) {
-        console.log('💤 No paying tenants — skipping reputation scrape cycle');
+        console.log('💤 No active or recently-logged-in tenants — skipping reputation scrape cycle');
         return [];
       }
+      console.log(`🎯 Scrape scope: ${paidTenants.length} active + recent logins (≤${windowDays}d) → ${paidTenantIds.length} tenants`);
 
       // Pull a much larger candidate pool so when we skip blacklisted zombies
       // we still have enough non-blacklisted DIDs left to fill the batch.
