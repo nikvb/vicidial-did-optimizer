@@ -13,6 +13,7 @@ import { authenticate, requireAdmin } from '../middleware/auth.js';
 import { creditTenant, deductCredit } from '../services/billing/creditService.js';
 import { getUsdtBalance, sweepTenantUsdt } from '../services/billing/tronWallet.js';
 import { getEffectiveRate } from '../services/billing/billingService.js';
+import { calculateBundleCharge } from '../services/billing/pricingCurves.js';
 
 const router = express.Router();
 router.use(authenticate, requireAdmin);
@@ -57,7 +58,10 @@ router.get('/overview', asyncHandler(async (req, res) => {
     const dids = didByTenant[String(t._id)] || 0;
     totalBillableDids += dids;
     if (status === 'active') {
-      projectedMrr += dids * getEffectiveRate(t).rate;
+      const bundle = t.subscription?.bundle;
+      projectedMrr += (bundle?.enabled && bundle.flatPriceUsd != null && bundle.includedDids != null)
+        ? calculateBundleCharge(dids, bundle).totalMonthlyCharge
+        : dids * getEffectiveRate(t).rate;
     }
   }
 

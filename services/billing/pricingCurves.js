@@ -68,6 +68,33 @@ export function calculateDirectCharge(totalDids, didSource = 'byo', customRate =
 }
 
 /**
+ * Flat bundle: a fixed monthly price covering up to `includedDids`, plus an
+ * optional per-DID overage for anything beyond. overageRatePerDid = 0 makes it
+ * a true flat price regardless of count. Same return shape as calculateFlatCharge.
+ */
+export function calculateBundleCharge(totalDids, { includedDids, flatPriceUsd, overageRatePerDid = 0 }) {
+  const dids = Math.max(0, Math.floor(totalDids || 0));
+  const included = Math.max(0, Math.floor(includedDids || 0));
+  const overageDids = Math.max(0, dids - included);
+  const overageFee = +(overageDids * (overageRatePerDid || 0)).toFixed(2);
+  const total = +((flatPriceUsd || 0) + overageFee).toFixed(2);
+
+  const breakdown = [{
+    from: 1, to: Math.min(dids, included), rate: 0,
+    didsInTier: Math.min(dids, included), subtotal: +flatPriceUsd.toFixed(2),
+    label: `Bundle — first ${included.toLocaleString()} DIDs, flat $${flatPriceUsd.toFixed(2)}/mo`
+  }];
+  if (overageDids > 0) {
+    breakdown.push({
+      from: included + 1, to: dids, rate: overageRatePerDid,
+      didsInTier: overageDids, subtotal: overageFee,
+      label: `${overageDids.toLocaleString()} DIDs over ${included.toLocaleString()} @ $${(overageRatePerDid || 0).toFixed(4)}/mo`
+    });
+  }
+  return { tierName: 'Bundle', baseFee: 0, didCharges: total, totalMonthlyCharge: total, total, breakdown };
+}
+
+/**
  * Reseller wholesale charge across all client DIDs.
  */
 export function calculateResellerCharge(totalDids, customRate = null) {
