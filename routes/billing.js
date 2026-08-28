@@ -929,6 +929,58 @@ router.put('/admin/tenants/:id/did-source', requireAdmin, [
   });
 }));
 
+// @desc    Set or clear a tenant's flat bundle (fixed $/mo for N included DIDs).
+//          Bundle overrides all per-DID pricing while enabled.
+// @route   PUT /api/v1/billing/admin/tenants/:id/bundle
+//          { includedDids, flatPriceUsd, overageRatePerDid? }  → enable/replace
+//          { enabled: false }                                  → clear
+// @access  Admin only
+router.put('/admin/tenants/:id/bundle', requireAdmin, [
+  body('enabled').optional().isBoolean(),
+  body('includedDids').optional().isInt({ min: 1 }).withMessage('includedDids must be a positive integer'),
+  body('flatPriceUsd').optional().isFloat({ min: 0 }).withMessage('flatPriceUsd must be >= 0'),
+  body('overageRatePerDid').optional().isFloat({ min: 0 }).withMessage('overageRatePerDid must be >= 0'),
+  body('label').optional().isString().isLength({ max: 60 })
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) throw createError.badRequest(errors.array()[0].msg);
+
+  const tenant = await Tenant.findById(req.params.id);
+  if (!tenant) throw createError.notFound('Tenant not found');
+
+  if (req.body.enabled === false) {
+    tenant.subscription.bundle = { enabled: false, includedDids: null, flatPriceUsd: null, overageRatePerDid: 0, label: null };
+    await tenant.save();
+    console.log(`📦 Admin ${req.user.email}: bundle cleared for ${tenant.name}`);
+    return res.json({ success: true, message: `${tenant.name}: bundle cleared`, data: { tenantId: tenant._id, bundle: null } });
+  }
+
+  const { includedDids, flatPriceUsd, overageRatePerDid, label } = req.body;
+  if (includedDids == null || flatPriceUsd == null) {
+    throw createError.badRequest('Provide { includedDids, flatPriceUsd } to set a bundle, or { enabled: false } to clear');
+  }
+
+  tenant.subscription.bundle = {
+    enabled: true,
+    includedDids: parseInt(includedDids, 10),
+    flatPriceUsd: +flatPriceUsd,
+    overageRatePerDid: overageRatePerDid != null ? +overageRatePerDid : 0,
+    label: label || `$${(+flatPriceUsd).toFixed(0)} for ${parseInt(includedDids, 10).toLocaleString()} DIDs`
+  };
+  await tenant.save();
+
+  const { calculateBundleCharge } = await import('../services/billing/pricingCurves.js');
+  const didCount = await DID.countDocuments({ tenantId: tenant._id, status: 'active', isActive: true });
+  const projected = calculateBundleCharge(didCount, tenant.subscription.bundle).totalMonthlyCharge;
+
+  console.log(`📦 Admin ${req.user.email}: bundle $${flatPriceUsd}/${includedDids} set for ${tenant.name} (${didCount} DIDs → $${projected}/mo)`);
+  res.json({
+    success: true,
+    message: `${tenant.name}: bundle set — $${projected}/mo at ${didCount.toLocaleString()} DIDs`,
+    data: { tenantId: tenant._id, bundle: tenant.subscription.bundle, billableDids: didCount, projectedMonthly: projected }
+  });
+}));
+
 // NOTE: The PayPal webhook lives in routes/paypal-webhook.js and is mounted in
 // server-full.js BEFORE authentication — PayPal's unauthenticated POSTs were
 // getting 401 from this router's authenticate middleware and never processed.
