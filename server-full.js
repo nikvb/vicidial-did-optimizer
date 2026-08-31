@@ -5678,8 +5678,10 @@ Available Routes:
   // DID inventory into the local DID collection for tenants that opted in).
   startVicidialDidSyncJob();
 
-  // Start background reputation scraper
-  backgroundScraperService.start();
+  // NOTE: the background reputation scraper NO LONGER runs in the web process.
+  // It has its own pm2 process (scraper-worker.js) so heavy scraping can't
+  // starve the login/API event loop (2026-08-29 outage). The web server keeps
+  // only the lightweight producer (enqueueReputationCheck) for on-demand checks.
 });
 
 // Graceful shutdown
