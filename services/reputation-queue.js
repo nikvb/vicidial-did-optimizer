@@ -10,8 +10,17 @@ export const reputationQueue = new Bull('did-reputation', { redis: REDIS });
 
 const AUTO_DISABLE_THRESHOLD = 40;
 
-// ── Workers ─────────────────────────────────────────────────────────────────
-reputationQueue.process(CONCURRENCY, async (job) => {
+// ── Workers (consumer) ───────────────────────────────────────────────────────
+// Only started in the dedicated scraper worker process via startReputationWorkers().
+// NOT started in the web server — heavy scraping must never share the web event
+// loop (see the 2026-08-29 login outage: an 81k in-process backlog saturated the
+// loop and Cloudflare returned 520s on the login page).
+let _workersStarted = false;
+export function startReputationWorkers() {
+  if (_workersStarted) return;
+  _workersStarted = true;
+
+  reputationQueue.process(CONCURRENCY, async (job) => {
   const { phoneNumbers } = job.data;
   job.progress(0);
   const results = await reputationService.bulkUpdateReputation(phoneNumbers, {
@@ -57,6 +66,9 @@ reputationQueue.on('completed', (job, result) => {
 reputationQueue.on('failed', (job, err) => {
   console.error(`❌ Rep-queue job ${job.id} failed:`, err.message);
 });
+
+  console.log(`🕷️ Reputation workers started (concurrency=${CONCURRENCY}, batch=${BATCH_SIZE})`);
+}
 
 // ── Producer helper ──────────────────────────────────────────────────────────
 /**
