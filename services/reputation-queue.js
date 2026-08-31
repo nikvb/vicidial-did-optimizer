@@ -4,7 +4,6 @@ import reputationService from './reputation-service.js';
 
 const REDIS = { host: '127.0.0.1', port: 6379 };
 const BATCH_SIZE = 200;   // DIDs per job
-const CONCURRENCY = 3;    // parallel workers
 
 export const reputationQueue = new Bull('did-reputation', { redis: REDIS });
 
@@ -19,6 +18,10 @@ let _workersStarted = false;
 export function startReputationWorkers() {
   if (_workersStarted) return;
   _workersStarted = true;
+
+  // Read lazily (not at module load): under ESM, imports run before the worker
+  // entrypoint's dotenv.config(), so a module-load read would miss .env.
+  const CONCURRENCY = parseInt(process.env.REPUTATION_WORKER_CONCURRENCY) || 3;
 
   reputationQueue.process(CONCURRENCY, async (job) => {
   const { phoneNumbers } = job.data;
